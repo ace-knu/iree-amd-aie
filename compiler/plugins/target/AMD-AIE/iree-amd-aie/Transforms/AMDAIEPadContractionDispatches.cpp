@@ -140,6 +140,22 @@ struct MatmulInfo {
   BlockArgument outArg;                          // the output binding
 };
 
+/// Same as `MatmulInfo`, but for a `linalg.batch_matmul` (an extra leading
+/// batch dim on every operand/result, otherwise identical structure). Kept as
+/// a separate struct/getter/grow-pair rather than generalizing `MatmulInfo`
+/// in place: the 2D helpers below hardcode rank-2 shapes throughout, and
+/// duplicating the (small) rank-3 equivalents avoids touching code already
+/// validated for the plain-matmul case.
+struct BatchMatmulInfo {
+  linalg::BatchMatmulOp matmul;
+  IREE::TensorExt::DispatchTensorLoadOp lhsLoad, rhsLoad;
+  BlockArgument lhsArg, rhsArg;
+  linalg::FillOp fill;
+  tensor::EmptyOp empty;
+  IREE::TensorExt::DispatchTensorStoreOp store;
+  BlockArgument outArg;
+};
+
 /// Returns the func of a dispatch's single entry point, or null.
 static func::FuncOp getDispatchFunc(IREE::Flow::DispatchOp dispatch,
                                     ModuleOp module) {
@@ -199,6 +215,36 @@ static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
                     rhsArg, fill,    empty,   store,  outArg};
 }
 
+/// Batch-matmul counterpart of `getMatmulInfo` -- identical shape of check
+/// (full-tensor loads, `empty`+`fill` init, direct store), just matched
+/// against `linalg::BatchMatmulOp` instead of `linalg::MatmulOp`.
+static std::optional<BatchMatmulInfo> getBatchMatmulInfo(func::FuncOp func) {
+  SmallVector<linalg::BatchMatmulOp> matmuls;
+  func.walk([&](linalg::BatchMatmulOp op) { matmuls.push_back(op); });
+  if (matmuls.size() != 1) return std::nullopt;
+  linalg::BatchMatmulOp matmul = matmuls.front();
+  auto lhsLoad = getFullTensorLoad(matmul.getInputs()[0]);
+  auto rhsLoad = getFullTensorLoad(matmul.getInputs()[1]);
+  if (!lhsLoad || !rhsLoad) return std::nullopt;
+  auto lhsArg = dyn_cast<BlockArgument>(lhsLoad.getSource());
+  auto rhsArg = dyn_cast<BlockArgument>(rhsLoad.getSource());
+  if (!lhsArg || !rhsArg) return std::nullopt;
+  auto fill = matmul.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+  if (!fill) return std::nullopt;
+  auto empty = fill.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>();
+  if (!empty) return std::nullopt;
+  SmallVector<IREE::TensorExt::DispatchTensorStoreOp> stores;
+  func.walk(
+      [&](IREE::TensorExt::DispatchTensorStoreOp s) { stores.push_back(s); });
+  if (stores.size() != 1) return std::nullopt;
+  auto store = stores.front();
+  if (store.getValue() != matmul.getResult(0)) return std::nullopt;
+  auto outArg = dyn_cast<BlockArgument>(store.getTarget());
+  if (!outArg) return std::nullopt;
+  return BatchMatmulInfo{matmul, lhsLoad, rhsLoad, lhsArg,
+                         rhsArg, fill,    empty,   store,  outArg};
+}
+
 /// Grows executable binding `arg` and its full-tensor `load` to `newShape`
 /// (the matmul revalidates from the loaded operand types).
 static void growBinding(IRRewriter &rewriter, BlockArgument arg,
@@ -242,6 +288,44 @@ static void growOutputStore(IRRewriter &rewriter, MatmulInfo &info,
   auto dtt = cast<IREE::TensorExt::DispatchTensorType>(info.outArg.getType());
   auto newTensorType = RankedTensorType::get(
       {mPad, nPad}, dtt.asRankedTensorType().getElementType());
+  info.outArg.setType(IREE::TensorExt::DispatchTensorType::get(dtt.getAccess(),
+                                                               newTensorType));
+  rewriter.setInsertionPoint(info.store);
+  rewriter.create<IREE::TensorExt::DispatchTensorStoreOp>(
+      info.store.getLoc(), info.matmul.getResult(0), info.outArg,
+      /*targetDynamicDims=*/ValueRange{});
+  rewriter.eraseOp(info.store);
+}
+
+/// Batch-matmul counterpart of `growMatmulInit`: identical, except the output
+/// init/result shape carries the (unpadded) leading batch dim, `[batch, mPad,
+/// nPad]` instead of `[mPad, nPad]`.
+static void growBatchMatmulInit(IRRewriter &rewriter, BatchMatmulInfo &info,
+                                int64_t batch, int64_t mPad, int64_t nPad) {
+  Location loc = info.fill.getLoc();
+  Type elemType =
+      cast<RankedTensorType>(info.matmul.getResult(0).getType()).getElementType();
+  rewriter.setInsertionPoint(info.empty);
+  Value newEmpty = rewriter.create<tensor::EmptyOp>(
+      loc, ArrayRef<int64_t>{batch, mPad, nPad}, elemType);
+  rewriter.setInsertionPoint(info.fill);
+  Value cst = info.fill.getInputs()[0];
+  auto newFill =
+      rewriter.create<linalg::FillOp>(loc, ValueRange{cst}, ValueRange{newEmpty});
+  info.matmul.setDpsInitOperand(0, newFill.getResult(0));
+  info.matmul.getResult(0).setType(
+      RankedTensorType::get({batch, mPad, nPad}, elemType));
+  rewriter.eraseOp(info.fill);
+  rewriter.eraseOp(info.empty);
+}
+
+/// Batch-matmul counterpart of `growOutputStore`: identical, except the output
+/// binding/store shape carries the leading batch dim, `[batch, mPad, nPad]`.
+static void growBatchOutputStore(IRRewriter &rewriter, BatchMatmulInfo &info,
+                                 int64_t batch, int64_t mPad, int64_t nPad) {
+  auto dtt = cast<IREE::TensorExt::DispatchTensorType>(info.outArg.getType());
+  auto newTensorType = RankedTensorType::get(
+      {batch, mPad, nPad}, dtt.asRankedTensorType().getElementType());
   info.outArg.setType(IREE::TensorExt::DispatchTensorType::get(dtt.getAccess(),
                                                                newTensorType));
   rewriter.setInsertionPoint(info.store);
@@ -535,6 +619,86 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
 
     func::FuncOp func = getDispatchFunc(dispatch, module);
     if (!func) continue;
+
+    if (std::optional<BatchMatmulInfo> batchInfo = getBatchMatmulInfo(func)) {
+      // Same padding scheme as the plain-matmul path below, generalized to
+      // carry a leading (unpadded) batch dim: `linalg.batch_matmul`'s
+      // iterator order is (batch, M, N, K) -- one position later than
+      // `linalg.matmul`'s (M, N, K) -- so the loop-dim constants passed to
+      // `operandDimForLoop` shift by one, and every padded/cropped shape
+      // gains a leading `batch` entry that is never itself padded.
+      int64_t lhsArgNo = batchInfo->lhsArg.getArgNumber();
+      int64_t rhsArgNo = batchInfo->rhsArg.getArgNumber();
+      auto lhsType =
+          cast<RankedTensorType>(dispatch.getArguments()[lhsArgNo].getType());
+      auto rhsType =
+          cast<RankedTensorType>(dispatch.getArguments()[rhsArgNo].getType());
+      SmallVector<AffineMap> maps = batchInfo->matmul.getIndexingMapsArray();
+      unsigned lhsBatchPos = operandDimForLoop(maps[0], /*batch=*/0);
+      unsigned lhsMPos = operandDimForLoop(maps[0], /*M=*/1);
+      unsigned lhsKPos = operandDimForLoop(maps[0], /*K=*/3);
+      unsigned rhsNPos = operandDimForLoop(maps[1], /*N=*/2);
+      unsigned rhsKPos = operandDimForLoop(maps[1], /*K=*/3);
+      int64_t batch = lhsType.getShape()[lhsBatchPos];
+      int64_t m = lhsType.getShape()[lhsMPos];
+      int64_t k = lhsType.getShape()[lhsKPos];
+      int64_t n = rhsType.getShape()[rhsNPos];
+      Type outElemType =
+          cast<RankedTensorType>(batchInfo->matmul.getResult(0).getType())
+              .getElementType();
+
+      std::optional<PaddingMultiples> mult = getPaddingMultiples(
+          target, lhsType.getElementType(), rhsType.getElementType(),
+          outElemType);
+      if (!mult) continue;
+
+      int64_t mPad = roundUpToMultiple(m, mult->m);
+      int64_t nPad = roundUpToMultiple(n, mult->n);
+      int64_t kPad = roundUpToMultiple(k, mult->k);
+      if (mPad == m && nPad == n && kPad == k) continue;
+      bool padOut = mPad != m || nPad != n;
+
+      SmallVector<int64_t, 3> lhsPad(3), rhsPad(3);
+      lhsPad[lhsBatchPos] = batch;
+      lhsPad[lhsMPos] = mPad;
+      lhsPad[lhsKPos] = kPad;
+      rhsPad[lhsBatchPos] = batch;  // batch is at the same operand position on both sides
+      rhsPad[rhsNPos] = nPad;
+      rhsPad[rhsKPos] = kPad;
+
+      if (paddedExecutables.insert(func.getOperation()).second) {
+        growBinding(rewriter, batchInfo->lhsArg, batchInfo->lhsLoad, lhsPad);
+        growBinding(rewriter, batchInfo->rhsArg, batchInfo->rhsLoad, rhsPad);
+        if (padOut) {
+          growBatchMatmulInit(rewriter, *batchInfo, batch, mPad, nPad);
+          growBatchOutputStore(rewriter, *batchInfo, batch, mPad, nPad);
+        }
+        SmallVector<Type> argTypes(llvm::map_range(
+            func.getArguments(), [](BlockArgument a) { return a.getType(); }));
+        func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
+      }
+
+      rewriter.setInsertionPoint(dispatch);
+      Value lhsPadded = createPaddingDispatch(
+          rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
+          hostAffinity, counter);
+      Value rhsPadded = createPaddingDispatch(
+          rewriter, module, dispatch.getArguments()[rhsArgNo], rhsPad,
+          hostAffinity, counter);
+      dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
+      dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
+
+      if (padOut) {
+        Value result = dispatch.getResult(0);
+        result.setType(RankedTensorType::get({batch, mPad, nPad}, outElemType));
+        rewriter.setInsertionPointAfter(dispatch);
+        Value cropped = createCropDispatch(rewriter, module, result,
+                                           {batch, m, n}, hostAffinity, counter);
+        result.replaceAllUsesExcept(cropped, cropped.getDefiningOp());
+      }
+      continue;
+    }
+
     std::optional<MatmulInfo> info = getMatmulInfo(func);
     if (!info) continue;
 

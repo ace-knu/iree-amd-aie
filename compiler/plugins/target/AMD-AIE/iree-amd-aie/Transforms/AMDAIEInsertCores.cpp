@@ -20,6 +20,7 @@
 #include "iree-amd-aie/Transforms/Utils/AMDAIEOpUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
@@ -139,9 +140,34 @@ static LogicalResult insertCoreOps(mlir::ModuleOp moduleOp, int64_t stackSize) {
     // Create CoreOp at the end of the innermost forall
     rewriter.setInsertionPoint(forallOp.getBody()->getTerminator());
     uint32_t rowOffset = deviceModel.getCoreTileRowStart();
+    // `threadY` (the core-row index) is not bounded to the number of
+    // physically available core rows: the tile-size selection heuristic that
+    // determines the forall's trip counts does not currently guarantee this
+    // (e.g. it doesn't tile the M dimension for `linalg.batch_matmul`, unlike
+    // `linalg.matmul`, so a wide N can end up needing more row-iterations than
+    // there are physical rows). Rather than passing an out-of-range row
+    // straight through to `CoreOp::build`'s unconditional `rowOffset + row`
+    // (which crashes later in `AMDAIEDeviceModel::getTileType` once the
+    // resulting tile location doesn't exist), spill the excess into
+    // additional columns: `col = threadX + threadY / numRows`,
+    // `row = threadY % numRows`. This keeps every generated tile within the
+    // device's actual (numRows x numCols) core grid.
+    Value col = threadX;
+    Value row = threadY;
+    std::optional<int64_t> maybeNumRows = getConfigNumRows(targetAttr);
+    if (maybeNumRows && *maybeNumRows > 0) {
+      auto numRowsVal = rewriter.create<arith::ConstantIndexOp>(
+          rewriter.getUnknownLoc(), *maybeNumRows);
+      Value colOffset = rewriter.create<arith::DivUIOp>(
+          rewriter.getUnknownLoc(), threadY, numRowsVal);
+      row = rewriter.create<arith::RemUIOp>(rewriter.getUnknownLoc(), threadY,
+                                            numRowsVal);
+      col = rewriter.create<arith::AddIOp>(rewriter.getUnknownLoc(), threadX,
+                                           colOffset);
+    }
     auto coreOp = rewriter.create<AMDAIE::CoreOp>(
-        rewriter.getUnknownLoc(), threadX, threadY, rowOffset, inputDmas,
-        outputDmas, stackSize);
+        rewriter.getUnknownLoc(), col, row, rowOffset, inputDmas, outputDmas,
+        stackSize);
     Region &region = coreOp.getRegion();
     Block *newBlock = rewriter.createBlock(&region);
     rewriter.setInsertionPointToStart(newBlock);
