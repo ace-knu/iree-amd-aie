@@ -133,3 +133,5 @@ artifacts/
 /models/*/*.vmfb
 /models/*/*.npy
 /models/vgg16/*.onnx
+/models/bert_tiny/*.onnx
+/models/bert_base/*.onnx
