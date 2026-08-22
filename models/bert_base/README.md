@@ -28,16 +28,27 @@ Identical flags to `models/bert_tiny/README.md` §3 (same function name,
 
 Measured on npu4: import_onnx ~6s (871 MB intermediate .mlir — regenerate,
 don't commit), compile ~8 min, run ~20s, output `[1,32,768]` correlates
-**0.99252** with a torch reference (max abs diff 1.37, values are O(0.1-1)).
+**0.99998** with a torch reference (re-measured 2026-08-20 after the
+row-overflow fix below; matches bert-tiny's correlation almost exactly).
 
-That correlation is noticeably lower than bert-tiny's 0.99998. This is
-expected, not a new bug: bf16-demotion rounding error compounds through 12
-transformer layers instead of 2, and each layer's LayerNorm renormalizes
-activations without correcting the accumulated error from prior layers. It's
-the same bf16-precision-loss mechanism vgg16 and bert-tiny already document,
-just more visible at this depth — still a strong global correlation, not the
-"reading wrong data" signature (near-zero or negative correlation, mismatched
-argmax) that a real placement/DMA bug would produce.
+**Originally measured at 0.99252** (max abs diff 1.37), before
+`docs/2026-08-20_batch_matmul_row_overflow_fix.md`'s fix existed. At the
+time this was attributed to bf16-demotion rounding compounding through 12
+transformer layers instead of 2 — plausible on its own, but re-measuring
+after the fix shows most of that gap actually came from bert-base's
+batch=12 attention matmuls running *unpadded* (M left as a single untiled
+block, per that doc), not just depth-related bf16 accumulation. The fix
+doesn't touch bf16 rounding at all, only which physical cores/tiles a
+batch matmul's M dimension gets spread across — so the ~750x improvement
+in error (1.37 -> ~0.04 max abs diff) means the untiled-M path was
+itself less numerically accurate, not merely a performance/placement
+concern. Filed away as an open question, not further investigated: *why*
+would untiled-vs-tiled M change the result at all for a mathematically
+exact operation like matmul? Bf16 accumulation order shouldn't be
+sensitive to how work is spatially distributed across cores in a way that
+would explain a 30x correlation-gap improvement, so there may have been a
+second, subtler numerical issue in the unpadded-M path beyond "just"
+placement -- not root-caused.
 
 ## 3. What this confirms beyond bert-tiny
 
