@@ -347,6 +347,25 @@ void AMDAIETileAndFusePass::runOnOperation() {
         [&](tensor::ExtractSliceOp sliceOp, OpResult originalProducer,
             bool isDestinationOperand)
             -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+          // Fusion is disabled here in general to avoid duplicating a
+          // reduction-dependent producer's computation across every
+          // reduction-tile iteration. A `linalg.broadcast` feeding the
+          // *destination*/accumulator operand is a safe, narrow exception:
+          // its value never depends on the reduction dimension being tiled
+          // here (e.g. a bias vector folded into a contraction's own
+          // accumulator init, see `AMDAIEFoldBroadcastAddIntoDest`), so
+          // fusing it costs nothing extra per tile. Just as importantly,
+          // fusing it here lets each tile get its own per-tile slice of the
+          // broadcast -- matching how a genuine `ins` operand (e.g. the
+          // contraction's other input) already gets tiled -- instead of the
+          // whole broadcast being materialized once as a single buffer
+          // shared across every tile, which then has to be redistributed
+          // to each tile's consumer after the fact via an actual multi-tile
+          // DMA broadcast.
+          if (isDestinationOperand &&
+              isa<linalg::BroadcastOp>(originalProducer.getOwner())) {
+            return scf::SCFTileAndFuseOptions::ControlFnResult{false};
+          }
           return std::nullopt;
         });
   } else {

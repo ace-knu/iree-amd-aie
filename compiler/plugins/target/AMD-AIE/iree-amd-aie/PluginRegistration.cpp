@@ -54,6 +54,15 @@ struct AMDAIESession
   }
 
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
+    // Fold a broadcasting bias-add (matmul + an [N]-shaped bias, the common
+    // nn.Linear/torch.aten.linear shape) into the matmul's own
+    // zero-initialized accumulator, eliminating the separate elementwise op
+    // entirely. Must run before dispatch region formation (this is the Flow
+    // phase, not yet Dispatch Creation) so the fused result forms a single,
+    // ordinary-looking matmul dispatch -- avoiding the multi-op dispatch
+    // fusion machinery (separate elementwise consumer, its own DMA/tile
+    // placement) that a detached bias-add would otherwise require.
+    passManager.addPass(AMDAIE::createAMDAIEFoldBroadcastAddIntoDestPass());
     // Demote contraction (matmul + conv) inputs f32 -> bf16 before the named
     // ops are generalized (the upstream demote pass only matches named ops).
     // npu4 has no f32 vector path, so this is required to run f32 models.

@@ -947,11 +947,19 @@ LogicalResult AIEDeviceBuilder::workgroupToAIE(AMDAIE::WorkgroupOp workgroupOp,
           rewriter.setInsertionPoint(deviceBlock->getTerminator());
           if (!isa_and_present<AMDAIEDialect>(op->getDialect())) {
             rewriter.clone(*op, mapper);
-          } else {
-            op->emitOpError() << "is unsupported in lowering to AIE dialect";
-            return WalkResult::interrupt();
+            // `clone` already deep-copies `op`'s nested regions (including
+            // any terminator, e.g. a `linalg.yield`). This walk is
+            // PreOrder, so returning `advance` here would additionally
+            // descend into `op`'s own (original) nested ops and clone each
+            // of them a second time, inserted as stray top-level siblings
+            // at the current insertion point -- e.g. a duplicate,
+            // out-of-scope `linalg.yield` referencing a block argument that
+            // is no longer in scope. `skip` avoids re-visiting what `clone`
+            // already handled.
+            return WalkResult::skip();
           }
-          return WalkResult::advance();
+          op->emitOpError() << "is unsupported in lowering to AIE dialect";
+          return WalkResult::interrupt();
         });
   });
   if (res.wasInterrupted()) return failure();
@@ -1010,6 +1018,12 @@ LogicalResult AIEDeviceBuilder::lowerToAIE(ModuleOp moduleOp) {
       } else {
         if (!isa_and_present<AMDAIEDialect>(op->getDialect())) {
           rewriter.clone(*op, mapper);
+          // See the identical comment in the `.Default` case of the
+          // `workgroupToAIE` walk above: `clone` already deep-copies `op`'s
+          // nested regions, so descending further (via `advance`) would
+          // re-visit and re-clone its already-copied nested ops as stray
+          // top-level siblings.
+          return WalkResult::skip();
         }
       }
       return WalkResult::advance();

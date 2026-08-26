@@ -181,6 +181,28 @@ def AMDAIECanonicalizeDoublyStridedOp :
   ];
 }
 
+def AMDAIEEraseDeadAllocAndStores :
+  Pass<"iree-amdaie-erase-dead-alloc-and-stores", "ModuleOp"> {
+  let summary = "Erase memref allocations whose only uses are stores/dealloc.";
+  let description = [{
+  Tile-and-fuse can leave behind the original (now un-fused, whole-tensor)
+  producer of a fused op. After bufferization, its destination buffer is
+  never read by anything, only written and deallocated, but generic DCE
+  does not remove allocations even when unused. This pass calls the
+  upstream `memref::eraseDeadAllocAndStores` utility on the whole module to
+  clean these up. It must run after linalg ops have been converted to
+  loops with explicit memref.load/memref.store (e.g. after
+  ConvertLinalgToLoopsPass), since the utility only recognizes region-free
+  store ops, not linalg op writes. Left uncleaned, such an alloc can end up
+  a direct, unwrapped child of an `aie.device` region (when the dead
+  producer was never assigned to any core), and converting its surrounding
+  scf.for loops to a CFG later violates aie.device's single-block region
+  invariant.
+  }];
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEEraseDeadAllocAndStoresPass()";
+}
+
 def AMDAIECanonicalizeNpuDmaCpyNd :
   Pass<"iree-amdaie-canonicalize-npu-dma-cpy-nd", "ModuleOp"> {
   let summary = "Canonicalize npu.dma_cpy_nd operations.";
@@ -397,6 +419,35 @@ def AMDAIEFoldDmaWaits :
   Pass<"iree-amdaie-fold-dma-waits", ""> {
   let summary = "Remove redundant dma wait operations in controlcode.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldDmaWaitsPass()";
+}
+
+def AMDAIEFoldBroadcastAddIntoDest :
+  Pass<"iree-amdaie-fold-broadcast-add-into-dest", ""> {
+  let summary = "Fold a broadcast-then-add (e.g. bias-add) into a preceding "
+                "contraction's zero-initialized destination.";
+  let description = [{
+    Rewrites the pattern
+
+      %zeroed = linalg.fill ins(%cst_zero) outs(%init : !acc_type)
+      %mm = linalg.matmul/batch_matmul ins(...) outs(%zeroed) -> !acc_type
+      %out = linalg.generic { broadcast %bias, add to %mm } -> !acc_type
+
+    (a contraction's result added, via a broadcasting elementwise op, to a
+    smaller operand such as a bias vector) into
+
+      %bias_bcast = linalg.broadcast ins(%bias) outs(%init2 : !acc_type)
+      %out = linalg.matmul/batch_matmul ins(...) outs(%bias_bcast) -> !acc_type
+
+    i.e. it initializes the contraction's own accumulator with the
+    (broadcast) bias instead of zero, since a contraction op accumulates
+    additively on its destination operand -- eliminating the separate
+    elementwise op entirely. This mirrors upstream MLIR's
+    `linalg::populateFoldAddIntoDestPatterns` (`FoldAddIntoDest.cpp`), which
+    only matches a same-shape `linalg.add`; this pass handles the broadcasting
+    `linalg.generic` case instead, which is what a mismatched-shape bias-add
+    (e.g. matmul + [N]-shaped bias) actually lowers to.
+  }];
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBroadcastAddIntoDestPass()";
 }
 
 def AMDAIEFuseConsumerIntoLoop :

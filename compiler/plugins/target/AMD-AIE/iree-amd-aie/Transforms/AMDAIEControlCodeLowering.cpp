@@ -229,6 +229,17 @@ struct HalfDmaCpyNdToNpuConverter final
     uint32_t bufferOffsetInBytes =
         (bufferOffset + reinterpretElemOffset) * elemWidthInBits / 8;
 
+    // Per the hardware spec (3.7.8): for MM2S channels, Buffer_Length=0
+    // requires Enable_Packet=0, otherwise behavior is undefined. A
+    // zero-length BD moves no data (e.g. an inert placeholder half of a
+    // connection whose other side does the real transfer), so it never
+    // legitimately needs packet routing regardless of whether its
+    // connection is otherwise a packet flow.
+    if (innerBufferLength == 0) {
+      enablePacket = 0;
+      packetId = 0;
+    }
+
     // Offset set to zero for shim as the offset is embedded in the address
     // patch.
     rewriter.create<AMDAIE::NpuWriteBdOp>(

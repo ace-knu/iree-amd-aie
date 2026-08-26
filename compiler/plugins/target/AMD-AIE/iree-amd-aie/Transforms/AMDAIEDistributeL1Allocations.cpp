@@ -8,6 +8,7 @@
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
@@ -172,6 +173,20 @@ LogicalResult distributeLocalMemory(ModuleOp moduleOp) {
                 rewriter.setInsertionPoint(deallocOp);
                 rewriter.create<memref::DeallocOp>(rewriter.getUnknownLoc(),
                                                    newAlloc);
+                return success();
+              })
+              .Case<linalg::LinalgOp>([&](linalg::LinalgOp linalgOp) {
+                // A plain structured op inserted by bufferization (e.g. an
+                // identity-copy `linalg.generic` moving a fused elementwise
+                // consumer's result out of local memory, or the `linalg.fill`
+                // zero-initializing it beforehand) reads/writes `oldAlloc`
+                // directly, with no intervening subview. Just point the
+                // matching operand(s) at `newAlloc` instead -- same shape, no
+                // index/offset adjustment needed.
+                for (OpOperand &operand : linalgOp->getOpOperands()) {
+                  if (operand.get() == oldAlloc.getResult())
+                    linalgOp->setOperand(operand.getOperandNumber(), newAlloc);
+                }
                 return success();
               })
               .Default([&](Operation *user) {

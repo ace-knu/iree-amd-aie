@@ -198,6 +198,42 @@ void addPackPeelBasedPassPipeline(OpPassManager &funcPassManager,
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 
+  // Re-fold a broadcast bias-add back into the (now per-tile) matmul's own
+  // accumulator. The whole-tensor fold already applied once at preprocessing
+  // time (see `AMDAIEFoldBroadcastAddIntoDest`, run early via
+  // `extendPreprocessingPassPipeline`) gets undone by the tiling above:
+  // upstream `scf::tileConsumerAndFuseProducersUsingSCF`'s destination-operand
+  // fusion doesn't recognize a `linalg.broadcast`-produced dest as directly
+  // tileable the way a `linalg.fill` is, so it reintroduces a fresh
+  // zero-filled per-tile accumulator plus a separate, now tile-local, small
+  // add. Re-running the same fold here lets it re-fuse at that tile
+  // granularity, giving each tile its own local broadcast slice -- the same
+  // shape a genuine tiled operand (e.g. the matmul's other input) already
+  // has -- instead of leaving one buffer shared across every tile.
+  funcPassManager.addPass(createAMDAIEFoldBroadcastAddIntoDestPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote a fused elementwise consumer's output to shared memory. When a
+  // matmul has a fused elementwise consumer, the elementwise op -- not the
+  // matmul -- produces the dispatch's actual final result, and this is what
+  // the eventual unpack (gathering all cores' tiles into natural layout)
+  // needs to read from a memory space visible across cores. Without this, the
+  // elementwise's output is left unbufferized until the generic
+  // comprehensive-bufferization fallback, which only assigns shared memory
+  // to exactly-4D allocations and misclassifies this (5D) one as local. Runs
+  // before the matmul-output promotion below so the elementwise op's own
+  // (still tensor.empty()-backed) init is bufferized while the IR is still
+  // untouched by that step.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeElementwise = true;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
   // Promote the matmul output to shared memory
   {
     AMDAIEBufferizeToAllocationOptions bufferizeOptions;
@@ -670,7 +706,7 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int callReplication, bool insertLoopAroundCoreBlock, bool enableCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas) {
+    uint32_t coreStackSize, bool reprogramDmas, bool detectArbiterDeadlock) {
   OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
   {
     FunctionLikeNest funcPassManager(modulePassManager);
@@ -706,11 +742,11 @@ void buildAMDAIETransformPassPipeline(
         enableVectorizationPasses, enableCoalescingLoops,
         enableCollapsingUnitDims, enableFunctionOutlining, callReplication,
         insertLoopAroundCoreBlock, numCols, enableCtrlPkt, coreStackSize,
-        reprogramDmas);
+        reprogramDmas, detectArbiterDeadlock);
   } else if (useLowerToAIEPipeline == LowerToAIEPassPipeline::AIR) {
     addMLIRAIRLoweringPasses(modulePassManager, device, useTilePipeline,
                              matmulElementwiseFusion,
-                             enableVectorizationPasses);
+                             enableVectorizationPasses, detectArbiterDeadlock);
   } else {
     assert(
         false &&
@@ -732,7 +768,7 @@ void addAMDAIEObjectFifoLoweringPasses(
     bool enableCoalescingLoops, bool enableCollapsingUnitDims,
     OutliningStrategy enableFunctionOutlining, int callReplication,
     bool insertLoopAroundCoreBlock, uint32_t numCols, bool enableCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas) {
+    uint32_t coreStackSize, bool reprogramDmas, bool detectArbiterDeadlock) {
   passManager.addPass(createEraseHALDescriptorTypeFromMemRefPass());
   passManager.addPass(memref::createFoldMemRefAliasOpsPass());
 
@@ -910,11 +946,12 @@ void addAMDAIEObjectFifoLoweringPasses(
   addAMDAIEToAIEPasses(passManager, insertLoopAroundCoreBlock, reprogramDmas);
 
   // Now lower using the AIE passes from MLIR-AIE.
-  addMLIRAIELoweringPasses(passManager, useTilePipeline);
+  addMLIRAIELoweringPasses(passManager, useTilePipeline, detectArbiterDeadlock);
 }
 
 void addMLIRAIELoweringPasses(OpPassManager &pm,
-                              TilePassPipeline useTilePipeline) {
+                              TilePassPipeline useTilePipeline,
+                              bool detectArbiterDeadlock) {
   mlir::iree_compiler::aievec::buildConvertVectorToAIEVec(pm);
 
   {
@@ -933,6 +970,7 @@ void addMLIRAIELoweringPasses(OpPassManager &pm,
       // Route control and data flows separately, prioritizing control flows
       // first to ensure their deterministic routing results.
       AMDAIERouteFlowsWithPathfinderOptions options;
+      options.detectArbiterDeadlock = detectArbiterDeadlock;
       // Route only control flows.
       options.routeCtrl = true;
       options.routeData = false;
@@ -946,6 +984,21 @@ void addMLIRAIELoweringPasses(OpPassManager &pm,
 
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createConvertLinalgToLoopsPass());
+  // Tile-and-fuse can leave the original (un-fused, whole-tensor) producer's
+  // destination buffer behind: after bufferization it's written and
+  // deallocated but never read, yet generic DCE never removes allocations.
+  // Left in place, such an alloc (and its loop nest, once linalg lowers to
+  // scf.for above) can end up a direct, unwrapped child of an `aie.device`
+  // region, and SCFToControlFlowPass converting it to a CFG later violates
+  // aie.device's single-block region invariant. Run twice with
+  // canonicalization interleaved: the first pass can only remove the
+  // outermost dead buffer (e.g. a copy's destination); removing it turns the
+  // load feeding it dead, which canonicalization then prunes, which is what
+  // makes the buffer that load read from eligible on the second pass.
+  pm.addPass(createAMDAIEEraseDeadAllocAndStoresPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createAMDAIEEraseDeadAllocAndStoresPass());
+  pm.addPass(createCanonicalizerPass());
   pm.addPass(createLowerAffinePass());
   pm.addPass(createSCFToControlFlowPass());
 
@@ -976,7 +1029,8 @@ void addMLIRAIELoweringPasses(OpPassManager &pm,
 void addMLIRAIRLoweringPasses(OpPassManager &passManager, AMDAIEDevice device,
                               TilePassPipeline useTilePipeline,
                               bool matmulElementwiseFusion,
-                              bool enableVectorizationPasses) {
+                              bool enableVectorizationPasses,
+                              bool detectArbiterDeadlock) {
   // Add passes for preparing for lowering to MLIR-AIR
   passManager.addPass(createEraseHALDescriptorTypeFromMemRefPass());
   passManager.addPass(memref::createFoldMemRefAliasOpsPass());
@@ -1147,7 +1201,7 @@ void addMLIRAIRLoweringPasses(OpPassManager &passManager, AMDAIEDevice device,
   }
 
   // Now lower using the AIE passes from MLIR-AIE.
-  addMLIRAIELoweringPasses(passManager, useTilePipeline);
+  addMLIRAIELoweringPasses(passManager, useTilePipeline, detectArbiterDeadlock);
 }
 
 // NOTE: this runs on the top-level program module containing all hal.executable

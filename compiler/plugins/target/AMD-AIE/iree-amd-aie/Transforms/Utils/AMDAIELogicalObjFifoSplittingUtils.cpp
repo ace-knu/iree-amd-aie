@@ -6,10 +6,13 @@
 
 #include "AMDAIELogicalObjFifoSplittingUtils.h"
 
+#include <map>
 #include <numeric>
+#include <vector>
 
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDmaUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -19,10 +22,20 @@
 
 namespace mlir::iree_compiler::AMDAIE {
 
-/// Hardcoded the transposed dimensions of L2 target dma for now.
-/// The values are based on the results from ConvertToDma with option as
-/// transposed on target, e.g., dma size [1, 1, 32, 32] -> [1, 32, 1, 32].
-const static SmallVector<size_t> transposedL2Dims = {0, 2, 1, 3};
+/// The transposed dimensions of an L2 target dma, i.e. the permutation
+/// `ConvertToDma`'s "transposed on target" option applies: dims 1 and 2 swap,
+/// every other dim stays in place, e.g. for a 4-dim dma, size
+/// [1, 1, 32, 32] -> [1, 32, 1, 32]. This was previously hardcoded to the
+/// 4-dim case ({0, 2, 1, 3}), which silently read/wrote out of bounds for any
+/// dma with a different total rank (e.g. a 5-dim one, from a fused batched
+/// matmul+elementwise dispatch) -- `rank` must match the actual dma's own
+/// offsets/sizes length at each call site, not be assumed fixed.
+static SmallVector<size_t> getTransposedL2Dims(size_t rank) {
+  SmallVector<size_t> dims(rank);
+  std::iota(dims.begin(), dims.end(), 0);
+  if (rank > 2) std::swap(dims[1], dims[2]);
+  return dims;
+}
 
 /// Utility to create a new logical objectfifo.
 static AMDAIE::LogicalObjectFifoFromMemrefOp createNewLogicalObjectFifo(
@@ -394,6 +407,8 @@ LogicalResult splitLogicalObjectFifoForElementwiseOp(
     // The L2 target side has transposed dimensions, while the L3 source side
     // data are continuous and don't have `nonSplitDim`. Then the L3 source
     // sizes need to be modified to match the new L2 target sizes.
+    SmallVector<size_t> transposedL2Dims =
+        getTransposedL2Dims(staticL2AsTargetOffsets.size());
     for (auto &&[splitDim, nonSplitdim] :
          llvm::zip_equal(splitDimsForL2, nonSplitDimsForL2)) {
       staticL2AsTargetOffsets[transposedL2Dims[splitDim]] = zeroVal;
@@ -403,74 +418,135 @@ LogicalResult splitLogicalObjectFifoForElementwiseOp(
     }
   }
 
-  // Traverse each L2->L1 DmaCpyNd op and split them.
+  // Traverse each L2->L1 DmaCpyNd op and split them. Consumers that read the
+  // identical (constant) offset into the old shared L2 buffer -- e.g. every
+  // row within the same column, all needing the exact same slice of data --
+  // are grouped together and continue to share ONE new L2 buffer and ONE new
+  // L3->L2 DMA, created once for the group; consumers at genuinely different
+  // offsets (e.g. different columns) each get their own independent new L2
+  // buffer + L3->L2 DMA. Without this grouping, every consumer -- including
+  // exact duplicates of each other -- got its own private buffer, needlessly
+  // fragmenting what should be one DMA per distinct offset into one per
+  // physical consumer (e.g. 32 instead of 8 for a 4-row x 8-column grid where
+  // the data only actually varies by column).
+  SmallPtrSet<Operation *, 16> processedL2ToL1Ops;
+  std::map<std::vector<int64_t>, AMDAIE::LogicalObjectFifoFromMemrefOp>
+      offsetKeyToNewSource;
   for (AMDAIE::DmaCpyNdOp l2ToL1DmaOp : l2ToL1DmaOps) {
+    // The same DmaCpyNdOp can appear multiple times in `l2ToL1DmaOps` (e.g.
+    // referenced as the "3rd input" by multiple CoreOps that all consume the
+    // exact same data) -- only process each one once.
+    if (!processedL2ToL1Ops.insert(l2ToL1DmaOp.getOperation()).second)
+      continue;
+
     SmallVector<OpFoldResult> staticL2AsSourceOffsets =
         l2ToL1DmaOp.getSourceMixedOffsets();
     SmallVector<OpFoldResult> staticL2AsSourceSizes =
         l2ToL1DmaOp.getSourceMixedSizes();
 
-    // Now we'll create a new L2 buffer based on the new shape inferred earlier
-    // via `staticL2AsTargetSizes`.
+    // This consumer's grouping key: its constant offset at each split
+    // dimension into the old shared L2 buffer. Consumers sharing a key read
+    // identical data and can safely continue sharing one (new) buffer. If any
+    // offset isn't a compile-time constant, fall back to never sharing (treat
+    // as its own singleton group) rather than failing outright.
+    std::vector<int64_t> offsetKey;
+    bool offsetKeyIsConstant = true;
+    for (size_t dim : splitDimsForL2) {
+      std::optional<int64_t> constantOffset =
+          getConstantIntValue(staticL2AsSourceOffsets[dim]);
+      if (!constantOffset) {
+        offsetKeyIsConstant = false;
+        break;
+      }
+      offsetKey.push_back(*constantOffset);
+    }
+
     LogicalObjectFifoFromMemrefOp oldL2ObjectFifo =
         l2ToL1DmaOp.getSourceObjectFifo();
     // If the dma transpose is on the source(target) side, then the L2
     // target(source) side has the sizes in order.
     SmallVector<OpFoldResult> newL2Sizes =
         dmaTransposeOnTarget ? staticL2AsSourceSizes : staticL2AsTargetSizes;
-    AMDAIE::LogicalObjectFifoFromMemrefOp source =
-        createNewLogicalObjectFifo(rewriter, oldL2ObjectFifo, newL2Sizes);
 
-    // --------------------------------------------
-    // ---------- L3 -> L2 splitting --------------
-    // --------------------------------------------
-    // Update L3 source offsets for non-split dimensions. Refer doc comment of
-    // `addToOffset` for the computation rationale involved.
-    SmallVector<OpFoldResult> staticL3AsSourceOffsets =
-        l3ToL2DmaOp.getSourceMixedOffsets();
-    for (auto &&[splitDim, nonSplitdim] :
-         llvm::zip_equal(splitDimsForL2, nonSplitDimsForL2)) {
-      std::optional<int64_t> constantOffset =
-          getConstantIntValue(staticL2AsSourceOffsets[splitDim]);
-      if (!constantOffset) {
-        return l2ToL1DmaOp->emitOpError()
-               << "found a non-constant value for source offset at dim "
-               << splitDim;
-      }
-      std::optional<int64_t> constantSize =
-          getConstantIntValue(newL2Sizes[nonSplitdim]);
-      if (!constantSize) {
-        return l3ToL2DmaOp->emitOpError()
-               << "found a non-constant value for target size at dim "
-               << nonSplitdim;
-      }
-      int64_t offsetToAdd = constantOffset.value() * constantSize.value();
+    AMDAIE::LogicalObjectFifoFromMemrefOp source;
+    auto existingSourceIt = offsetKeyIsConstant
+                                ? offsetKeyToNewSource.find(offsetKey)
+                                : offsetKeyToNewSource.end();
+    if (existingSourceIt != offsetKeyToNewSource.end()) {
+      // A sibling consumer at the identical offset already created (and will
+      // populate) this buffer; reuse it instead of creating another,
+      // redundant copy of the same data.
+      source = existingSourceIt->second;
+    } else {
+      source = createNewLogicalObjectFifo(rewriter, oldL2ObjectFifo, newL2Sizes);
+      if (offsetKeyIsConstant) offsetKeyToNewSource[offsetKey] = source;
 
-      // If the dma transpose is on the target side, L3 source side data are
-      // continuous and don't have `nonSplitDim`.
-      size_t dim = dmaTransposeOnTarget ? splitDim : nonSplitdim;
-      FailureOr<OpFoldResult> newOffset =
-          addToOffset(rewriter, staticL3AsSourceOffsets[dim], offsetToAdd);
-      if (failed(newOffset)) {
-        // TODO: Ideally we should be able to handle even +, -, *, /, etc.
-        //       But handle this later (if at all!) as such cases might not
-        //       arise.
-        return l3ToL2DmaOp->emitOpError()
-               << "Unhandled expression for source offset at dim "
-               << nonSplitdim;
+      // --------------------------------------------
+      // ---------- L3 -> L2 splitting --------------
+      // --------------------------------------------
+      // Update L3 source offsets for non-split dimensions. Refer doc comment
+      // of `addToOffset` for the computation rationale involved.
+      SmallVector<OpFoldResult> staticL3AsSourceOffsets =
+          l3ToL2DmaOp.getSourceMixedOffsets();
+      for (auto &&[splitDim, nonSplitdim] :
+           llvm::zip_equal(splitDimsForL2, nonSplitDimsForL2)) {
+        std::optional<int64_t> constantOffset =
+            getConstantIntValue(staticL2AsSourceOffsets[splitDim]);
+        if (!constantOffset) {
+          return l2ToL1DmaOp->emitOpError()
+                 << "found a non-constant value for source offset at dim "
+                 << splitDim;
+        }
+        std::optional<int64_t> constantSize =
+            getConstantIntValue(newL2Sizes[nonSplitdim]);
+        if (!constantSize) {
+          return l3ToL2DmaOp->emitOpError()
+                 << "found a non-constant value for target size at dim "
+                 << nonSplitdim;
+        }
+        int64_t offsetToAdd = constantOffset.value() * constantSize.value();
+
+        // If the dma transpose is on the target side, L3 source side data are
+        // continuous and don't have `nonSplitDim`.
+        size_t dim = dmaTransposeOnTarget ? splitDim : nonSplitdim;
+        // The L3->L2 dma's source side can have fewer dims than its target
+        // side (e.g. a `[64]` bias broadcast into a `[32, 64]`-shaped
+        // target): the leading target dims that don't exist on the source
+        // side are pure broadcast dims with no source offset to adjust at
+        // all. Align `dim` (a target-space index) into source-space from the
+        // right/trailing end -- standard broadcasting alignment -- and skip
+        // dims that only exist on the target side.
+        size_t targetRank = staticL2AsTargetSizes.size();
+        size_t sourceRank = staticL3AsSourceOffsets.size();
+        if (targetRank > sourceRank && dim < targetRank - sourceRank) {
+          // Pure broadcast dim on the target side; nothing to update on
+          // source.
+          continue;
+        }
+        size_t sourceDim = dim - (targetRank - sourceRank);
+        FailureOr<OpFoldResult> newOffset = addToOffset(
+            rewriter, staticL3AsSourceOffsets[sourceDim], offsetToAdd);
+        if (failed(newOffset)) {
+          // TODO: Ideally we should be able to handle even +, -, *, /, etc.
+          //       But handle this later (if at all!) as such cases might not
+          //       arise.
+          return l3ToL2DmaOp->emitOpError()
+                 << "Unhandled expression for source offset at dim "
+                 << nonSplitdim;
+        }
+        staticL3AsSourceOffsets[sourceDim] = *newOffset;
       }
-      staticL3AsSourceOffsets[dim] = *newOffset;
+
+      // Create new L3 -> L2 Dma Op.
+      rewriter.setInsertionPoint(l3ToL2DmaOp);
+      rewriter.create<AMDAIE::DmaCpyNdOp>(
+          l3ToL2DmaOp.getLoc(), source, llvm::ArrayRef(staticL2AsTargetOffsets),
+          llvm::ArrayRef(staticL2AsTargetSizes),
+          l3ToL2DmaOp.getTargetMixedStrides(), l3ToL2DmaOp.getSource(),
+          llvm::ArrayRef(staticL3AsSourceOffsets),
+          llvm::ArrayRef(staticL3AsSourceSizes),
+          l3ToL2DmaOp.getSourceMixedStrides());
     }
-
-    // Create new L3 -> L2 Dma Op.
-    rewriter.setInsertionPoint(l3ToL2DmaOp);
-    rewriter.create<AMDAIE::DmaCpyNdOp>(
-        l3ToL2DmaOp.getLoc(), source, llvm::ArrayRef(staticL2AsTargetOffsets),
-        llvm::ArrayRef(staticL2AsTargetSizes),
-        l3ToL2DmaOp.getTargetMixedStrides(), l3ToL2DmaOp.getSource(),
-        llvm::ArrayRef(staticL3AsSourceOffsets),
-        llvm::ArrayRef(staticL3AsSourceSizes),
-        l3ToL2DmaOp.getSourceMixedStrides());
 
     // --------------------------------------------
     // ---------- L2 -> L1 splitting --------------

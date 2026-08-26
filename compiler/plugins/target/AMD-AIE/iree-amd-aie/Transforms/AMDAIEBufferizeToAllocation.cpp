@@ -7,9 +7,11 @@
 #include "iree-amd-aie/IR/AMDAIEAttrs.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/Pass/Pass.h"
 
@@ -225,9 +227,30 @@ void AMDAIEBufferizeToAllocationPass::runOnOperation() {
     for (auto operand : *operandsToBufferize) {
       AMDAIEMemSpaceAttr memorySpaceAttr =
           getMemorySpaceAttr(rewriter, memorySpace);
-      rewriter.setInsertionPointAfter(operand.getDefiningOp());
-      if (failed(applyBufferizeToAllocation(rewriter, operand.getDefiningOp(),
-                                            memorySpaceAttr))) {
+      Operation *definingOp = operand.getDefiningOp();
+      // `linalg::bufferizeToAllocation` requires the defining op to have
+      // exactly one operand that aliases/writes its result (e.g. a
+      // `linalg.fill`'s init, for a matmul's zero-initialized accumulator).
+      // A bare `tensor.empty()` -- the usual init for a non-reduction
+      // elementwise op's own output, which never needs a fill -- has none,
+      // so it can't go through that path as-is. Give it one: a harmless
+      // zero-fill (the elementwise op unconditionally overwrites every
+      // element anyway) makes it structurally identical to the
+      // already-supported case.
+      if (auto emptyOp = dyn_cast<tensor::EmptyOp>(definingOp)) {
+        rewriter.setInsertionPointAfter(emptyOp);
+        auto tensorType = cast<RankedTensorType>(emptyOp.getType());
+        Value zero = rewriter.create<arith::ConstantOp>(
+            emptyOp.getLoc(), rewriter.getZeroAttr(tensorType.getElementType()));
+        auto fillOp = rewriter.create<linalg::FillOp>(
+            emptyOp.getLoc(), ValueRange{zero}, ValueRange{emptyOp.getResult()});
+        rewriter.replaceAllUsesExcept(emptyOp.getResult(),
+                                      fillOp.getResult(0), fillOp);
+        definingOp = fillOp;
+      }
+      rewriter.setInsertionPointAfter(definingOp);
+      if (failed(
+              applyBufferizeToAllocation(rewriter, definingOp, memorySpaceAttr))) {
         targetOp->emitOpError("failed bufferizing to allocations");
         return signalPassFailure();
       }

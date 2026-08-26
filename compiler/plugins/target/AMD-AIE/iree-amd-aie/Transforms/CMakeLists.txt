@@ -75,8 +75,10 @@ iree_cc_library(
     "AMDAIEDmaComposition.cpp"
     "AMDAIEDmaLoopSubsumption.cpp"
     "AMDAIEDmaToCircularDma.cpp"
+    "AMDAIEEraseDeadAllocAndStores.cpp"
     "AMDAIEFlattenLogicalObjectFifo.cpp"
     "AMDAIELinalgFunctionOutlining.cpp"
+    "AMDAIEFoldBroadcastAddIntoDest.cpp"
     "AMDAIEFoldDmaWaits.cpp"
     "AMDAIEFuseConsumerIntoLoop.cpp"
     "AMDAIEFuseFillIntoForall.cpp"
@@ -157,6 +159,7 @@ iree_cc_library(
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRMemRefDialect
+    MLIRMemRefUtils
     MLIRPDLDialect
     MLIRPDLInterpDialect
     MLIRPass

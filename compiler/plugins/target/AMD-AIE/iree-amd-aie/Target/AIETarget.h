@@ -106,6 +106,7 @@ struct AMDAIEOptions {
   std::string enableAMDAIEUkernels{"none"};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
   bool enableCtrlPkt{false};
+  bool detectArbiterDeadlock{true};
 
   enum class DeviceHAL { XRT, AMDXDNA };
   DeviceHAL deviceHal{DeviceHAL::AMDXDNA};
@@ -347,6 +348,17 @@ struct AMDAIEOptions {
                                     "Use packet mode on all output flows."),
                          clEnumValN(PacketFlowStrategy::All, "all",
                                     "Use packet mode on all flows.")));
+
+    binder.opt<bool>(
+        "iree-amdaie-detect-arbiter-deadlock", detectArbiterDeadlock,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Enable a conservative check that flags any packet-flow stream "
+            "switch arbiter shared by more than one destination group as a "
+            "potential deadlock, aborting compilation. This check has known "
+            "false positives (it flags any arbiter sharing, not just cases "
+            "that provably deadlock); disable to attempt compilation anyway "
+            "when it fires spuriously."));
 
     binder.opt<DeviceHAL>(
         "iree-amdaie-device-hal", deviceHal, llvm::cl::cat(category),
