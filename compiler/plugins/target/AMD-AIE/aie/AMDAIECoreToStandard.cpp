@@ -9,6 +9,7 @@
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/IRMapping.h"
@@ -40,6 +41,14 @@ static LogicalResult lockToStd(IRRewriter &rewriter, Operation *parentOp,
 
   buildDecl(acquireFunction);
   buildDecl(releaseFunction);
+
+  // EXPERIMENTAL: tag each acquire/release func.call with a stable integer
+  // identifying which underlying lock it targets (distinct from the
+  // acquire/release VALUE, which is usually just 1 for every call and is
+  // useless for telling calls to different locks apart). Read back in
+  // `coreToStd` to test the "only the first release of each lock needs a
+  // delay" hypothesis precisely. Not a real fix -- exploratory only.
+  DenseMap<Operation *, int64_t> lockIds;
 
   WalkResult res = parentOp->walk([&](UseLockOp useLock) {
     if (!isa<DeviceOp>(useLock->getParentOp())) {
@@ -78,7 +87,11 @@ static LogicalResult lockToStd(IRRewriter &rewriter, Operation *parentOp,
           rewriter.create<arith::IndexCastOp>(loc, type, useLock.getLock()),
           rewriter.create<arith::ConstantOp>(loc, type, lockAttr)};
 
-      rewriter.create<func::CallOp>(loc, func, args);
+      auto callOp = rewriter.create<func::CallOp>(loc, func, args);
+      Operation *lockDefOp = useLock.getLock().getDefiningOp();
+      int64_t id = lockIds.try_emplace(lockDefOp, (int64_t)lockIds.size())
+                       .first->second;
+      callOp->setAttr("amdaie_lock_id", rewriter.getI64IntegerAttr(id));
     }
 
     rewriter.eraseOp(useLock);
@@ -138,6 +151,79 @@ static void coreToStd(CoreOp coreOp, IRRewriter &rewriter, int tileCol,
   IRMapping mapper;
   rewriter.cloneRegionBefore(coreOp.getBody(), coreFunc.getBody(),
                              coreFunc.getBody().begin(), mapper);
+
+  // EXPERIMENTAL: insert a macro-scale delay (real runtime loop, built out
+  // of cf.br/cf.cond_br -- SCF-to-CF lowering doesn't run again this late)
+  // immediately after the FIRST release of each distinct lock value only
+  // (subsequent releases of the same lock ID -- i.e. batch 1, 2, 3, ...'s
+  // releases -- get none). Tests the "lock starts pre-charged with an
+  // initial credit, so only the very first acquire/release cycle skips a
+  // real hardware wait" hypothesis: if this narrower placement still fully
+  // fixes correctness, it directly confirms only the first use needed the
+  // delay, and is a much cheaper fix shape than delaying after every
+  // release. Not a real fix -- exploratory only.
+  {
+    MLIRContext *ctx = rewriter.getContext();
+    SmallVector<func::CallOp> releaseCalls;
+    coreFunc.getBody().walk([&](func::CallOp callOp) {
+      if (callOp.getCallee().ends_with(".release"))
+        releaseCalls.push_back(callOp);
+    });
+    SmallVector<int64_t> seenLockIds;
+    SmallVector<func::CallOp> firstReleaseCalls;
+    for (func::CallOp releaseCall : releaseCalls) {
+      auto idAttr =
+          releaseCall->getAttrOfType<IntegerAttr>("amdaie_lock_id");
+      if (!idAttr) continue;
+      int64_t lockId = idAttr.getInt();
+      if (llvm::is_contained(seenLockIds, lockId)) continue;
+      seenLockIds.push_back(lockId);
+      firstReleaseCalls.push_back(releaseCall);
+    }
+    for (func::CallOp releaseCall : firstReleaseCalls) {
+      Block *curBlock = releaseCall->getBlock();
+      rewriter.setInsertionPointAfter(releaseCall);
+      Location loc = releaseCall.getLoc();
+      Type i32Type = rewriter.getI32Type();
+      Type ptrType = LLVM::LLVMPointerType::get(ctx);
+      Value oneI32 = rewriter.create<LLVM::ConstantOp>(
+          loc, i32Type, rewriter.getI32IntegerAttr(1));
+      Value alloca = rewriter.create<LLVM::AllocaOp>(loc, ptrType, i32Type,
+                                                     oneI32, /*alignment=*/0);
+      Value dummy = rewriter.create<LLVM::ConstantOp>(
+          loc, i32Type, rewriter.getI32IntegerAttr(0));
+      Value zero = rewriter.create<arith::ConstantOp>(
+          loc, i32Type, rewriter.getI32IntegerAttr(0));
+      Value bound = rewriter.create<arith::ConstantOp>(
+          loc, i32Type, rewriter.getI32IntegerAttr(10000));
+      Value stepOne = rewriter.create<arith::ConstantOp>(
+          loc, i32Type, rewriter.getI32IntegerAttr(1));
+
+      Block *restBlock =
+          rewriter.splitBlock(curBlock, rewriter.getInsertionPoint());
+      Block *headerBlock = rewriter.createBlock(
+          &coreFunc.getBody(), Region::iterator(restBlock),
+          TypeRange{i32Type}, {loc});
+      Block *bodyBlock = rewriter.createBlock(&coreFunc.getBody(),
+                                              Region::iterator(restBlock));
+
+      rewriter.setInsertionPointToEnd(curBlock);
+      rewriter.create<cf::BranchOp>(loc, headerBlock, ValueRange{zero});
+
+      rewriter.setInsertionPointToStart(headerBlock);
+      Value iv = headerBlock->getArgument(0);
+      Value cond = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, iv, bound);
+      rewriter.create<cf::CondBranchOp>(loc, cond, bodyBlock, ValueRange{},
+                                        restBlock, ValueRange{});
+
+      rewriter.setInsertionPointToStart(bodyBlock);
+      rewriter.create<LLVM::StoreOp>(loc, dummy, alloca, /*alignment=*/0,
+                                     /*isVolatile=*/true);
+      Value next = rewriter.create<arith::AddIOp>(loc, iv, stepOne);
+      rewriter.create<cf::BranchOp>(loc, headerBlock, ValueRange{next});
+    }
+  }
 
   // Rewrite the AIE.end op
   coreFunc.getBody().walk([&](EndOp endOp) {
