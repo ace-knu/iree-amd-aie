@@ -33,18 +33,25 @@ class ChannelGenerator {
   }
 
   /// Attempts to find the first available channel that is not present in any of
-  /// the given exclusion sets.
+  /// the given exclusion sets. If `order` is non-empty, channels are tried in
+  /// that order instead of 0..numChannels-1 (used to steer selection toward
+  /// e.g. a less-contended buffer-descriptor-id pool).
   std::optional<uint8_t> findFirstAvailableChannel(
       uint8_t numChannels,
-      ArrayRef<llvm::SmallSetVector<uint8_t, 8>> excludeSets);
+      ArrayRef<llvm::SmallSetVector<uint8_t, 8>> excludeSets,
+      ArrayRef<uint8_t> order = {});
 
   /// Retrieves the next producer channel using the specified strategy.
+  /// `preferredOrder`, if non-empty, is the order in which otherwise-equal
+  /// candidate channels are tried when searching for a still-unused channel.
   std::optional<uint8_t> getAndAssignProducerDMAChannel(
-      ChannelAssignmentMode mode);
+      ChannelAssignmentMode mode, ArrayRef<uint8_t> preferredOrder = {});
 
   /// Retrieves the next consumer channel using the specified strategy.
+  /// `preferredOrder`, if non-empty, is the order in which otherwise-equal
+  /// candidate channels are tried when searching for a still-unused channel.
   std::optional<uint8_t> getAndAssignConsumerDMAChannel(
-      ChannelAssignmentMode mode);
+      ChannelAssignmentMode mode, ArrayRef<uint8_t> preferredOrder = {});
 
   /// Assigns the provided producer channel.
   void assignProducerDMAChannel(uint8_t channel, ChannelAssignmentMode mode);

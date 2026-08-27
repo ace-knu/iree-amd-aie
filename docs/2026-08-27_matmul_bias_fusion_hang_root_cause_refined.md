@@ -206,3 +206,199 @@ multi-tile인 경우만 골라 독립 connection들로 쪼개도록 구현.
 `_local/int8_debug/`에도 오늘 만든 관련 스크립트가 있습니다: `gen_bmm_bias_smallN.py`,
 `gen_bmm_bias_tiny.py`, `gen_matmul_bias_2d.py` (N/M을 줄인 재현들, circuit-only
 채널 예산이 스케일과 무관하게 부족함을 확인하는 데 씀).
+
+---
+
+## §7. BD id 예산 문제 — 실측 후 밸런싱으로 해결
+
+다음 세션(같은 날 후반)에서 "다음 단계 1"을 실제로 시도했습니다.
+
+**견적(실측):** memtile의 BD id 예산은 총 48개(even 채널군 24 + odd 채널군
+24)로 넉넉한데, `matmul_bias_2d`(M=32) 실패 지점을 실측하니 **odd 그룹은
+24/24로 꽉 찼고 even 그룹은 20/24로 여유가 있었습니다.** 즉 "예산 절대 부족"이
+아니라 "채널 배정이 한쪽으로 쏠린" 문제였습니다.
+
+**원인:** `runtime/.../Utils/ChannelGenerator.cpp`의 채널 선택 로직
+(`findFirstAvailableChannel`)이 그냥 인덱스 순서(0,1,2...)로 첫 빈 채널을
+고르고, BD id 풀이 어느 쪽에 여유가 있는지 전혀 모름.
+
+**수정 (3번의 반복, 매번 재측정 후 재수정):**
+1. 새 채널 탐색 경로에 `preferredOrder`(풀 여유량 기준 재정렬)를 추가 — **효과
+   없음.** 원인: 이미 배정된 채널을 재사용하는 LRU 폴백 경로가 그대로였고,
+   문제되는 마지막 연결들이 전부 그 경로를 탐.
+2. LRU 재사용 폴백도 `preferredOrder`를 참고하도록 수정 — 불균형이
+   **odd→even으로 반전**(even 24/24, odd 22/24). 원인: producer(MM2S)/consumer
+   (S2MM) 사용량을 따로 카운트했는데, 실제로는 한 타일의 BD id 풀을 양쪽
+   방향이 **공유**함(`AMDAIEAssignBufferDescriptorIDs.cpp`가 방향 무관하게 타일당
+   제너레이터 하나만 씀).
+3. producer/consumer 카운터를 하나로 통합 — **여전히 효과 없음.** 원인: circuit
+   connection이 먼저 채널을 가져가며 이미 한쪽 풀을 채워놓는데, 카운터를 packet
+   모드일 때만 증가시켜서 packet 밸런싱 로직이 circuit이 만든 쏠림을 못 봄.
+4. circuit 배정도 카운터에 반영(재정렬 대상은 여전히 packet만) — **`could not
+   find and assign a valid BD id` 에러가 로그에서 완전히 사라짐.** BD id 문제
+   해결 확인.
+
+## §8. 그 자리를 대신한 새 병목 — 라우팅/arbiter 자원
+
+BD id가 뚫리자 컴파일이 훨씬 더 진행됐고(런타임 시퀀스, `npu_instructions`까지
+생성), 대신 그 다음 단계에서 새 에러가 남:
+
+```
+error: 'aie.device' op could not create a valid routing configuration
+error: failed to convert packet flows to amsels and rules
+```
+
+같은 근본 원인(1개 connection → N개 독립 connection으로 쪼개면 모든 하류
+하드웨어 자원을 N배로 소비)이 BD id 다음으로 라우팅 자원에서도 나타난 것.
+
+## §9. 원인 재규정 — "쪼개기"가 아니라 "타입"이 문제였다
+
+사용자와의 논의로 관점이 바뀜: split 로직은 fan-out(하나가 여러 개로 뻗는 구조)
+자체는 없앴지만, 쪼개진 N개 connection이 여전히 **`ConnectionType::Packet`**로
+남아있어서(원본 타입을 그대로 clone) 패킷 스위치 전용 자원(BD id → 라우팅)을
+계속 소비하고 있었음이 드러남. → "쪼갠 뒤 Circuit 타입으로 재분류할 수 있는가"
+라는 새 가설(§10) 로 이어짐.
+
+## §10. 실험 (B): split 후 Circuit 재분류 — 실패, 예상된 방식으로
+
+`splitPacketConnectionAcrossTiles`에서 clone한 connection을
+`ConnectionType::Circuit`로 재생성하도록 임시 수정 → 컴파일 시도:
+
+```
+error: 'amdaie.connection' op no producer DMA channel available
+```
+
+**원래 `packet-flow-strategy=inputs`를 도입했던 바로 그 문제(circuit 채널
+예산 고갈)가 정확히 재발.** split된 4개 connection이 circuit 채널(타일당 6개)
+을 다른 operand들과 나눠 쓰다가 바닥남. → **(B) 기각, 코드 되돌림.**
+
+## §11. bias의 실제 데이터 패턴 확인 — 여러 번 정정된 끝에
+
+이 지점에서 "bias가 진짜 브로드캐스트(같은 값)인지, distribute(다른 슬라이스)
+인지"를 여러 차례 재확인/정정했습니다 (세션 내 시행착오 기록):
+
+1. 최초 실측(잘못됨): memtile의 한 채널 그룹에서 offset 0/64/128/192로 4등분된
+   버퍼를 발견 → "bias는 distribute"라고 결론. **나중에 이 버퍼가 bias가 아니라
+   다른 operand(X/Y)였다고 판명.**
+2. 재확인: bias의 진짜 소스(`memref<64xf32>`)를 추적하니 모든 `dma_bd`가
+   `offset=0, len=64`(전체) → "bias는 완전 브로드캐스트"로 정정.
+3. 사용자 지적으로 재재확인: pre-lowering IR
+   (`scf.forall (%arg2, %arg3) in (4, 8) {...} {mapping = [thread<y>, thread<x>]}`,
+   `%arg2`=row(4), `%arg3`=col(8))을 직접 추적한 결과, **최종 정답**은:
+   - L3→L2(shim→memtile): 8개 column이 각자 독립적으로 bias 전체 64개를
+     DRAM에서 재읽음 (`aie.shim_dma_allocation`이 column마다 별도 심볼, fan-out
+     아님, 안전)
+   - L2→L1(memtile→4코어): 그 column 몫인 **8개만** 잘라서(`%lof[%arg3,0]`,
+     row `%arg2`는 인덱싱에 안 쓰임) 같은 column의 4개 row 코어에 **동일하게
+     브로드캐스트**. `{%tile_0_2, %tile_0_3, %tile_0_4, %tile_0_5}` 같은 식으로
+     4개 타일이 `memref<8xf32,2>` 하나를 공유.
+
+   즉 **column(8) 방향은 distribute, row(4) 방향은 broadcast** — 사용자가 처음에
+   제안한 모델이 정확했음. (제가 1번에서 반대로 짚었던 게 완전히 다른 버퍼를
+   착각한 것이었고, 2번의 "완전 브로드캐스트"도 column 방향 차이를 놓친
+   불완전한 결론이었음.)
+
+## §12. 실하드웨어 검증: "브로드캐스트도 hang" — 결정적 확정
+
+§9의 재규정에 따라, split을 하지 않고 원본 bias connection(4타일 공유, 진짜
+브로드캐스트)을 그대로 둔 채 IREE 전체 파이프라인(mlir-aie 아님, 실제
+`iree-compile`+`iree-run-module`+실 npu4)으로 직접 테스트:
+
+- `AMDAIEAssignChannels.cpp`에 `isGenuineDistribute` 휴리스틱(소스/타깃
+  objectFifo 크기 비교)을 임시 추가해 **크기가 같으면(브로드캐스트) split을
+  건너뛰도록** 수정.
+- 결과: **BD id, 라우팅 에러 둘 다 완전히 사라지고 컴파일 성공**(304479 바이트
+  vmfb). bias를 안 쪼개니 자원 소모가 사라진 것 확인.
+- 하지만 `scripts/debug/pipeline_dump.py`로 실 npu4에서 실행하니:
+  ```
+  INTERNAL; amdxdna dispatch did not complete: ert state 8 (TIMEOUT)
+  ```
+  **여전히 hang.** → "브로드캐스트는 안전하다"는 가설이 실하드웨어로 반박됨.
+
+**최종 결론:** distribute든 broadcast든, "**1개의 물리 자원(BD)이 여러 물리적
+목적지로 동시에 fan-out하는 구조 자체**"가 데이터 내용과 무관하게 이 하드웨어
+(npu4/Strix)에서 hang을 유발함. → `isGenuineDistribute` 휴리스틱 되돌림
+(최종 커밋에는 미포함, BD id 밸런싱만 남음).
+
+## §13. 컴파일러 자원 검사(`detect-arbiter-deadlock`)가 이걸 못 잡는 이유
+
+§12의 hang이 "컴파일러가 자원 초과를 놓친 것 아니냐"는 가설을 검증:
+
+- `--iree-amdaie-detect-arbiter-deadlock`은 **기본값이 이미 `true`**(항상
+  켜져 있었음). 다만 검사 범위가 좁아서 "한 arbiter가 msel 그룹을 2개 이상
+  쓰는가"만 봄 — "arbiter를 몇 개 쓰는가"나 "브로드캐스트가 하드웨어적으로
+  안전한가"는 애초에 검사 대상이 아님.
+- §12에서 컴파일된 IR을 직접 스캔: arbiter 인덱스 최댓값 4(한도 5 이내), msel
+  최댓값 0(한도 3 이내, 사실상 미사용) — **자원 초과 흔적 전혀 없음.**
+- 즉 "컴파일러가 자원 폭증을 놓쳤다"는 가설은 숫자로 반박됨. 하드웨어 문서상
+  한도 내인데도 hang 나는 걸 보면, 컴파일 타임 카운팅으로는 원천적으로 못 잡는
+  실리콘/펌웨어 레벨 문제일 가능성이 높음 — §12 결론을 재확인함.
+
+## §14. Upstream 사례 조사 — nod-ai/iree-amd-aie#644, PR #709
+
+같은 클래스 문제("matmul+elementwise 융합 시 connection 폭증")를 upstream
+팀도 겪었는지 웹 검색:
+
+- **[Issue #644 "ObjectFifo Matmul + Elementwise"](https://github.com/nod-ai/iree-amd-aie/issues/644)**:
+  정확히 같은 문제. 팀이 검토한 3가지 접근법 중 "1. 패킷 라우팅으로 스트림
+  재사용"은 **명시적으로 기각**하고 "3. 가능한 connection들을 하나로 통합
+  (재사용)"을 채택.
+- **[PR #709](https://github.com/nod-ai/iree-amd-aie/pull/709)**: approach 3의
+  실제 구현. `amdaie.logicalobjectfifo.placeholder` 메커니즘으로 **L3(DDR)
+  쪽에서만** 하나의 물리 connection을 여러 논리적 데이터가 시간차로(순차적으로)
+  재사용하게 함.
+- **저장소 내 확인**: `AMDAIE_LogicalObjectFifoPlaceholderOp`
+  (`AMDAIEOps.td:1459`)와 `AMDAIECreateAIEWorkgroup.cpp:160-200`에 이미
+  존재. `AMDAIEDistributeCoresAndObjectFifos.cpp`(#625),
+  `AMDAIEFlattenLogicalObjectFifo.cpp`(#638/#652)도 존재하고 기본 파이프라인에
+  이미 포함됨.
+- **직접 확인**: 이 두 패스 전후로 IR을 덤프해서 봤더니, X/Y/bias는 이 패스들
+  실행 전후로도 **여전히 별개의 `dma_cpy_nd`**로 남아있음 — 즉 이 기존
+  인프라는 "connection 결합(bias를 X/Y 채널에 얹기)"을 자동으로 해주지
+  않음. approach 3 인프라는 있지만 **L3 레벨 시간차 재사용에 한정**돼 있어서,
+  우리 문제(L1/L2에서 bias가 4개 코어로 fan-out)에는 그대로 적용 안 됨 —
+  새로운 확장 구현이 필요함 (예: K-loop 시작 전 prologue로 bias를 X/Y 채널에
+  한 번 얹는 방식 — 순차적 재사용이라면 구조적으로는 말이 됨, 미구현).
+
+## §15. 크기 재검증 — 8 vs 64, 결론 재확인
+
+§12의 실하드웨어 hang이 정확한 크기(8개 원소)로 검증된 것인지 재확인 요청 →
+`AMDAIEAssignChannels` 직전 IR을 직접 덤프해서 해당 connection을 확인:
+
+```
+%56 = amdaie.connection(%lof_0_r_76 : memref<8xf32,2>(4타일), %lof_0_1 : memref<8xf32,1>)
+      {connection_type = Packet}
+```
+
+**양쪽 다 정확히 8개 원소.** §12에서 hang을 확인한 connection은 처음부터
+authentic한 8개짜리였음 (별도로 만든 mlir-aie N=64 합성 테스트만 크기가 안
+맞았던 것뿐, 결정적 증거인 실 IREE 테스트는 애초부터 정확했음). **§12의 결론은
+그대로 유효.**
+
+## 오늘 최종 커밋 상태 및 파일별 변경사항
+
+BD id 밸런싱(§7)만 최종 반영, 그 외 실험적 코드(circuit 재분류 §10, broadcast
+skip 휴리스틱 §12)는 전부 되돌림.
+
+| 파일 | 변경 내용 |
+|---|---|
+| `compiler/plugins/target/AMD-AIE/iree-amd-aie/Transforms/AMDAIEAssignChannels.cpp` | `computeBdIdPools`/`buildBdIdAwareChannelOrder` 추가, packet-flow 채널 배정 시 BD-id 풀(짝/홀) 여유량 기준으로 재정렬하도록 `assignChannels` 수정. `splitMultiTilePacketConnections`(§6, 어제 구현)는 그대로 유지 |
+| `runtime/src/iree-amd-aie/aie_runtime/Utils/ChannelGenerator.h` | `findFirstAvailableChannel`/`getAndAssignProducerDMAChannel`/`getAndAssignConsumerDMAChannel`에 `order`/`preferredOrder` 파라미터 추가 |
+| `runtime/src/iree-amd-aie/aie_runtime/Utils/ChannelGenerator.cpp` | 위 파라미터 구현 — 새 채널 탐색과 LRU 재사용 폴백 둘 다 `preferredOrder`를 따르도록 |
+
+**검증:** `matmul_bias_2d`(M=32) 기준 BD id 에러 완전 해소(재현 로그 3종,
+`bdcount_v3~v6.log` 계열로 반복 확인). `bmm_pure_repro`(패킷 connection 없는
+케이스) 회귀 없음.
+
+## 다음 단계 (미결, §12 결론 기준으로 갱신)
+
+1. **§10/§12로 "connection 쪼개기" 계열 우회는 전부 막힘** (circuit 재분류는
+   채널 고갈, split 자체는 라우팅 고갈, split 없이 두면 hang). 남은 방향은
+   §14의 **connection 결합(approach 3 확장)** — bias를 X 또는 Y operand의
+   기존 connection에 prologue 방식(순차 재사용)으로 얹는 새 구현. 아직 미착수.
+2. 위가 막히면 §1의 (c), 즉 packet-ID 기반 라우팅(mlir-aie `packet_switch`
+   예제 방식)이 진짜 대안인지 — `distribute`(hang)와 `packet_switch`(안전
+   확인됨)의 IR/하드웨어 레벨 메커니즘 차이를 규명하는 조사가 필요. 아직
+   미착수.
+3. 어느 쪽이든 해결되면 `matmul_bias_2d`(M=32) 실하드웨어 검증 →
+   `bmm_bias_repro`(배치 포함 원래 케이스) → 8컬럼 전체 스케일 확장.

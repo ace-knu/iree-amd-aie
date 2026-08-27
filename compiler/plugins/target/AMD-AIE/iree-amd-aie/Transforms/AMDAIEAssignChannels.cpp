@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <numeric>
+
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
@@ -279,6 +281,70 @@ LogicalResult initializeChannelsGenerators(
 }
 
 /// Assign channels to `amdaie.connection` ops.
+/// Groups DMA channel indices of the given tile type by the buffer-
+/// descriptor-id pool they draw from (e.g. `MEMTILE` channels split into an
+/// even and an odd pool of 24 ids each; `SHIMNOC` channels share one pool).
+/// Each group is sorted ascending; groups are returned in ascending order of
+/// their first (smallest) member.
+SmallVector<SmallVector<uint8_t>> computeBdIdPools(
+    const AMDAIEDeviceModel &deviceModel, AMDAIETileType tileType) {
+  DenseMap<uint32_t, SmallVector<uint32_t>> channelToValidBdIds =
+      deviceModel.getChannelToValidBdIds(tileType);
+  SmallVector<uint32_t> channels;
+  for (auto &[channel, _] : channelToValidBdIds) channels.push_back(channel);
+  llvm::sort(channels);
+  SmallVector<SmallVector<uint8_t>> pools;
+  for (uint32_t channel : channels) {
+    const SmallVector<uint32_t> &validBdIds = channelToValidBdIds[channel];
+    bool merged = false;
+    for (SmallVector<uint8_t> &pool : pools) {
+      if (channelToValidBdIds[pool.front()] == validBdIds) {
+        pool.push_back(static_cast<uint8_t>(channel));
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) pools.push_back({static_cast<uint8_t>(channel)});
+  }
+  return pools;
+}
+
+/// Orders all channels across `pools` so channels in the least-contended
+/// pool (lowest summed `channelUseCounts` among its channels) come first.
+/// Used to steer packet-flow channel assignment away from a
+/// buffer-descriptor-id pool that's already heavily used -- e.g. when
+/// `splitMultiTilePacketConnections` turns one multi-tile connection into N
+/// independent single-tile ones, naively assigning channels index-first can
+/// pile most of that new demand onto a single BD-id pool (observed: one pool
+/// fully exhausted while a sibling pool still had headroom) even though a
+/// pool-balanced choice would fit. `channelUseCounts` counts *connections*
+/// routed to each channel so far (not just distinct channels touched) --
+/// distinct-channel counting saturates as soon as every channel in a pool
+/// has been touched once, at which point it can no longer tell a
+/// lightly-reused pool from a heavily-reused one. Channels within a pool
+/// keep ascending order relative to each other.
+SmallVector<uint8_t> buildBdIdAwareChannelOrder(
+    ArrayRef<SmallVector<uint8_t>> pools,
+    const DenseMap<uint8_t, int> &channelUseCounts) {
+  SmallVector<size_t> poolIndices(pools.size());
+  std::iota(poolIndices.begin(), poolIndices.end(), 0);
+  auto usageInPool = [&](size_t poolIdx) {
+    int total = 0;
+    for (uint8_t channel : pools[poolIdx]) {
+      auto it = channelUseCounts.find(channel);
+      if (it != channelUseCounts.end()) total += it->second;
+    }
+    return total;
+  };
+  llvm::stable_sort(poolIndices, [&](size_t a, size_t b) {
+    return usageInPool(a) < usageInPool(b);
+  });
+  SmallVector<uint8_t> order;
+  for (size_t poolIdx : poolIndices)
+    order.append(pools[poolIdx].begin(), pools[poolIdx].end());
+  return order;
+}
+
 LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
   IRRewriter rewriter(workgroupOp->getContext());
 
@@ -300,6 +366,42 @@ LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
                                           tileToGeneratorMap))) {
     return failure();
   }
+  // For packet-flow channel assignment, order candidate channels to prefer
+  // whichever buffer-descriptor-id pool is least contended so far on this
+  // tile, rather than always trying low indices first. See
+  // `buildBdIdAwareChannelOrder` for why this matters. Contention is tracked
+  // as a per-(tile, channel) connection count -- not just which channels
+  // have been touched -- since a pool's channels can all be touched once
+  // each while still differing a lot in how many connections (and thus BD
+  // ids) actually ended up on each of them. Producer (MM2S) and consumer
+  // (S2MM) channels are numbered independently, but on a `MEMTILE`/`SHIMNOC`
+  // both directions' `dma_bd`s are assigned from the *same* per-tile,
+  // per-parity buffer-descriptor-id pool (`AMDAIEAssignBufferDescriptorIDs`
+  // uses one generator per tile covering all of its blocks, regardless of
+  // direction) -- so a single combined counter is used here for both, not
+  // separate producer/consumer ones, or each direction would balance
+  // against a pool that looks emptier than it really is.
+  DenseMap<Value, DenseMap<uint8_t, int>> tileToChannelUseCounts;
+  auto computeBdIdAwareOrder = [&](Value tile,
+                                   const DenseMap<uint8_t, int> &useCounts)
+      -> SmallVector<uint8_t> {
+    auto tileOp = dyn_cast_if_present<AMDAIE::TileOp>(tile.getDefiningOp());
+    if (!tileOp) return {};
+    uint32_t col = getConstantIndexOrAssert(tileOp.getCol());
+    uint32_t row = getConstantIndexOrAssert(tileOp.getRow());
+    AMDAIETileType tileType = deviceModel.getTileType(col, row);
+    // `getChannelToValidBdIds` only has cases for `MEMTILE`/`SHIMNOC`; other
+    // tile types (e.g. compute cores) don't have a BD-id pool to be aware
+    // of here, so leave their channel order unchanged.
+    if (tileType != AMDAIETileType::MEMTILE &&
+        tileType != AMDAIETileType::SHIMNOC) {
+      return {};
+    }
+    SmallVector<SmallVector<uint8_t>> pools =
+        computeBdIdPools(deviceModel, tileType);
+    if (pools.size() <= 1) return {};
+    return buildBdIdAwareChannelOrder(pools, useCounts);
+  };
   // Get all `amdaie.connection` ops.
   SmallVector<AMDAIE::ConnectionOp> circuitConnections, packetConnections;
   workgroupOp->walk([&](AMDAIE::ConnectionOp op) {
@@ -341,12 +443,22 @@ LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
       for (Value tile : sourceLogicalObjFifo.getTiles()) {
         assert(tileToGeneratorMap.contains(tile) &&
                "no channel generator found for tile");
+        SmallVector<uint8_t> preferredOrder;
+        if (mode == ChannelAssignmentMode::RoundRobinPacketFlow) {
+          preferredOrder =
+              computeBdIdAwareOrder(tile, tileToChannelUseCounts[tile]);
+        }
         std::optional<uint8_t> maybeChannel =
-            tileToGeneratorMap[tile].getAndAssignProducerDMAChannel(mode);
+            tileToGeneratorMap[tile].getAndAssignProducerDMAChannel(
+                mode, preferredOrder);
         if (!maybeChannel) {
           return connectionOp.emitOpError()
                  << "no producer DMA channel available";
         }
+        // Count circuit assignments too: they draw from the same per-tile
+        // buffer-descriptor-id pool, so packet-flow balancing needs to see
+        // their load even though only packet flows get reordered.
+        ++tileToChannelUseCounts[tile][maybeChannel.value()];
         auto channelOp = rewriter.create<AMDAIE::ChannelOp>(
             rewriter.getUnknownLoc(), tile, maybeChannel.value(),
             StrmSwPortType::DMA, AMDAIE::DMAChannelDir::MM2S);
@@ -359,12 +471,22 @@ LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
       for (Value tile : targetLogicalObjFifo.getTiles()) {
         assert(tileToGeneratorMap.contains(tile) &&
                "no channel generator found for tile");
+        SmallVector<uint8_t> preferredOrder;
+        if (mode == ChannelAssignmentMode::RoundRobinPacketFlow) {
+          preferredOrder =
+              computeBdIdAwareOrder(tile, tileToChannelUseCounts[tile]);
+        }
         std::optional<uint8_t> maybeChannel =
-            tileToGeneratorMap[tile].getAndAssignConsumerDMAChannel(mode);
+            tileToGeneratorMap[tile].getAndAssignConsumerDMAChannel(
+                mode, preferredOrder);
         if (!maybeChannel) {
           return connectionOp.emitOpError()
                  << "no consumer DMA channel available";
         }
+        // Count circuit assignments too: they draw from the same per-tile
+        // buffer-descriptor-id pool, so packet-flow balancing needs to see
+        // their load even though only packet flows get reordered.
+        ++tileToChannelUseCounts[tile][maybeChannel.value()];
         auto channelOp = rewriter.create<AMDAIE::ChannelOp>(
             rewriter.getUnknownLoc(), tile, maybeChannel.value(),
             StrmSwPortType::DMA, AMDAIE::DMAChannelDir::S2MM);
