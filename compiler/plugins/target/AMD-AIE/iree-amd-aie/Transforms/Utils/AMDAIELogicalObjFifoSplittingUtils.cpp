@@ -274,6 +274,23 @@ static LogicalResult checkWhetherSplitIsPossible(
                                         splitDimsForL2.size());
   std::iota(nonSplitDimsForL2.begin(), nonSplitDimsForL2.end(),
             splitDimsForL2.size());
+  // The logic below (here and in `splitLogicalObjectFifoForElementwiseOp`)
+  // pairs up each split dimension with a corresponding non-split dimension
+  // one-to-one (via `zip_equal`), which is only a valid correspondence when
+  // there are as many of one as the other -- true for the pack-derived
+  // (outer-dims, inner-dims) buffers this was originally written for, but not
+  // guaranteed in general (e.g. a buffer with an extra degenerate/broadcast
+  // dimension that is neither split nor part of such a pairing). Bail out
+  // safely instead of asserting in `zip_equal` on a mismatched length.
+  if (splitDimsForL2.size() != nonSplitDimsForL2.size()) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "cannot split L2 logicalobjectfifo because the number of "
+                  "split dimensions ("
+               << splitDimsForL2.size()
+               << ") does not match the number of non-split dimensions ("
+               << nonSplitDimsForL2.size() << ")\n");
+    return failure();
+  }
 
   for (AMDAIE::DmaCpyNdOp l2ToL1DmaOp : l2ToL1DmaOps) {
     SmallVector<OpFoldResult, 6> staticL2AsSourceOffsets =

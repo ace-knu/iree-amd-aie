@@ -54,6 +54,22 @@ struct AMDAIESession
   }
 
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
+    // Fold a matmul's broadcast-bias accumulator into one extra K row/column
+    // (y = W*x + b == W_aug * x_aug) before GlobalOptimization ever sees the
+    // op. This removes bias as a distinct dispatch input, so
+    // dispatch-creation's contraction-fusion heuristic never has to give it
+    // its own shim DMA connections -- the motivation for
+    // --iree-dispatch-creation-no-fuse-into-contraction-conv-roots and
+    // --iree-global-opt-detach-elementwise-through-reshape (see
+    // models/vgg16/README.md) in the first place, for this pattern. No-op
+    // (pattern not matched) for a matmul that is not bias-accumulated this
+    // way, so unrelated matmuls are unaffected. Runs before bf16 demotion
+    // below so the augmented bias row/constant-one column get demoted to
+    // bf16 together with the rest of the matmul's operands.
+    AMDAIE::AMDAIEFoldBiasIntoContractionOptions foldBiasOptions;
+    foldBiasOptions.foldConvBias = options.foldConvBiasIntoContraction;
+    passManager.addPass(
+        AMDAIE::createAMDAIEFoldBiasIntoContractionPass(foldBiasOptions));
     // Demote contraction (matmul + conv) inputs f32 -> bf16 before the named
     // ops are generalized (the upstream demote pass only matches named ops).
     // npu4 has no f32 vector path, so this is required to run f32 models.

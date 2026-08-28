@@ -87,6 +87,22 @@ def AMDAIEAssignDeviceAffinities :
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
 }
 
+def AMDAIEFoldBiasIntoContraction :
+    Pass<"iree-amdaie-fold-bias-into-contraction", "ModuleOp"> {
+  let summary = "Fold a matmul's broadcast-bias accumulator into one extra "
+                "K reduction row/column, so bias never becomes a separate "
+                "contraction operand.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBiasIntoContractionPass()";
+  let options = [
+    Option<"foldConvBias", "fold-conv-bias", "bool", /*default=*/"true",
+      "Also apply the K+1 fold to conv2d + bias (not just matmul). Disable "
+      "to keep conv's bias as a separate dispatch input (relying on the "
+      "usual detach/no-fuse workaround flags for conv), while matmul bias "
+      "is still folded into the same dispatch.">
+  ];
+}
+
 def AMDAIEPadContractionDispatches :
     Pass<"iree-amdaie-pad-contraction-dispatches", "ModuleOp"> {
   let summary = "Pad NPU contraction dispatch operands up to the target pack-peel tile multiples at the Flow dispatch boundary (target-known, via each dispatch's device affinity).";

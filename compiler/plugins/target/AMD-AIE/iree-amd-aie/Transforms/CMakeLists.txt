@@ -77,6 +77,7 @@ iree_cc_library(
     "AMDAIEDmaToCircularDma.cpp"
     "AMDAIEFlattenLogicalObjectFifo.cpp"
     "AMDAIELinalgFunctionOutlining.cpp"
+    "AMDAIEFoldBiasIntoContraction.cpp"
     "AMDAIEFoldDmaWaits.cpp"
     "AMDAIEFuseConsumerIntoLoop.cpp"
     "AMDAIEFuseFillIntoForall.cpp"

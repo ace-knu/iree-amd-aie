@@ -84,6 +84,14 @@ std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 /// NPU, everything else -> CPU) for heterogeneous CPU+NPU execution.
 std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass();
 
+/// Create a pass that folds a `linalg.matmul` whose accumulator is a
+/// broadcast of a 1-D bias into a single bias-free matmul with one extra
+/// reduction (K) row/column (the "K+1 augmentation" identity
+/// `y = W*x + b == W_aug * x_aug`), so amd-aie codegen never has to handle a
+/// separate bias operand for this pattern.
+std::unique_ptr<Pass> createAMDAIEFoldBiasIntoContractionPass(
+    AMDAIEFoldBiasIntoContractionOptions options = {});
+
 /// Create a pass to pad the operands of NPU contraction dispatches up to the
 /// target's pack-peel tile multiples (so divisibility holds inside the
 /// dispatch), inserting the padding at the Flow dispatch boundary.

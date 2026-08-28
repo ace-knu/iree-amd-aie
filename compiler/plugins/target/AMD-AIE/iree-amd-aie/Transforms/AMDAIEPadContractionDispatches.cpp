@@ -16,23 +16,45 @@
 //
 // Runs right after `AMDAIEAssignDeviceAffinities`, when every `flow.dispatch`
 // already carries a `stream.affinity` and dispatch regions are outlined. This
-// pass assumes the amd-aie contraction dispatch is a *plain* matmul
-// (`empty -> fill(0) -> matmul -> store`, with bias/relu/etc. already split into
-// separate dispatches upstream). For such a dispatch pinned to an amd-aie device
-// whose M/K dims are not multiples of the target tiles, it:
+// pass assumes the amd-aie contraction dispatch is a matmul whose accumulator
+// (`outs`) is *either* a fresh zero-init (`empty -> fill(0) -> matmul`), *or* a
+// full-tensor load of a [M, N] bias operand straight from a binding
+// (`load -> matmul`, e.g. a conv2d+bias that never went through
+// `DetachElementwiseFromNamedOpsPass`'s zero-fill split) -- see `MatmulInfo`'s
+// comment. The matmul's result is *either* stored directly, *or* consumed by
+// one or more fused elementwise ops (e.g. a ReLU or bias-add fused onto the
+// same dispatch by normal IREE fusion) before the store. For such a dispatch
+// pinned to an amd-aie device whose M/K dims are not multiples of the target
+// tiles, it:
 //   * zero-pads the matmul operands to the padded shape *outside* the dispatch
 //     (a host `tensor.pad` dispatch), and
 //   * rewrites the executable so its bindings/loads/matmul see the padded shape.
 //
 // K is a reduction dim: the padded elements are zero, so the extra products are
-// zero and the output is unchanged (no cropping). The output dims M (outer) and
-// N (inner) are handled uniformly: when either is padded the matmul output, the
-// output binding and the store grow too, and the padded dispatch result is
-// cropped back to the logical shape by a `tensor.extract_slice` *dispatch*
-// placed on the host (CPU). Using a dispatch (rather than `flow.tensor.slice`,
-// which only crops a contiguous outer-dim range) lets the inner N dim be cropped
-// with a strided extraction, so a dispatch whose N is non-divisible (e.g. a
-// 1000-class classifier matmul) is padded and cropped like M.
+// zero and the output is unchanged (no cropping) -- this holds regardless of
+// what (if anything) consumes the matmul's result, so K-only padding is always
+// safe to apply. The output dims M (outer) and N (inner) are different: when
+// either is padded, the matmul output, the output binding and the store must
+// grow too, and the padded dispatch result is cropped back to the logical
+// shape by a `tensor.extract_slice` *dispatch* placed on the host (CPU). Using
+// a dispatch (rather than `flow.tensor.slice`, which only crops a contiguous
+// outer-dim range) lets the inner N dim be cropped with a strided extraction,
+// so a dispatch whose N is non-divisible (e.g. a 1000-class classifier matmul)
+// is padded and cropped like M.
+//
+// Growing the output through an arbitrary fused consumer is still not
+// implemented in general, but one common shape *is* handled: a single fused
+// elementwise consumer (e.g. a ReLU) that is a pure shape-preserving unary map
+// over the matmul's result (one input == the matmul result, one output,
+// identity indexing maps, all-parallel iterators -- see
+// `isShapePreservingUnaryMapOf`). Such an op cannot depend on absolute tensor
+// size or mix across positions, so it is grown to [mPad, nPad] right alongside
+// the matmul and its (discarded-by-cropping) output on the padded region is
+// irrelevant to correctness. A dispatch that needs M/N padding and has any
+// other shape of fused consumer (a reduction, more than one real input, or a
+// chain of more than one intervening op) is still conservatively skipped
+// entirely -- see `MatmulInfo`'s comment and the `padOut` check in
+// `runOnOperation`.
 //
 // The padding multiples are read from each dispatch's own device affinity
 // (affinity -> device global -> executable target attr), never hardcoded, so the
@@ -126,18 +148,57 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
                           /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
 }
 
-/// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
-/// executable, with the ops/bindings needed to grow its M/K dims. Sizes are
-/// intentionally not cached here -- they are read from each caller dispatch's
-/// operands so a shared executable can be handled per caller.
+/// A matmul (`[empty -> fill | load] -> matmul -> [elementwise consumer(s)]
+/// -> store`) inside a dispatch executable, with the ops/bindings needed to
+/// grow its M/K dims. Sizes are intentionally not cached here -- they are read
+/// from each caller dispatch's operands so a shared executable can be handled
+/// per caller.
+///
+/// The accumulator (matmul's `outs`) is recognized in exactly one of two
+/// mutually-exclusive forms, populating exactly one of these field pairs:
+///   * `fill`/`empty`: a fresh zero-init (`matmul outs(fill(empty))`).
+///   * `accLoad`/`accArg`: a full-tensor load of a [M, N] bias operand
+///     straight from a binding (`matmul outs(load)`) -- e.g. a conv2d+bias
+///     dispatch whose bias was already broadcast to the output shape by an
+///     earlier op, so the accumulator itself is a plain external input
+///     rather than a zero-init. Growing this form pads the bias binding's
+///     *value* the same way LHS/RHS are padded (see `runOnOperation`'s
+///     accArg handling): the extra M/N rows/cols it introduces are never
+///     read back, since the grown result is cropped to the original [m, n]
+///     afterward, so their padded value is immaterial.
+///
+/// `store`/`outArg` are populated when the single store in the function
+/// consumes the matmul result either *directly*, or *indirectly* through
+/// exactly one fused `elementwiseConsumer` (see below). When the store's value
+/// is produced by anything else (a reduction-shaped consumer, a consumer with
+/// more than one real input, or a chain of more than one intervening op),
+/// `store`/`outArg` are left null: K-only padding (a reduction dim -- the
+/// extra products are zero, so the matmul's result value and shape are
+/// provably unchanged) can still proceed using only
+/// lhsArg/rhsArg/lhsLoad/rhsLoad, but growing the *output* side through an
+/// unrecognized intervening consumer is not handled, so callers must check
+/// `store`/`outArg` before attempting to pad M or N.
 struct MatmulInfo {
   linalg::MatmulOp matmul;
   IREE::TensorExt::DispatchTensorLoadOp lhsLoad, rhsLoad;
   BlockArgument lhsArg, rhsArg;  // executable bindings feeding LHS/RHS
   linalg::FillOp fill;           // output init: matmul outs = fill(empty)
   tensor::EmptyOp empty;
+  // Accumulator-as-bias form (see struct comment); null unless fill/empty are
+  // both null.
+  IREE::TensorExt::DispatchTensorLoadOp accLoad;
+  BlockArgument accArg;
+  // Set (non-null) when exactly one elementwise op sits between the matmul
+  // and the store, and it is a pure shape-preserving unary map over the
+  // matmul's result (see `isShapePreservingUnaryMapOf`) -- e.g. a fused ReLU.
+  // Null when the store consumes the matmul result directly.
+  linalg::GenericOp elementwiseConsumer;
   IREE::TensorExt::DispatchTensorStoreOp store;  // writes the output binding
-  BlockArgument outArg;                          // the output binding
+                                                  // (null if the store's value
+                                                  // isn't the matmul result or
+                                                  // a recognized single
+                                                  // elementwise consumer of it)
+  BlockArgument outArg;  // the output binding (null under the same condition)
 };
 
 /// Returns the func of a dispatch's single entry point, or null.
@@ -168,9 +229,45 @@ static IREE::TensorExt::DispatchTensorLoadOp getFullTensorLoad(Value operand) {
   return load;
 }
 
-/// Inspects the func for a single plain matmul: LHS/RHS from full-tensor loads
-/// of bindings, an `empty`+`fill` output init, and the matmul result stored
-/// directly to the output binding.
+/// True iff `generic` is a pure per-position (shape-preserving) unary map
+/// whose one real input is exactly `input`: exactly one DPS input, exactly one
+/// DPS init/output, every indexing map is the 2-D identity map (no
+/// permutation, no broadcast, no projection), and every iterator is
+/// `parallel` (no `reduction`). The op's body is deliberately not inspected --
+/// these structural checks alone guarantee the op cannot depend on absolute
+/// tensor size or mix values across positions, so padding `input` with zeros
+/// and then cropping the result later is safe regardless of what arithmetic
+/// the body performs (e.g. a fused ReLU's `cmpf`+`select`).
+static bool isShapePreservingUnaryMapOf(linalg::GenericOp generic,
+                                        Value input) {
+  if (!generic) return false;
+  if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
+    return false;
+  if (generic->getNumResults() != 1) return false;
+  if (generic.getDpsInputOperand(0)->get() != input) return false;
+  if (generic.getNumLoops() != 2) return false;
+  AffineMap identity =
+      AffineMap::getMultiDimIdentityMap(2, generic.getContext());
+  for (AffineMap map : generic.getIndexingMapsArray())
+    if (map != identity) return false;
+  for (utils::IteratorType it : generic.getIteratorTypesArray())
+    if (it != utils::IteratorType::parallel) return false;
+  return true;
+}
+
+/// Inspects the func for a single matmul: LHS/RHS from full-tensor loads of
+/// bindings, an `empty`+`fill` output init, and exactly one store in the
+/// function. The store may consume the matmul result directly (a plain
+/// matmul dispatch), or indirectly through exactly one fused elementwise op
+/// that is a shape-preserving unary map of the matmul result (e.g. a ReLU or
+/// bias-add fused onto the same dispatch by normal IREE fusion) -- a
+/// completely ordinary outcome that is unrelated to whether the matmul's own
+/// M/K dims happen to need padding. Anything else feeding the store (a
+/// reduction-shaped consumer, a consumer with more than one real input, or a
+/// chain of more than one intervening op) is not recognized. In the
+/// unrecognized case `MatmulInfo::store`/`outArg` are left null (see the
+/// struct comment); the caller is responsible for only using them when
+/// non-null.
 static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
   SmallVector<linalg::MatmulOp> matmuls;
   func.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
@@ -182,21 +279,55 @@ static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
   auto lhsArg = dyn_cast<BlockArgument>(lhsLoad.getSource());
   auto rhsArg = dyn_cast<BlockArgument>(rhsLoad.getSource());
   if (!lhsArg || !rhsArg) return std::nullopt;
+  // The accumulator (matmul's own dps-init operand) is resolved in one of two
+  // mutually-exclusive forms -- see MatmulInfo's comment -- entirely
+  // independent of what (if anything) consumes the matmul's result
+  // downstream, so this is unaffected by the direct-vs-indirect store
+  // distinction below.
   auto fill = matmul.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
-  if (!fill) return std::nullopt;
-  auto empty = fill.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>();
-  if (!empty) return std::nullopt;
+  tensor::EmptyOp empty;
+  IREE::TensorExt::DispatchTensorLoadOp accLoad;
+  BlockArgument accArg;
+  if (fill) {
+    empty = fill.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>();
+    if (!empty) return std::nullopt;
+  } else {
+    accLoad = getFullTensorLoad(matmul.getDpsInits()[0]);
+    if (!accLoad) return std::nullopt;
+    accArg = dyn_cast<BlockArgument>(accLoad.getSource());
+    if (!accArg) return std::nullopt;
+  }
   SmallVector<IREE::TensorExt::DispatchTensorStoreOp> stores;
   func.walk(
       [&](IREE::TensorExt::DispatchTensorStoreOp s) { stores.push_back(s); });
   if (stores.size() != 1) return std::nullopt;
-  auto store = stores.front();
-  // Plain matmul: the matmul result feeds the store directly (no output chain).
-  if (store.getValue() != matmul.getResult(0)) return std::nullopt;
-  auto outArg = dyn_cast<BlockArgument>(store.getTarget());
-  if (!outArg) return std::nullopt;
-  return MatmulInfo{matmul, lhsLoad, rhsLoad, lhsArg,
-                    rhsArg, fill,    empty,   store,  outArg};
+  IREE::TensorExt::DispatchTensorStoreOp store = stores.front();
+  IREE::TensorExt::DispatchTensorStoreOp resolvedStore;
+  BlockArgument outArg;
+  linalg::GenericOp elementwiseConsumer;
+  Value storedValue = store.getValue();
+  if (storedValue == matmul.getResult(0)) {
+    // Plain matmul: the matmul result feeds the store directly.
+    if (auto arg = dyn_cast<BlockArgument>(store.getTarget())) {
+      resolvedStore = store;
+      outArg = arg;
+    }
+  } else if (auto generic = storedValue.getDefiningOp<linalg::GenericOp>();
+            isShapePreservingUnaryMapOf(generic, matmul.getResult(0))) {
+    // Exactly one recognized elementwise consumer (e.g. a fused ReLU) sits
+    // between the matmul and the store -- resolve store/outArg the same way,
+    // the store target is unchanged, only what feeds it differs. A longer
+    // chain (the consumer's own input not being the matmul result directly)
+    // falls through this `else if` and leaves everything null.
+    elementwiseConsumer = generic;
+    if (auto arg = dyn_cast<BlockArgument>(store.getTarget())) {
+      resolvedStore = store;
+      outArg = arg;
+    }
+  }
+  return MatmulInfo{matmul,      lhsLoad,      rhsLoad,       lhsArg,
+                    rhsArg,      fill,         empty,         accLoad,
+                    accArg,      elementwiseConsumer, resolvedStore, outArg};
 }
 
 /// Grows executable binding `arg` and its full-tensor `load` to `newShape`
@@ -216,27 +347,81 @@ static void growBinding(IRRewriter &rewriter, BlockArgument arg,
   rewriter.replaceOp(load, newLoad.getResult());
 }
 
-/// Grows the output init (`empty`+`fill`) and the matmul result to [mPad, nPad].
+/// Grows the fused elementwise consumer's own init to a *fresh* `[mPad,
+/// nPad]` `tensor.empty` (its values are irrelevant -- the consumer is a pure
+/// per-position map, verified by `isShapePreservingUnaryMapOf`, so nothing
+/// ever reads the old init's data) and widens its result type to match.
+///
+/// Must run *before* `growMatmulInit`. The trap this ordering avoids: in the
+/// real IR this pass targets (e.g. VGG16's FC1/FC2, "FC -> ReLU"), the
+/// consumer's `outs` operand is literally the *same* `tensor.empty` the
+/// matmul's own accumulator is built from (`%8 = tensor.empty(); %9 =
+/// fill(%8); ... matmul outs(%9) ...; generic ... outs(%8) ...`) -- i.e.
+/// `info.empty`'s result has two independent uses, one feeding `info.fill`
+/// and one feeding this consumer directly. `growMatmulInit` erases
+/// `info.fill`/`info.empty` assuming they have no remaining uses once the
+/// matmul is rewired away from them; MLIR cannot erase an op that still has
+/// uses. Rewiring the consumer's `outs` away from the shared empty *here*,
+/// before `growMatmulInit` runs, severs that second use unconditionally
+/// (whether or not it was actually the shared empty), so the later erase is
+/// always safe.
+static void growElementwiseConsumerInit(IRRewriter &rewriter, MatmulInfo &info,
+                                        int64_t mPad, int64_t nPad) {
+  linalg::GenericOp consumer = info.elementwiseConsumer;
+  Location loc = consumer.getLoc();
+  Type elemType =
+      cast<RankedTensorType>(consumer.getResult(0).getType()).getElementType();
+  rewriter.setInsertionPoint(consumer);
+  Value newInit = rewriter.create<tensor::EmptyOp>(
+      loc, ArrayRef<int64_t>{mPad, nPad}, elemType);
+  consumer.setDpsInitOperand(0, newInit);
+  consumer.getResult(0).setType(RankedTensorType::get({mPad, nPad}, elemType));
+}
+
+/// Grows the matmul's accumulator and result to [mPad, nPad]. Handles both
+/// accumulator forms (see MatmulInfo's comment):
+///   * fill/empty: replaces the old `fill(empty)` zero-init with a fresh one
+///     of the padded shape (the old fill's constant is preserved), the same
+///     way `growBinding` grows LHS/RHS.
+///   * accLoad/accArg (accumulator-as-bias): grows the binding/load exactly
+///     like `growBinding` does for LHS/RHS. The caller is responsible for
+///     zero-padding this argument's host value to match (see the `accArg`
+///     handling in `runOnOperation`) -- the extra M/N rows/cols are never
+///     read back (the grown result is cropped to the original [m, n]
+///     afterward), so their padded value is immaterial.
+/// When a fused elementwise consumer is present, the caller must have already
+/// called `growElementwiseConsumerInit` first (see its comment) -- by the time
+/// this function erases the old `fill`/`empty` (fill/empty form; the accLoad
+/// form's `growBinding` call replaces *all* uses of the old load instead, so
+/// it has no equivalent ordering requirement), any use of them from the
+/// consumer must already be severed, or the erase fails.
 static void growMatmulInit(IRRewriter &rewriter, MatmulInfo &info, int64_t mPad,
                            int64_t nPad) {
-  Location loc = info.fill.getLoc();
   Type elemType =
       cast<RankedTensorType>(info.matmul.getResult(0).getType()).getElementType();
-  rewriter.setInsertionPoint(info.empty);
-  Value newEmpty = rewriter.create<tensor::EmptyOp>(
-      loc, ArrayRef<int64_t>{mPad, nPad}, elemType);
-  rewriter.setInsertionPoint(info.fill);
-  Value cst = info.fill.getInputs()[0];
-  auto newFill =
-      rewriter.create<linalg::FillOp>(loc, ValueRange{cst}, ValueRange{newEmpty});
-  info.matmul.setDpsInitOperand(0, newFill.getResult(0));
+  if (info.fill) {
+    Location loc = info.fill.getLoc();
+    rewriter.setInsertionPoint(info.empty);
+    Value newEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, ArrayRef<int64_t>{mPad, nPad}, elemType);
+    rewriter.setInsertionPoint(info.fill);
+    Value cst = info.fill.getInputs()[0];
+    auto newFill = rewriter.create<linalg::FillOp>(loc, ValueRange{cst},
+                                                    ValueRange{newEmpty});
+    info.matmul.setDpsInitOperand(0, newFill.getResult(0));
+    rewriter.eraseOp(info.fill);
+    rewriter.eraseOp(info.empty);
+  } else {
+    growBinding(rewriter, info.accArg, info.accLoad, {mPad, nPad});
+  }
   info.matmul.getResult(0).setType(RankedTensorType::get({mPad, nPad}, elemType));
-  rewriter.eraseOp(info.fill);
-  rewriter.eraseOp(info.empty);
 }
 
 /// Grows the output binding and rewrites the store to write the full padded
-/// [mPad, nPad] matmul result.
+/// [mPad, nPad] result -- the elementwise consumer's grown result when one is
+/// present (it must already have been grown by `growElementwiseConsumerInit`
+/// + the automatic type update of the matmul result it reads from), or the
+/// matmul's own grown result otherwise.
 static void growOutputStore(IRRewriter &rewriter, MatmulInfo &info,
                             int64_t mPad, int64_t nPad) {
   auto dtt = cast<IREE::TensorExt::DispatchTensorType>(info.outArg.getType());
@@ -244,9 +429,12 @@ static void growOutputStore(IRRewriter &rewriter, MatmulInfo &info,
       {mPad, nPad}, dtt.asRankedTensorType().getElementType());
   info.outArg.setType(IREE::TensorExt::DispatchTensorType::get(dtt.getAccess(),
                                                                newTensorType));
+  Value grownResult = info.elementwiseConsumer
+                          ? info.elementwiseConsumer.getResult(0)
+                          : info.matmul.getResult(0);
   rewriter.setInsertionPoint(info.store);
   rewriter.create<IREE::TensorExt::DispatchTensorStoreOp>(
-      info.store.getLoc(), info.matmul.getResult(0), info.outArg,
+      info.store.getLoc(), grownResult, info.outArg,
       /*targetDynamicDims=*/ValueRange{});
   rewriter.eraseOp(info.store);
 }
@@ -574,6 +762,18 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // Any output dim (M outer and/or N inner) may be padded; the grown result is
     // cropped back on the host by a single extract_slice dispatch.
     bool padOut = mPad != m || nPad != n;
+    // Growing the output side requires the matmul result to be stored either
+    // directly, or through exactly one recognized shape-preserving unary
+    // elementwise consumer (see MatmulInfo's comment): store/outArg are only
+    // resolved in those two cases. When the store's value is anything else
+    // (a reduction-shaped consumer, a consumer with more than one real
+    // input, or a chain of more than one intervening op) and M and/or N also
+    // need padding, this pass doesn't know how to grow the output through
+    // that unrecognized consumer, so skip the dispatch entirely -- same
+    // conservative behavior as before for that harder case. K-only padding
+    // (padOut == false) never touches the matmul's output at all, so it
+    // remains safe and is handled below regardless of store/outArg.
+    if (padOut && (!info->store || !info->outArg)) continue;
 
     // Padded operand shapes placed at each operand's own M/N/K dim positions, so
     // the RHS layout (plain [K,N] or transpose_b [N,K]) is preserved.
@@ -591,6 +791,11 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       growBinding(rewriter, info->lhsArg, info->lhsLoad, lhsPad);
       growBinding(rewriter, info->rhsArg, info->rhsLoad, rhsPad);
       if (padOut) {
+        // Order matters: sever the elementwise consumer's use of the
+        // (possibly shared) old empty/fill *before* growMatmulInit erases
+        // them -- see growElementwiseConsumerInit's comment.
+        if (info->elementwiseConsumer)
+          growElementwiseConsumerInit(rewriter, *info, mPad, nPad);
         growMatmulInit(rewriter, *info, mPad, nPad);
         growOutputStore(rewriter, *info, mPad, nPad);
       }
@@ -613,6 +818,20 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // Grow this caller's result to [mPad, nPad] and crop it back to [m, n] on
     // the host with an extract_slice dispatch (handles the inner N dim too).
     if (padOut) {
+      // Accumulator-as-bias form: the executable rewrite above already grew
+      // the accArg binding itself (via growMatmulInit -> growBinding), so
+      // this caller's host-side bias value must be grown to match, the same
+      // way LHS/RHS were above. Only reachable when padOut (M and/or N need
+      // padding) -- when padOut is false, growMatmulInit was never called
+      // above and this argument's binding is untouched, so it must not be
+      // padded here either.
+      if (info->accArg) {
+        int64_t accArgNo = info->accArg.getArgNumber();
+        Value accPadded = createPaddingDispatch(
+            rewriter, module, dispatch.getArguments()[accArgNo], {mPad, nPad},
+            hostAffinity, counter);
+        dispatch.getArgumentsMutable().slice(accArgNo, 1).assign(accPadded);
+      }
       Value result = dispatch.getResult(0);
       result.setType(RankedTensorType::get({mPad, nPad}, outElemType));
       rewriter.setInsertionPointAfter(dispatch);
@@ -686,6 +905,33 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
     if (!func) continue;
     std::optional<MatmulInfo> info = getMatmulInfo(func);
     if (!info) continue;
+    // This pass always splits/grows the output (each N-chunk gets its own
+    // output binding via growOutputStore below), which requires the matmul
+    // result to be stored directly (see MatmulInfo's comment). Skip a
+    // dispatch whose store is indirect (e.g. a fused elementwise consumer
+    // sits between the matmul and the store) -- unlike
+    // AMDAIEPadContractionDispatches, there is no K-only-safe fallback here.
+    //
+    // This also excludes the one indirect shape getMatmulInfo now resolves
+    // (a single shape-preserving unary elementwise consumer, e.g. a fused
+    // ReLU): resolving `store`/`outArg` for that shape only means
+    // AMDAIEPadContractionDispatches knows how to grow the consumer's own
+    // init/result alongside the matmul (via growElementwiseConsumerInit).
+    // This pass does not, so `info->elementwiseConsumer` must be excluded
+    // explicitly here or growOutputStore below would wire a still
+    // full-size (never-chunked) consumer result into a chunk-sized output
+    // binding.
+    //
+    // `growMatmulInit` below is always called (every N-chunk gets its own
+    // [M, C] accumulator), and for the accumulator-as-bias form
+    // (`!info->fill`, see MatmulInfo's comment) that means growing (padding)
+    // a *slice* of the bias to [M, C] per chunk -- this pass has no logic for
+    // that (unlike AMDAIEPadContractionDispatches's accArg handling, which
+    // only ever pads the *whole* accumulator once), so `!info->fill` is
+    // excluded here too.
+    if (!info->store || !info->outArg || info->elementwiseConsumer ||
+        !info->fill)
+      continue;
 
     // Only split when N is the RHS *outer* dim (transpose_b [N,K]), so the weight
     // N-slice is a contiguous outer-dim slice.

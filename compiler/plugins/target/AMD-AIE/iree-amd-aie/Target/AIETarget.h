@@ -67,6 +67,12 @@ struct AMDAIEOptions {
   // too. Harmless while every contraction is placed on the accelerator; revisit
   // if the placement rules change.
   bool demoteContractionInputsToBf16{false};
+
+  // Also fold conv2d + bias into a single dispatch (K+1 augmentation), not
+  // just matmul + bias. Disable to keep conv's bias as a separate dispatch
+  // input (falling back on the usual detach/no-fuse workaround flags for
+  // conv), while matmul + bias is still folded into the same dispatch.
+  bool foldConvBiasIntoContraction{true};
   bool enableCoalescingLoops{false};
   bool enableCollapsingUnitDims{false};
   OutliningStrategy enableFunctionOutlining{OutliningStrategy::Balanced};
@@ -176,6 +182,16 @@ struct AMDAIEOptions {
             "Demote the inputs of contraction ops (matmul + convolution) from "
             "f32 to bf16 during preprocessing (accumulation stays f32). Needed "
             "to run f32 models on npu4, which has no f32 vector path."));
+
+    binder.opt<bool>(
+        "iree-amdaie-fold-conv-bias-into-contraction",
+        foldConvBiasIntoContraction, llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Also fold conv2d + bias into a single dispatch (K+1 "
+            "augmentation), not just matmul + bias. Disable to keep conv's "
+            "bias as a separate dispatch input (relying on the usual "
+            "detach/no-fuse workaround flags for conv), while matmul + bias "
+            "is still folded into the same dispatch."));
 
     binder.opt<bool>(
         "iree-amd-aie-enable-chess-for-ukernel", useChessForUKernel,

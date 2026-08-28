@@ -263,6 +263,24 @@ FailureOr<ParameterSetting> ParameterSetting::create(
         bufferDepthAcc = linalgUser.getNumDpsInputs() == 1 ? 1 : 2;
       }
     }
+    // Give back to C (the consumer's own output buffer) the L1 headroom Acc
+    // just took: C's double buffering (bufferDepthC = 2) only pipelines the
+    // final write-out DMA against the *next* tile's compute, a throughput
+    // optimization, not a correctness requirement (bufferDepthAcc = 0 for
+    // the no-consumer case above is already this same single-buffered
+    // pattern applied elsewhere in this function). Without giving the space
+    // back, every dispatch with a fused consumer silently gets a smaller L1
+    // tile than an equivalent bare matmul, which multiplies out to
+    // dramatically more unrolled M/N/K-tile iterations once the core control
+    // program is generated -- large enough to overflow the AIE core's
+    // program memory for e.g. VGG16's conv4 (M=12544), a failure mode with
+    // no connection to tile *correctness* at all. When nBytesC == nBytesAcc
+    // (true for a same-dtype consumer like ReLU on an f32 accumulator) this
+    // exactly cancels bufferDepthAcc's addition, restoring the tile size an
+    // equivalent bare matmul would get; a wider-output consumer still
+    // benefits partially, bounded at single-buffering (never below 1, since
+    // C needs at least one buffer to exist at all).
+    bufferDepthC = std::max(1u, bufferDepthC - bufferDepthAcc);
   } else {
     // For pure matmul, set the buffer depth as 0 for accumulation.
     bufferDepthAcc = 0;
