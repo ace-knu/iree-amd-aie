@@ -390,15 +390,244 @@ skip 휴리스틱 §12)는 전부 되돌림.
 `bdcount_v3~v6.log` 계열로 반복 확인). `bmm_pure_repro`(패킷 connection 없는
 케이스) 회귀 없음.
 
-## 다음 단계 (미결, §12 결론 기준으로 갱신)
+## §16. Connection 결합(approach 3, PR #709 확장) 스코핑 — NO-GO, 두 실행 모델이 근본적으로 안 맞음
 
-1. **§10/§12로 "connection 쪼개기" 계열 우회는 전부 막힘** (circuit 재분류는
-   채널 고갈, split 자체는 라우팅 고갈, split 없이 두면 hang). 남은 방향은
-   §14의 **connection 결합(approach 3 확장)** — bias를 X 또는 Y operand의
-   기존 connection에 prologue 방식(순차 재사용)으로 얹는 새 구현. 아직 미착수.
-2. 위가 막히면 §1의 (c), 즉 packet-ID 기반 라우팅(mlir-aie `packet_switch`
-   예제 방식)이 진짜 대안인지 — `distribute`(hang)와 `packet_switch`(안전
-   확인됨)의 IR/하드웨어 레벨 메커니즘 차이를 규명하는 조사가 필요. 아직
-   미착수.
-3. 어느 쪽이든 해결되면 `matmul_bias_2d`(M=32) 실하드웨어 검증 →
-   `bmm_bias_repro`(배치 포함 원래 케이스) → 8컬럼 전체 스케일 확장.
+§14의 "connection 결합" 방향(bias를 X/Y operand의 기존 L1/L2 connection에
+prologue로 얹기)을 실제로 스코핑함. **결론: 범위가 정해진 패치가 아니라
+새 기능급 재설계가 필요함.**
+
+- `AMDAIEDmaToCircularDmaPass`(`AMDAIEDmaToCircularDma.cpp:21-34`)가
+  `AMDAIECreateAIEWorkgroup`보다 먼저 돌면서 source/target 둘 다 memory
+  space가 있는(즉 모든 L1/L2) `DmaCpyNdOp`를 **무조건** `CircularDmaCpyNdOp`로
+  바꿔버림(주석: "MLIR-AIE 구조 때문에 하드코딩했다"). bias의 L2→L1 DMA도
+  `AMDAIECreateAIEWorkgroup`에 도달하기 전에 이미 이 변환을 거쳐서, placeholder
+  로직(PR #709)이 있는 코드에는 아예 도달하지 않음.
+- **두 op 자체가 성격이 다름**: `CircularDmaCpyNdOp`(L1/L2, X/Y가 씀)는
+  양 끝 고정, lock 기반으로 자율적으로 무한 반복. `DmaCpyNdOp`/`NpuDmaCpyNdOp`
+  (L3, PR #709가 씀)는 컨트롤러가 매번 명시적으로 push하는 1회성 호출 —
+  placeholder가 의미 있는 이유가 바로 이 컨트롤러 개입 때문. bias를 X/Y
+  connection에 prologue로 얹으려면 "자율 반복하면서 동시에 컨트롤러가 앞에
+  한 번 끼워넣을 수 있는" connection이 필요한데, 지금 두 op family 어느 쪽도
+  이 모양을 표현 못 함.
+- 최소 구현으로도 `AMDAIEDmaToCircularDma.cpp`(변환 예외 처리),
+  `ConnectionOp`(다중 producer/순서 개념 추가), `AMDAIECreateAIEWorkgroup.cpp`
+  (두 build 경로 통합), `AMDAIEAssignChannels/ConnectionTypes.cpp`(대역폭
+  검증), `AMDAIEInsertDmaBdChain.cpp`(1회성 prologue BD → 독립 반복 BD로
+  hand-off하는 새 체인 모양)까지 건드려야 하고, AIE2P BD 체인이 이런 hand-off를
+  실제로 지원하는지는 소스만으로 확인 불가.
+- **§1의 `repeat_count=1` 실험(pass 순서상 flow-type 정보가 없어서 구조적으로
+  막혔던 것)보다 더 근본적**: 그건 pass *순서* 문제였지만, 이건 두 op family가
+  애초에 화해 안 되는 하드웨어 실행 모델을 표현한다는 문제. **NO-GO.**
+
+## §17. `packet_switch` 메커니즘 재검토 — non-finding, 우리가 이미 그 구조를 쓰고 있었음
+
+§1의 (c)(packet-ID 기반 라우팅이 진짜 대안인지) 방향을 조사.
+
+- 이 저장소엔 mlir-aie가 vendored되어 있지 않음(`third_party/`엔 aie-rt,
+  mlir-air, XRT만 있음) — 우리 AIE dialect는 독립 구현. upstream Xilinx/mlir-aie
+  문서/GitHub을 직접 조사.
+- **우리 `AIE_PacketFlowOp`(`AIEOps.td:252-266`) 자체가 이미 "하나의 packet ID로
+  여러 목적지(N개 `packet_dest`)를 묶는" 구조**이고, `AMDAIECreatePathFindFlows.cpp:658-664`가
+  실제로 이 구조로 emit함(한 소스/ID를 공유하는 N개의 `addFlow()` 호출).
+- upstream의 `AIE.broadcast_packet`(`packet_switch`류) 자체도 "place-and-route
+  단계에서 결국 `packet_flow`/`packet_dest`로 대체된다"고 문서에 명시된
+  **문법 설탕**일 뿐 — 별도의 하드웨어 라우팅 primitive가 애초에 존재하지 않음.
+- **정정**: "packet_switch는 hang 안 나는 걸로 확인됨"이라는 이 조사의 기존
+  가정은 실제로는 검증된 적이 없었음. upstream 디스커션(#1075)과 모든 예제를
+  뒤져봐도 fan-out degree 2짜리뿐, 우리 규모(4~8-way)에서 실하드웨어로
+  검증된 사례는 없음.
+- **결론**: 이 각도는 dead end/non-finding. 다만 조사 중 새로 나온 저비용
+  실험 하나 발견 — §18로 이어짐.
+
+## §18. Fan-out degree bisection — 메커니즘 재정정, 테스트할 중간 지점 자체가 없었음
+
+§17에서 나온 아이디어: 지금까지 테스트한 건 전부 극단값뿐(목적지당 connection
+1개 = 컴파일 실패, 전부 하나로 묶음 = hang). **중간 fan-out 정도(목적지 2개씩)는
+한 번도 테스트 안 함.**
+
+- 실제로 degree=2를 만들려고 코드를 뜯어봤더니, **이미 그게 오늘 shipping
+  중인 구조**였음. `AMDAIECreateAIEWorkgroup.cpp`→`AMDAIEConnectionToFlowPass`
+  (1:1)→`AMDAIELowerToAIE.cpp:197`가 각 packet `FlowOp`를 (producer 채널,
+  각 consumer 채널) 쌍마다 하나의 `aie.packet_flow`로 만듦. **실제 IR을
+  덤프해보니 bias의 L2→L1 전달은 컬럼당 4개의 독립적인 단일-목적지
+  `ConnectionOp`였고, 하나의 4-목적지 connection이 아니었음.**
+- 실제 구조: memtile에 물리 MM2S 채널이 2개뿐이라 `AMDAIEAssignChannels`가
+  4개의 독립 connection을 2개 채널에 나눠 배정(예: 채널 2가 row2+row4,
+  채널 3이 row3+row5), 같은 채널을 공유하는 두 flow는 서로 다른 packet
+  ID(예: id=0, id=2)로 구분됨. **즉 "BD 하나가 여러 타일로 멀티캐스트"가
+  아니라 "물리 채널 하나가 서로 다른 packet ID로 서로 다른 타일에 보내는
+  ≥2개의 단일-목적지 flow를 처리"하는 구조.**
+- 이 구조(오늘 shipping 상태 그대로)를 실 npu4에서 실행 → **여전히 hang**
+  (`ert state 8`, ~120초).
+- **더 낮은 degree를 테스트할 방법이 없음**: degree=1(목적지마다 완전 전용
+  채널)은 이미 예전에 시도(§6, `0baac08` 관련)했는데 그건 애초에 **컴파일
+  단계**에서 "유효한 라우팅 설정을 만들 수 없다"는 에러로 막힘 — memtile
+  물리 채널이 목적지 수만큼 부족함. **degree=2가 컴파일 가능한 가장 낮은
+  fan-out/공유 수준**이고 그게 이미 hang나므로, bisect할 더 낮은 계단이 없음.
+
+## §19. `repeat_count>1` + packet flow 가설 — 실제 fix 적용·검증·반증 (5번째 반증)
+
+`AMDAIEDmaLoopSubsumption.cpp`의 `onlyZeroStrideOnOuterDim` guard(무의미한
+stride=0 반복 폴딩을 막는 안전장치)가 loop dimension index 1부터만 체크하고
+**가장 바깥쪽(outer, index 0) 차원은 명시적으로 예외 처리**한다는 걸 발견.
+batch(=2) loop가 이 dispatch에서 제일 바깥쪽이라, bias의 stride=0 반복 폴딩이
+이 예외를 그대로 통과 → 실제 BD에 `repeat_count=2` + `enable_packet=true`가
+동시에 붙음(이 저장소 역사상 처음 실하드웨어에서 combo 실행). **가설: 이
+조합이 hang 원인.**
+
+- 첫 시도(잘못된 hop): bias의 실제 L2→L1 전송이 `NpuDmaCpyNdOp`가 아니라
+  `CircularDmaCpyNdOp`라서 IR이 전혀 안 바뀜 — no-op, 되돌림.
+- **`AMDAIEDmaLoopSubsumption.cpp:508-525`에 이미 작성돼 있다가 주석 처리로
+  꺼진 체크 발견**: `NpuDmaCpyNdOp`가 Packet 타입 connection이면 loop
+  subsumption을 아예 거부. 원 작성자(zhewen) 주석: *"현재는 control code
+  크기를 줄이고 성능을 높이려고 비활성화해둠. 다만 여러 packet flow가
+  arbiter를 공유하면 deadlock 위험 있음."* — 우리가 이번에 추론한 것과
+  정확히 같은 우려를 원작자도 이미 알고 있었음.
+- 이 체크를 켜고 빌드 → **IR로 검증**: `push_to_queue` 28→36(+8, 컬럼당
+  1개씩 늘어남 — bias가 `repeat_count=2` 1번에서 `repeat_count=1` 2번으로
+  바뀜), `repeat_count=2` 발생 11→8로 감소. 컴파일 깨끗(rc=0).
+- **실 npu4 실행: 여전히 hang** (`ert state 8`, ~60초, 이전과 완전히 동일).
+- **재검증(사용자 지적)**: 남은 8개의 `repeat_count=2`가 정말 다 안전한지
+  하나하나 직접 까봄 — **8개 전부 Circuit 타입**(packet 아님). 4개는 A/B의
+  정상적인 batch-varying 패턴(실제 stride 있음, `bmm_pure_repro`의 4개와
+  동일 카테고리), 4개는 packet과 무관한 별도 circuit-only 반복 패턴. fix가
+  실제로 packet connection에 작동했다는 직접 증거도 확인(`bd_id=9`→`10`,
+  `packet_id=1` 쌍, 동일 zero-stride payload — "하나였던 repeat=2 packet
+  push가 repeat=1 두 개로 쪼개진" 흔적).
+- **결론: packet + repeat_count>1 조합은 이 빌드 어디에도 안 남아있는데
+  hang이 그대로 남 → 가설 완전히 반증됨** (성급한 결론 아님, 재검증까지 마침).
+  코드 되돌림, 커밋 안 함.
+
+## §20. End-to-end 파이프라인 감사 (전반부) — "accumulator fusion" pass가 죽은 코드였다는 중대 정정
+
+지금까지의 narrow한 가설 검증 대신, HEAD(`3509353`) 기준으로 입력 MLIR부터
+AIE-dialect lowering 직전까지 전체를 편견 없이 재감사.
+
+**주요 발견 — `AMDAIEFoldBroadcastAddIntoDestPass`(2026-08-26에 만든
+"accumulator fusion" 아키텍처 변경, [2026-08-26 문서](2026-08-26_matmul_bias_fusion_runtime_hang.md) 참고)가
+이 입력에 대해 실질적으로 아무 효과가 없음 — dispatch가 만들어지기 전에
+조용히 원상복구됨.**
+
+- `preprocessing.mlir` 단계에선 분명히 제대로 작동(`linalg.broadcast(bias) →
+  batch_matmul(outs=broadcast)`, 별도 add 없음, 의도대로).
+- **근데 같은 `global-optimization` 파이프라인 안에서 9개 pass 뒤에, IREE의
+  표준(우리가 안 건드리는, 항상 켜져 있는) `DetachElementwiseFromNamedOpsPass`가
+  이걸 그대로 되돌림** — `zero-fill → matmul(outs=zero) → 별도 add` 형태로
+  복원. dispatch가 실제로 만들어질 때는 우리 fusion 형태가 존재한 적이
+  없는 것과 같음.
+- **이게 예전의 의문 하나를 설명함**: [2026-08-26 문서]에 "이 pass를 아예
+  꺼도 결과가 똑같았다"는 기록이 있었는데, 당연한 것이었음 — 어차피 나중에
+  표준 pass가 똑같이 되돌리니까.
+- **2026-08-26 문서의 "architecture change로 버그 #1~7이 해결됐다"는 서술
+  자체가 틀림.** 실제로는 그 시점에 같이 넣은 다른 독립적인 수정들
+  (bufferization, tile 배정, DMA lowering)이 버그를 고친 것이고, dispatch는
+  그때부터 지금까지 계속 원래의 "별도 elementwise add" 형태로 컴파일되고
+  있었음.
+- **결과값 자체는 안 틀림** — K-tiling이 bias를 재도입하는 지점(컬럼당
+  정확히 1번, 4개 row가 다 합쳐진 뒤)을 이번에 직접 재확인함, 정상. correctness
+  bug 아니고, 문서/이해의 오류. 또한 `DEBUG[refold] non-parallel iterator`
+  잔여 디버그 프린트가 여전히 무조건 출력되고 있음(정리 안 됨, 낮은 우선순위).
+- 나머지 전반부(dispatch fusion 형성, bias L2 버퍼 8-컬럼 분리, tile 배정
+  컬럼 0 쏠림 없음)는 전부 직접 재검증해서 PASS.
+
+## §21. End-to-end 파이프라인 감사 (후반부) — 대체로 정상, 새로운 미검증 단서 발견
+
+AIE-dialect lowering부터 최종 `.vmfb`까지 같은 강도로 재감사.
+
+- `AMDAIECreateAIEWorkgroup`(connection 1:1 생성), `AMDAIELowerToAIE`(멀티블록
+  없음), BD-id/packet-id 배정(충돌 없음), control-code push/wait 카운트 일치,
+  disassembly lock acq/rel 균형 — **전부 PASS**, 재검증 완료.
+- arbiter-deadlock 체크는 여전히 진짜로 작동 중(우회 flag 빼면 실제 컴파일
+  실패) — 새로운 게 아니라 기존 알려진 사실 재확인.
+- **새 발견**: bias의 L3→L2(shim→memtile) connection — 8개 컬럼 구조상
+  동일한 모양(컬럼당 1:1 전송, 공유 `memref<64xf32>` constant에서 8개씩
+  slice)인데도 **연결 타입이 컬럼마다 다름**: **컬럼 0~3은 Packet, 컬럼
+  4~7은 Circuit.** 메모리 채널 사용에도 비대칭이 이어짐(0~3은 2개 채널
+  공유, 4~7은 6개 채널에 고르게 분산). `AMDAIEAssignConnectionTypes.cpp`의
+  greedy·순서 의존적 congestion-aware 배정이 원인으로 추정(확정은 아님).
+- **중요한 명확화**: 지금까지 hang 논의의 핵심이었던 memtile→core(L2→L1)
+  구간은 8개 컬럼 전부 이미 Packet으로 일관됨 — 이번에 찾은 비대칭은
+  **L3→L2 구간(단순 1:1 전송, fan-out 아님)에만** 있는 것이었음.
+- 지금까지 반증된 5개 가설 중 어느 것도 이 컬럼 간 비대칭을 통제하거나
+  변형해서 테스트한 적이 없음 — §22로 이어짐.
+
+## §22. 컬럼별 connection 타입 비대칭 가설 — 테스트, 반증 (6번째)
+
+- **all-Packet으로 8개 컬럼 통일**: IR로 8개 전부 Packet 확인, 컴파일 clean,
+  실 npu4 실행 → **여전히 hang**(`ert state 8`, ~122초).
+- **all-Circuit으로 통일**: 컴파일 자체가 실패 — 근데 bias가 아니라
+  **B/Y operand의 다른 connection**에서 "채널 부족" 에러(`no producer DMA
+  channel available`). 원래의 0~3/4~7 혼합 배정이 버그가 아니라 bias·operand
+  트래픽이 공유 채널을 놓고 경쟁하는 걸 실제로 정확히 조율한 결과였음을
+  확인 — 이 변형은 하드웨어까지 못 감.
+- 회귀(`bmm_pure_repro`)는 두 패치 다 영향 없음, 정상.
+- **결론: 컴파일되는 유일한 변형(all-Packet)도 hang 동일 → 반증.** 6번째
+  가설 반증. 코드 되돌림, 커밋 안 함.
+
+## §23. 하드웨어 trace 툴링 스코핑 — qualified GO, 결정적 질문 하나 남음
+
+6개 가설 전부 반증 + 두 번의 end-to-end 감사까지 마친 뒤, 남은 유일한 선택지인
+실하드웨어 trace 캡처를 스코핑함(코드 수정/빌드/실행 없이 조사만).
+
+- **API 표면**(`third_party/aie-rt/driver/src/trace/xaie_trace.{h,c}`): CDO/
+  비트스트림과 무관한 순수 레지스터 쓰기 API. `XAie_TraceEvent`로 이벤트를
+  trace slot에 매핑, `XAie_TraceControlConfig` 등으로 트리거/모드/패킷
+  라우팅 설정.
+- **런타임 연동 — 예상보다 유리함**: aie-rt는 지금 컴파일러(CDO/PDI 생성)
+  에만 링크되어 있고 `runtime/.../amdxdna/`엔 전혀 없음. **근데 우리 런타임
+  shim에 이미 완성돼서 작동하는 커널 UAPI 기반 레지스터/메모리 I/O 함수가
+  있음** — `device::read_aie_reg`/`write_aie_reg_checked`(`device.cpp:408-453`),
+  `read_aie_mem`/`write_aie_mem`(`device.cpp:390-440`). **CERT 로그 구조체와
+  달리 이건 완전히 구현돼서 작동하는데, 아무도 호출을 안 하고 있었음.** 즉
+  새 커널 드라이버 작업 없이, 컴파일러/CDO도 안 건드리고, 이 기존 함수 위에
+  trace 설정 코드만 얹으면 런타임에서 직접 레지스터를 찌를 수 있음.
+- **결정적 제약**: `ert.h`의 공식 주석 — *"ERT_CMD_STATE_TIMEOUT: 스케줄러가
+  타임아웃이면서 리셋됐을 때 설정"*(`ert.h:581`). **`ert state 8`을 확인하는
+  시점엔 이미 AIE 배열이 리셋된 뒤** — 타임아웃 본 다음 trace를 읽으면 늦음.
+  hang나는 동안, 리셋 전에 실시간으로 폴링해서 미리 읽어놔야 함(60초 TDR
+  창 안에서 백그라운드 폴링, delicate한 타이밍 설계 필요).
+- **아직 안 풀린 결정적 질문**: trace 데이터가 (1) 타일 내부 작은 on-chip
+  buffer에 쌓이는지, (2) DDR로 DMA되어 나오는지 — (1)이면 리셋 전 폴링 레이스
+  필수, (2)면 DRAM은 리셋에서 살아남을 가능성 높아서 타임아웃 이후에 느긋하게
+  읽어도 됨. 반나절 정도 투자하면(`xaie_trace.c`의 packet-config 경로 확인 +
+  실제 레지스터 주소 검증) 풀릴 것으로 추정.
+- **견적**: qualified GO, 구조적 dead end 아님. (a) on-chip/DDR 질문 해결
+  (~0.5일), (b) 레지스터 접근 배선(aie-rt trace 모듈 링크+어댑터, 또는
+  직접 레지스터 주소 유도) (~1~2일), (c) on-chip이면 리셋 전 폴링 wrapper
+  구축(~1일, IOCTL 폴링 트래픽 자체가 타이밍을 흔들 위험 있음), (d) 최소
+  이벤트/타임스탬프 디코더 작성(이 컨테이너엔 mlir-aie Python 툴 없음, 재사용
+  불가) (~0.5~1일). **총 3~5일, (a)의 답에 따라 상단/하단 갈림.**
+
+## 오늘 세션 전체 정리 — 6개 가설 반증, 2개의 새로운(가설과 무관한) 발견
+
+**반증된 가설 6개** (전부 실제 코드 수정 + 실 npu4 검증까지 거침):
+1. BD 하나가 N개 타일로 멀티캐스트 — §18에서 메커니즘 설명 자체가 틀렸다고
+   정정(실제로는 물리 채널 공유+packet ID 구분)
+2. packet-ID 공유 채널 fan-out degree — §18, 더 낮은 degree는 컴파일도 안 됨
+3. `packet_switch`가 다른 메커니즘이다 — §17, non-finding
+4. fan-out degree bisection — §18, 테스트할 중간 지점이 아예 없었음
+5. `repeat_count>1` + packet flow — §19, 실제 fix, 검증, 재검증까지 마침
+6. 컬럼별 connection 타입 비대칭 — §22, 실제 fix, 검증 완료
+
+**가설과 별개인 중요한 발견 2개**:
+- §16: connection 결합(approach 3/PR #709 확장)은 NO-GO — 두 실행 모델이
+  구조적으로 안 맞음, 새 기능급 재설계 필요
+- §20: "accumulator fusion" pass가 죽은 코드 — 2026-08-26 문서의 architecture
+  narrative를 정정할 필요 있음 (correctness에는 영향 없음)
+
+**소스/컴파일러 레벨에서 감사 가능한 모든 각도를 두 번의 전체 end-to-end
+감사를 포함해서 소진함.** 이 정도면 [[2026-08-24 int8 조사]]의 "2번째 버그"와
+완전히 동급의 소진 단계.
+
+## 다음 단계 (갱신)
+
+1. **하드웨어 trace 툴링** (§23) — 유일하게 남은, 새로운 정보를 얻을 수
+   있는 방향. 먼저 trace 데이터가 on-chip인지 DDR인지부터 확인(~반나절),
+   그 결과에 따라 3~5일 규모의 구현 착수 여부 결정.
+2. 위가 여의치 않거나 우선순위가 안 맞으면, "알려진 미해결 하드웨어/펌웨어
+   레벨 블로커"로 문서화하고 로드맵의 다음 항목으로 이동. 소스 레벨로는
+   더 팔 곳이 안 보이는 상태.
+3. (참고, 별도 트랙) §20에서 발견된 "accumulator fusion pass가 죽은 코드"
+   건은 hang과 무관하게 별도로 정리 필요 — pass를 실제로 살릴지(DetachElementwiseFromNamedOpsPass가
+   이 fusion-eligible 케이스는 건드리지 않도록), 아니면 이제 와서 불필요한
+   pass이니 제거하고 문서 서술을 정정할지 결정 필요.
