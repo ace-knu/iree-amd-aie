@@ -21,6 +21,7 @@ StringRef getDeviceBackend(IREE::Util::GlobalOpInterface global) {
 DeviceRole deviceRole(StringRef backend) {
   if (backend == "llvm-cpu") return DeviceRole::Host;
   if (backend == "amd-aie") return DeviceRole::Accelerator;
+  if (backend == "vulkan-spirv") return DeviceRole::Accelerator;  // TEMP: experiment
   return DeviceRole::Unknown;  // not managed by this plugin
 }
 
@@ -47,6 +48,20 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
   // outcome -- the NPU's result has to be copied into a CPU allocation for a
   // host dispatch to read it -- but it is a behavior change, not a no-op.
   if (srcBackend == "llvm-cpu" && dstBackend == "amd-aie")
+    return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
+  if (srcBackend == "vulkan-spirv" && dstBackend == "llvm-cpu")
+    return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
+  //  - vulkan-spirv -> amd-aie is declared true, but the runtime cannot honor
+  //    it yet: a Vulkan dispatch binds a buffer as a VkBuffer, and importing an
+  //    amdxdna BO needs dma-buf (amdxdna `export_buffer` is unimplemented and
+  //    the Vulkan allocator only imports HOST_ALLOCATION). An NPU->GPU boundary
+  //    therefore reaches the Vulkan queue unimported (buffer.cc:249 assertion).
+  //    Setting this false does NOT fall back to a staging copy: the flag gates
+  //    whether a buffer shared by the two devices can be allocated at all, so
+  //    ResolveTopologyQueries then fails on the boundary buffer's
+  //    hal.device.optimal<[gpu, npu]> and compilation dies at legalization.
+  //    Fixing this requires the dma-buf import, not a topology change.
+  if (srcBackend == "vulkan-spirv" && dstBackend == "amd-aie")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
   return {};  // conservative default: stage (copy) across the boundary.
 }

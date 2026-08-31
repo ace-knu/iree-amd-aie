@@ -141,14 +141,13 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   }
   // A host device is required; accelerators are optional.
   if (hosts.empty()) return;
+  if (accelerators.empty()) return;
 
   // Placement policy (currently trivial "front"). A performance/config-aware
   // policy would replace this selection (and then also need the two-phase
   // topology keep-alive noted below).
   // TODO: choose among multiple accelerators/hosts by device performance/config.
   DeviceInfo hostTarget = hosts.front();
-  DeviceInfo accelTarget =
-      accelerators.empty() ? hostTarget : accelerators.front();
 
   auto affinityFor = [&](FlatSymbolRefAttr ref) {
     return IREE::HAL::DeviceAffinityAttr::get(ctx, ref, /*queue_mask=*/-1ll);
@@ -160,14 +159,21 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   DenseMap<StringRef, bool> executableIsAccel;
   for (auto exe : moduleOp.getOps<IREE::Flow::ExecutableOp>())
     executableIsAccel[exe.getSymName()] = executableIsContractionOrConv(exe);
+  unsigned accelIdx = 1;
+  DenseSet<Attribute> usedRefs;
   moduleOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
     bool onAccel = false;
     for (SymbolRefAttr entryPoint : dispatchOp.getEntryPointRefs()) {
       auto it = executableIsAccel.find(entryPoint.getRootReference().getValue());
       if (it != executableIsAccel.end() && it->second) onAccel = true;
     }
-    dispatchOp->setAttr("stream.affinity",
-                        affinityFor((onAccel ? accelTarget : hostTarget).ref));
+    DeviceInfo target = hostTarget;
+    if (onAccel && !accelerators.empty()) {
+      target = accelerators[accelIdx % accelerators.size()];
+      ++accelIdx;
+    }
+    usedRefs.insert(target.ref);
+    dispatchOp->setAttr("stream.affinity", affinityFor(target.ref));
   });
 
   // Inject the device topology over the devices we place work on so cross-device
@@ -178,7 +184,14 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   // keep all candidates alive at preprocessing and narrow at the Flow call.
   if (!moduleOp->hasAttr("stream.topology")) {
     SmallVector<DeviceInfo> used;
-    if (accelTarget.ref != hostTarget.ref) used.push_back(accelTarget);
+    // This pass runs twice. The first run happens before any flow.dispatch
+    // exists, so the walk sees nothing and usedRefs stays empty; keep every
+    // candidate alive there or FoldGlobals removes the accelerator globals
+    // before the second run can place work on them. Once dispatches exist,
+    // narrow to what was actually used.
+    bool sawDispatch = !usedRefs.empty();
+    for (const DeviceInfo &d : accelerators)
+      if (!sawDispatch || usedRefs.contains(d.ref)) used.push_back(d);
     used.push_back(hostTarget);
     if (used.size() >= 2) {
       SmallVector<IREE::HAL::DeviceLinkAttr> links;

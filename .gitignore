@@ -64,6 +64,8 @@ compile_commands.json
 
 # Build tool caches (ccache, pip, etc.)
 /.cache/
+/.ccache-gpu/
+/.home-gpu/
 
 # Language server configuration files
 .clangd
@@ -133,3 +135,12 @@ artifacts/
 /models/*/*.vmfb
 /models/*/*.npy
 /models/vgg16/*.onnx
+
+# local scratch
+.bash_history
+.gitconfig
+build-*.log
+models/_backup/
+models/**/dump*/
+models/**/*.log
+models/**/*.vmfb
