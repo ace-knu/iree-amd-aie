@@ -227,3 +227,17 @@ Note, this is roughly equivalent to [passing](https://github.com/nod-ai/iree-amd
 ## Architectural overview (out of date)
 
 ![image](https://github.com/nod-ai/iree-amd-aie/assets/74956/3fa73139-5fdf-4658-86c3-0705352c4ea0)
+
+---
+
+## `bert-onnx` branch
+
+BERT를 IREE-AMD-AIE 백엔드(NPU)에서 이기종(CPU+NPU)으로 end-to-end 실행하기 위한 작업 브랜치.
+`vgg16-onnx`에서 갈라져 나왔으며, 검증 완료된 항목만 포함합니다 (진행 중인 작업은 별도 브랜치에서 관리).
+
+- BERT-tiny / BERT-base CPU+NPU 이기종 e2e 실행 (`models/bert_tiny/`, `models/bert_base/`)
+- batch matmul의 tile-multiple padding 누락 수정 (row-overflow 버그 근본 수정)
+- int8 batched matmul을 위한 iree submodule 업데이트 + batch-0 lock-pre-charge race 수정
+- ONNX → dispatch 프론트엔드 lowering 과정 설명 문서 (`docs/2026-08-16_frontend_lowering_passes.md`)
+
+자세한 내용/알려진 한계는 각 모델 README 참고.
