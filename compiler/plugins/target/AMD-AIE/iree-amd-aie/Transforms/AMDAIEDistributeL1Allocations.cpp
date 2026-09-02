@@ -189,6 +189,19 @@ LogicalResult distributeLocalMemory(ModuleOp moduleOp) {
                 }
                 return success();
               })
+              .Case<linalg::PackOp, linalg::UnPackOp>([&](Operation *packOp) {
+                // Same reasoning as the `linalg::LinalgOp` case above --
+                // `linalg.pack`/`linalg.unpack` don't implement that
+                // interface, but a pack-peel dispatch's re-layout of a
+                // fused-in accumulator (e.g. a broadcasted bias folded into
+                // a contraction's dest, see AMDAIEFoldBroadcastAddIntoDest)
+                // can reach this alloc directly the same way.
+                for (OpOperand &operand : packOp->getOpOperands()) {
+                  if (operand.get() == oldAlloc.getResult())
+                    packOp->setOperand(operand.getOperandNumber(), newAlloc);
+                }
+                return success();
+              })
               .Default([&](Operation *user) {
                 return user->emitOpError(
                     "needs logic implemented for handling.");

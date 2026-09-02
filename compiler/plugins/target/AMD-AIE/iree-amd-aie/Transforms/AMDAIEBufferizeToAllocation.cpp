@@ -190,6 +190,16 @@ void AMDAIEBufferizeToAllocationPass::runOnOperation() {
       // Skip FillOp and CopyOp.
       if (isa<linalg::FillOp, linalg::CopyOp>(linalgOp))
         return WalkResult::advance();
+      // Skip an elementwise op already folded into a contraction/conv's own
+      // accumulator init (e.g. a broadcasted bias, see
+      // AMDAIEFoldBroadcastAddIntoDestPass): it isn't an independent
+      // elementwise dispatch tail, and the contraction's own output-promotion
+      // step (BufferizeOperand::LinalgOutput) already bufferizes it as a
+      // whole, the same way it does a `linalg.fill`. Treating it as its own
+      // target here would instead try to bufferize its raw, not-yet-lowered
+      // input operands (e.g. a `dispatch.tensor.load`) directly, which fails.
+      if (isElementwiseFeedingContractionDest(linalgOp))
+        return WalkResult::advance();
       // Skip if the op's elementwise status doesn't match the bufferization
       // mode.
       if (isElementwise(linalgOp) != bufferizeElementwise)

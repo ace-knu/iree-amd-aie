@@ -99,6 +99,15 @@ bool isElementwiseWithMatmulProducer(linalg::LinalgOp linalgOp);
 /// elementwise op as its consumer.
 bool isMatmulWithElementwiseConsumer(linalg::LinalgOp linalgOp);
 
+/// Utility to identify if `linalgOp` is an elementwise operation (e.g. a
+/// broadcasted bias) whose result feeds directly into a contraction or
+/// convolution op's own destination/accumulator operand -- i.e. it has
+/// already been folded into that op's accumulator init (see
+/// AMDAIEFoldBroadcastAddIntoDestPass) and should be treated like a
+/// `linalg.fill` for bufferization purposes, not as an independent
+/// elementwise dispatch tail.
+bool isElementwiseFeedingContractionDest(linalg::LinalgOp linalgOp);
+
 /// Utility to identify if `linalgOp` is a supported reduction op.
 bool isReductionOp(linalg::LinalgOp linalgOp);
 

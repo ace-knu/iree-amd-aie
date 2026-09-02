@@ -14,7 +14,9 @@
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 
 #define DEBUG_TYPE "iree-amdaie-utils"
 
@@ -363,6 +365,63 @@ bool isMatmulWithElementwiseConsumer(linalg::LinalgOp linalgOp) {
     }
   }
   return false;
+}
+
+/// Utility to identify if `result` (transitively, through any chain of
+/// `linalg.pack`/`linalg.copy` re-layout ops the pack-peel pipeline inserts
+/// between an accumulator-init producer and the contraction that consumes
+/// it) feeds a contraction/convolution op's own destination operand.
+static bool feedsContractionDestTransitively(Value result) {
+  for (OpOperand &use : result.getUses()) {
+    Operation *user = use.getOwner();
+    if (auto userLinalgOp = dyn_cast<linalg::LinalgOp>(user)) {
+      bool isContractionLike =
+          linalg::isaContractionOpInterface(userLinalgOp) ||
+          isa<linalg::ConvolutionOpInterface>(*userLinalgOp);
+      if (isContractionLike && userLinalgOp.isDpsInit(&use)) return true;
+    }
+    if (auto packOp = dyn_cast<linalg::PackOp>(user)) {
+      if (packOp.getSource() == result &&
+          feedsContractionDestTransitively(packOp.getResult())) {
+        return true;
+      }
+    }
+    if (auto copyOp = dyn_cast<linalg::CopyOp>(user)) {
+      if (llvm::is_contained(copyOp.getInputs(), result) &&
+          feedsContractionDestTransitively(copyOp.getResult(0))) {
+        return true;
+      }
+    }
+    if (auto extractSliceOp = dyn_cast<tensor::ExtractSliceOp>(user)) {
+      if (extractSliceOp.getSource() == result &&
+          feedsContractionDestTransitively(extractSliceOp.getResult())) {
+        return true;
+      }
+    }
+    // A pack-peel K-reduction loop (`scf.for`) or a per-tile parallel loop
+    // (`scf.forall`) both thread the accumulator through as a loop-carried
+    // value; follow it into the region's tied iter_arg either way.
+    if (auto loopLikeOp = dyn_cast<LoopLikeOpInterface>(user)) {
+      if (BlockArgument iterArg = loopLikeOp.getTiedLoopRegionIterArg(&use)) {
+        if (feedsContractionDestTransitively(iterArg)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// Utility to identify if `linalgOp` is an elementwise operation whose result
+/// feeds (possibly through intervening `linalg.pack`/`linalg.copy` re-layout
+/// ops) into a contraction/convolution op's own destination operand (e.g. a
+/// broadcasted bias folded into a matmul's accumulator init by
+/// AMDAIEFoldBroadcastAddIntoDestPass).
+bool isElementwiseFeedingContractionDest(linalg::LinalgOp linalgOp) {
+  if (!linalg::isElementwise(linalgOp) ||
+      isa<linalg::FillOp, linalg::CopyOp>(linalgOp)) {
+    return false;
+  }
+  if (linalgOp->getNumResults() != 1) return false;
+  return feedsContractionDestTransitively(linalgOp->getResult(0));
 }
 
 static bool isIteratorTypesOfConvSame(
