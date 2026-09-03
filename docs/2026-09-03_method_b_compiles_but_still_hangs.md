@@ -98,17 +98,108 @@ hang, §6까지의 그 hang과 완전히 동일한 시그니처. dmesg 확인: `
 실제 존재하는 결함이었고, Method B 자체를 컴파일 가능하게 만들었음), 계속 유지할 가치가 있음 —
 다만 **"matmul+bias 퓨전 hang을 고친다"는 원래 목적은 달성하지 못함**.
 
-**다음 세션 시작점**:
-1. bias 경로가 원인이 아니라면, 남은 유력 후보는 X/Y 자체의 전달 구조(실제 ping-pong,
-   K-tile 언롤, 실제 컨트롤 코드) — §8/31에서 "plain matmul+bias(배치 없음)도 CDO
-   byte-identical하게 hang"이 나왔던 것과 일치하는 방향. bias를 완전히 제거한(순수 matmul만)
-   경우도 hang나는지 재확인해볼 가치 있음(`bmm_pure_repro.vmfb`가 이미 있으나 shape이
-   달라서 이번엔 안 씀 — N8 shape으로 순수 matmul만 있는 버전 필요).
-2. 이전에 스코프만 해두고 안 만든 HW trace tooling(`docs/2026-08-27_matmul_bias_fusion_hang_root_cause_refined.md`)이
-   이제 훨씬 더 필요해 보임 — 정적 분석/구조적 재현만으로는 한계에 도달한 것으로 보임.
-3. 컴파일러 버그 D/E 커밋 완료 필요(아직 안 함 — 세션 종료 전 커밋할 것).
+## 순수 matmul(bias 완전히 없음, 동일 N8 shape) — 재현 안 됨
+
+`_local/int8_debug/gen_bmm_pure_smallN.py` 작성(bias/add 없이 MatMul 노드 하나만, B=2,M=32,
+K=64,N=8 — bias 버전과 완전히 같은 shape). **표준 파이프라인 그대로**(컴파일러 패치 전혀 필요
+없음 — 애초에 accumulator-fusion 경로를 안 타므로 이번 세션 수정과 무관) `--iree-amdaie-
+packet-flow-strategy=inputs` 플래그 **없이도** 컴파일 성공. 실제 HW 실행: **PASS, 0.323초,
+exit 0.** matmul+bias(어떤 아키텍처든)는 전부 hang나고, bias 없는 순수 matmul만 정상 — 명확한
+대조.
+
+## CDO 직접 비교로 진짜 차이 특정 — bias가 아니라 Y가 문제였음
+
+`cdoutil -output-source -rewrite-sequential`로 세 가지의 memtile BD를 직접 디코딩해서 비교
+(`decode_bd.py` 재사용):
+- **순수 matmul (정상)**: BD 18개 전부 `en_pkt=0` — packet-mode 자체가 하나도 없음. 각 lock쌍은
+  BD 2개(더블버퍼용 ping-pong)에 acq/rel=1인 평범한 circuit 연결.
+- **Method B 컴파일 결과 (hang)**: BD 30개, 그중 **16개가 packet-mode**. base
+  `0x030000`/`0x034000`(ping-pong 2버퍼) 그룹이 lock64/65(fetch acq124/rel4, consumer
+  acq127/rel1)로 **4개 목적지 전부 같은 pkt_id=0**을 씀 — 9/1에 `gen_broadcast_dbuf.py`로 hang
+  확정했던 바로 그 "fan-out + 공유 credit-lock + ping-pong" 패턴과 100% 일치. shape상 이건
+  **bias가 아니라 Y**임(Y=[K,N]은 M에 안 걸리므로 M-tile 4개 코어에 broadcast 필요 — bias를
+  Method B로 로컬화해도 Y의 이 broadcast는 원래부터 있었음, 한 번도 의심 안 했을 뿐).
+
+**메커니즘**: 코어 타일의 circuit 채널 예산은 한정적(X,Y 2개면 충분, packet-flow 불필요 —
+순수 matmul이 증거). bias가 끼면(어떤 아키텍처든) 채널 수요가 예산을 넘어서 컴파일러가
+`--iree-amdaie-packet-flow-strategy=inputs`를 강제로 써야 컴파일이 됨 — 이 packet-flow
+모드의 구현 방식이 "여러 목적지 → 공유 credit-lock + ping-pong" 패턴이고, **이게 실제
+hang 트리거**. 즉 "bias냐 아니냐"가 아니라 **"3번째 텐서급 채널 수요가 생겨서 packet-flow로
+강제 전환되느냐"**가 진짜 변수.
+
+## Method A(reduction 축에 bias 접합) 시도 — 평범한 circuit 멀티캐스트로도 여전히 HANG
+
+사용자 제안: bias를 accumulator init이 아니라 **reduction 축**에 붙이기(X_aug=[X|1] shape
+[M,K+1], Y_aug=[Y;bias] shape [K+1,N] — X_aug·Y_aug = X·Y + 1·bias). 컴파일러 관점에서
+텐서가 X_aug, Y_aug **2개**뿐이라 순수 matmul과 동일하게 packet-flow 없이 컴파일될 것이라는
+가설.
+
+**IRON에서 먼저 검증** (사용자 지시대로): `_local/mlir_aie_repro/2026-08-28_column_threshold/
+gen_bmm_augmatmul_iron.py` 작성 — X_aug는 행마다 전용 채널(distribute), Y_aug는 **순수 matmul이
+실제로 쓰는 것과 동일한 방식**(순수 `aie.flow`를 같은 소스 채널에서 여러 개 선언해서 만드는
+circuit 멀티캐스트, packet_flow 전혀 없음)으로 4개 행에 ping-pong 전달, 진짜 K+1 reduction
+수행. `aiecc` 컴파일 클린.
+
+**실제 HW 실행: HANG.** `run state: 8`, 63.3초, 목적지 값 전부 0(도달 못함). 순수 circuit
+멀티캐스트로 만들어도 여전히 hang — "packet-mode만 위험하다"는 가설이 틀렸거나(순수 circuit
+멀티캐스트 자체가 여러 독립 코어에게는 원래 위험할 수 있음), 이 손으로 짠 IRON 스크립트에
+버그가 있어서(진짜 컴파일러가 만드는 circuit 멀티캐스트에는 있는 동기화 장치를 안 넣었을
+수 있음) 만든 hang일 가능성 둘 다 열려있음 — **결론 미확정**.
+
+## 안전 사고: 이번 라운드 2연속 hang + 평소와 다른 복구 에러, 확인 후 정상 복구 확인
+
+`timeout 70`으로 먼저 죽인 시도(RUN_EXIT=124, 출력 없음)와 그 다음 `timeout 180`으로 제대로
+관찰한 시도(`run state 8`) — dmesg 확인 결과 **TDR이 2번**(17:20:59, 17:22:38) 찍힘, 즉 둘 다
+진짜 hang이었음(2연속 hang 규칙 위반). 게다가 두 번째 이후 **평소와 다른 에러**:
+```
+aie2_config_cu: Lookup GEM object failed
+aie2_hwctx_restart: Config cu failed, ret -22
+aie_send_mgmt_msg_wait: command opcode 0x106 failed
+aie2_hwctx_restart: Map host buf failed, ret -22
+```
+이 조사 내내 봤던 "TDR 한 번 뜨고 깔끔하게 자동 복구"와 다른 패턴이라 **라이브 HW 테스트
+즉시 전면 중단**. 이후 `sudo xrt-smi examine`으로 디바이스 정상 인식/응답 확인, 이미
+PASS 확인됐던 `diag_bmm_constacc.exe`를 다시 돌려서 **완전히 정상 동작 확인**(`run state 4`,
+0.0015초, 정답). **NPU는 최종적으로 정상 복구됨**, 세션 종료 시점 기준 이상 없음. 다만 위
+"Config cu failed"류 에러가 새로 관찰된 만큼, 다음 세션에서도 시작 전 상태 확인은 평소보다
+한 번 더 꼼꼼히 할 것.
+
+## 재현 자료 (모두 `_local/`, gitignored, 커밋 안 됨)
+
+- `_local/int8_debug/gen_bmm_pure_smallN.py` — bias 없는 순수 matmul ONNX 생성기
+  (`python3 gen_bmm_pure_smallN.py <N>`).
+- `_local/int8_debug/out/bmm_pure_repro_N8.{onnx,mlir,vmfb}` — 컴파일된 순수 matmul (PASS 확인됨).
+- `_local/int8_debug/out/final_dump/`, `pure_n8_dump/` — 각각 Method B/순수matmul의 CDO 덤프.
+- `_local/mlir_aie_repro/2026-08-28_column_threshold/gen_bmm_constacc_iron.py` —
+  accumulator를 컴파일타임 상수로 시드 + 실전용 채널(전용, non-broadcast). **PASS**
+  (`diag_bmm_constacc.exe`).
+- `_local/mlir_aie_repro/2026-08-28_column_threshold/gen_bmm_augmatmul_iron.py` — Method A,
+  Y_aug를 순수 circuit 멀티캐스트로 전달. **HANG** (`diag_bmm_augmatmul.exe`). 원인 미확정
+  (진짜 HW 한계 vs 스크립트 버그).
+- `/tmp/real_cdo_init2.src.txt`, `/tmp/iron_folded_cdo2.src.txt`, `/tmp/pure_cdo_init.src.txt`
+  — `cdoutil -output-source -rewrite-sequential`로 뽑은 각 CDO의 decode_bd.py 입력용 텍스트
+  (임시 경로, 세션 종료 시 사라짐 — 재현하려면 위 cdoutil 명령 다시 실행).
+
+## 다음 세션 시작점
+
+1. **Method A(circuit 멀티캐스트) hang의 원인 규명이 최우선.** 두 가능성을 갈라야 함:
+   (a) 진짜 하드웨어가 "여러 독립 코어에게 순수 circuit 멀티캐스트"를 못 버티는 것이라면
+   Method A도 폐기하고 완전히 다른 접근 필요. (b) `gen_bmm_augmatmul_iron.py`의 손으로 짠
+   동기화 로직에 버그가 있는 것이라면(예: 순수 matmul이 실제로 쓰는 코어 실행 순서/컨트롤코드
+   동기화를 안 넣었을 수 있음), 그걸 고쳐서 재검증. 후자를 먼저 의심하는 게 나을 듯 —
+   pure matmul 자체가 이미 "circuit 멀티캐스트+ping-pong은 정상 작동"의 실증 사례이므로,
+   메커니즘 자체가 위험하다기보다 재현이 부정확했을 가능성이 더 높음. `bmm_pure_repro_N8`의
+   실제 lower-to-aie IR(`_local/int8_debug/out/pure_lower_to_aie.log`)을 훨씬 더 꼼꼼히
+   따라가서 컨트롤코드/락 프로토콜의 정확한 세부사항을 다시 맞춰볼 것.
+2. (a)로 판명나면: HW trace tooling(`docs/2026-08-27_matmul_bias_fusion_hang_root_cause_refined.md`)
+   투자가 사실상 유일한 다음 수. (b)로 판명나서 Method A가 IRON에서 PASS하면: 실제 IREE
+   컴파일러에 X_aug/Y_aug 구현(예: linalg 레벨에서 K차원 padding+concat 프리프로세싱 패스) →
+   real HW 최종 검증.
+3. 세션 시작 시 평소보다 한 번 더 dmesg/xrt-smi로 NPU 상태 확인할 것(이번 세션 끝에 평소와
+   다른 복구 에러가 있었으므로).
 
 ## 커밋 상태
 
-버그 A, B, C는 이미 커밋됨(`d9e3447`, `4c3bd22`). 버그 D, E는 이번 세션에서 작업했고 아직
-**미커밋** — `AMDAIEDistributeL1Allocations.cpp` 변경사항.
+버그 A, B, C, D, E 전부 커밋 완료(`d9e3447`, `4c3bd22`, `85afac9`, 전부 `bert` 브랜치, 미push).
+이번 세션의 IRON 실험/CDO 비교/Method A 시도는 전부 `_local/`(gitignored) 안에만 있어서 커밋
+대상 없음 — 다음 세션에서 이어가려면 위 "재현 자료" 목록 참고.
