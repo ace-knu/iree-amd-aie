@@ -491,7 +491,9 @@ static LogicalResult foldBiasIntoConv2d(RewriterBase &rewriter,
 /// the exact shape handled, so unrelated matmuls (including plain
 /// `fill(0)`-initialized ones) are never touched.
 static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
-                                        linalg::MatmulOp matmul) {
+                                        linalg::MatmulOp matmul,
+                                        bool foldRhsTranspose,
+                                        int64_t kAlign) {
   if (!matmul.hasPureTensorSemantics()) return failure();
   if (matmul.getNumDpsInits() != 1) return failure();
 
@@ -526,6 +528,81 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
 
   SmallVector<AffineMap> maps = matmul.getIndexingMapsArray();
   AffineMap lhsMap = maps[0], rhsMap = maps[1], outMap = maps[2];
+  Value rhs = matmul.getDpsInputs()[1];
+
+  // torch-to-linalg's ONNX Gemm(transB=1) lowering materializes the
+  // transpose of the weight explicitly (`linalg.transpose` then plain
+  // `linalg.matmul`) rather than leaving it as a permuted matmul indexing
+  // map ("transpose_b" form, RHS = [N,K]). Left alone, augmenting `rhs` as
+  // the transpose's *output* would carry that materialized transpose
+  // straight through: the augmented RHS is no longer the transpose's
+  // direct, sole use (it is wrapped in the K+1 `tensor.insert_slice`
+  // padding below), so a later "fold transpose into matmul" canonicalization
+  // that only matches a matmul operand produced *directly* by a transpose
+  // can no longer fire on it, permanently losing the transpose_b layout.
+  // That loss is exactly what caused a real runtime regression on VGG16's
+  // FC1 (K=25088, N=4096): `AMDAIESplitLargeContractionDispatchesPass`
+  // splits a large-N transpose_b weight into cheap contiguous-outer-dim
+  // N-chunks, but for a plain (non-transpose_b) RHS the same split still
+  // compiles, yet leaves K (not N) as the DMA's per-chunk iterated axis --
+  // splitting N never reduces K's iteration count, so it still blows the
+  // shim's iteration budget and hangs on real hardware. Folding the
+  // transpose into the matmul's own indexing map *here*, before
+  // augmentation, keeps the matmul in transpose_b form throughout (and, as
+  // a bonus, avoids ever materializing the transpose at all -- a real
+  // runtime cost for a large FC weight).
+  //
+  // BUT: the split pass this fold exists for already skips any dispatch with
+  // a fused elementwise consumer (`AMDAIEPadContractionDispatches.cpp`'s
+  // `info->elementwiseConsumer` check) -- so when this matmul's result feeds
+  // straight into an elementwise op that DispatchCreation's default fusion
+  // heuristic will pull into the same dispatch (e.g. VGG16's FC1/FC2, each
+  // immediately followed by a ReLU, with neither of the two workaround flags
+  // that prevent that fusion), this fold buys nothing: the split will not
+  // fire regardless. Its cost remains, though -- an unsplit, transpose_b-
+  // shaped large weight drives a different L2/L1 pack/DMA structure than a
+  // plain-shaped one, and for FC1/FC2 specifically that difference exhausts
+  // a core tile's consumer DMA channels (`no consumer DMA channel available`,
+  // discovered when compiling without the workaround flags -- see
+  // docs/2026-09-04d_workaround-free-compile-regression-bisection.md).
+  //
+  // A same-IR heuristic (`hasFusableElementwiseConsumer`, checking whether
+  // this result has a single all-parallel-generic use) was tried here and
+  // REJECTED: at this Preprocessing-phase pass's vantage point, the IR looks
+  // identical whether or not
+  // `--iree-dispatch-creation-no-fuse-into-contraction-conv-roots` is later
+  // passed -- that flag only changes a *downstream* DispatchCreation
+  // decision, not anything visible yet in this IR. The heuristic therefore
+  // always predicted "will be fused" for VGG16's FC1/FC2 (true without the
+  // flag, false with it) and always skipped the fold -- which fixed the
+  // workaround-free compile but broke the workaround-included real-NPU
+  // success verified earlier today (regressed back to the original FC1
+  // runtime hang, `ert state 8`). Reverted: the fold below is unconditional
+  // on `foldRhsTranspose` again, matching the verified-working behavior.
+  // Compiling without the two workaround flags now succeeds (the DMA
+  // channel-exhaustion compile error is fixed by other means -- see the doc
+  // above) but the resulting binary still hangs on real hardware; that is a
+  // separate, deeper runtime problem this change does not attempt to solve.
+  linalg::TransposeOp deadTranspose;
+  if (foldRhsTranspose) {
+  if (auto transposeOp = rhs.getDefiningOp<linalg::TransposeOp>()) {
+    ArrayRef<int64_t> perm = transposeOp.getPermutation();
+    if (transposeOp->getResult(0).hasOneUse() && perm.size() == 2) {
+      rhs = transposeOp.getInput();
+      // `rhsMap` describes `rhs` as the transpose's *output*; rebuild it to
+      // describe the transpose's *input* instead by undoing `perm`
+      // (result i of the old map, which read operand-dim i of the
+      // transposed value, becomes result perm[i], reading operand-dim
+      // perm[i] of the pre-transpose value).
+      SmallVector<AffineExpr> newResults(2);
+      for (unsigned i = 0; i < 2; ++i)
+        newResults[perm[i]] = rhsMap.getResult(i);
+      rhsMap = AffineMap::get(rhsMap.getNumDims(), rhsMap.getNumSymbols(),
+                              newResults, rhsMap.getContext());
+      deadTranspose = transposeOp;
+    }
+  }
+  }  // foldRhsTranspose
 
   // The bias broadcasts into `initOperand` dim `biasResultDim`; resolve which
   // loop dim that tensor position stands for, and require it to be N (bias
@@ -549,7 +626,6 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
   }
 
   Value lhs = matmul.getDpsInputs()[0];
-  Value rhs = matmul.getDpsInputs()[1];
   auto lhsType = cast<RankedTensorType>(lhs.getType());
   auto rhsType = cast<RankedTensorType>(rhs.getType());
   auto biasType = cast<RankedTensorType>(bias.getType());
@@ -573,14 +649,46 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
   Type elemType = rhsType.getElementType();
   int64_t k = rhsType.getShape()[*rhsKPos];
 
-  // --- Augment rhs: [K,N] (or [N,K]) -> one more row/col along K, holding
-  // bias at the new K index. ---
+  // The augmentation needs K+1, but grow it all the way to the next multiple
+  // of `kKAlign` instead (the extra rows/cols beyond the bias row are zero, so
+  // they contribute nothing). Motivation: leaving K at exactly K+1 hands a
+  // non-tile-aligned K to `AMDAIEPadContractionDispatchesPass`, which then pads
+  // it up with a *host padding dispatch* -- and for a weight that was a
+  // hoisted compile-time constant, that turns the NPU dispatch's weight
+  // operand into a runtime-produced buffer instead of a constant one.
+  // Producing the aligned shape here keeps the augmented weight a foldable
+  // constant, exactly like the un-augmented weight is when K already happens
+  // to be aligned (which is the configuration that is known to work on real
+  // hardware).
+  // TODO: plumb this from the target (numRows * pack-peel reduction tile,
+  // i.e. 4 * 32 on npu4) instead of hardcoding, once the target device is
+  // available to this Preprocessing-phase pass.
+  int64_t align = std::max<int64_t>(kAlign, 1);
+  int64_t augK = ((k + 1 + align - 1) / align) * align;
+  // When `augK == k + 1` (kAlign == 1, the pre-2026-09-04 behavior), every
+  // element of the augmented base is about to be overwritten by the inserts
+  // below -- skip the zero-fill so this path stays a byte-for-byte
+  // reproduction of the pre-2026-09-04 IR (no extra `linalg.fill` ops).
+  bool needsZeroFill = augK > k + 1;
+
+  // --- Augment rhs: [K,N] (or [N,K]) -> grow along K to `augK`, holding
+  // bias at K index `k` and zeros beyond it. The base is zero-*filled* (not a
+  // bare `tensor.empty`) whenever `augK > k+1`: the tail rows/cols are never
+  // written by an insert below, and they must read as zero, not as
+  // undefined. ---
   SmallVector<int64_t> augRhsShape(rhsType.getShape());
-  augRhsShape[*rhsKPos] += 1;
+  augRhsShape[*rhsKPos] = augK;
+  Value zeroElem =
+      arith::ConstantOp::create(rewriter, loc, rewriter.getZeroAttr(elemType));
   Value augRhsEmpty =
       tensor::EmptyOp::create(rewriter, loc, augRhsShape, elemType);
+  Value augRhsZero =
+      needsZeroFill
+          ? linalg::FillOp::create(rewriter, loc, zeroElem, augRhsEmpty)
+                .getResult(0)
+          : augRhsEmpty;
   SmallVector<int64_t> zeroOffsets(2, 0);
-  Value augRhs = insertFullSlice(rewriter, loc, rhs, augRhsEmpty, zeroOffsets);
+  Value augRhs = insertFullSlice(rewriter, loc, rhs, augRhsZero, zeroOffsets);
 
   SmallVector<int64_t> biasSliceShape(augRhsShape);
   biasSliceShape[*rhsKPos] = 1;
@@ -593,14 +701,21 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
   augRhs = insertFullSlice(rewriter, loc, biasReshaped, augRhs,
                            biasSliceOffsets);
 
-  // --- Augment lhs: one more row/col along K, holding the constant 1.0 at
-  // the new K index (so the extra rhs row is picked up exactly once, added
-  // unscaled, for every M row). ---
+  // --- Augment lhs: grow along K to the same `augK`, holding the constant
+  // 1.0 at K index `k` (so the extra rhs row is picked up exactly once, added
+  // unscaled, for every M row) and zeros beyond it (they pair with the rhs's
+  // zero tail, so their value is immaterial -- but zero-filling keeps it
+  // defined rather than reading an uninitialized `tensor.empty`). ---
   SmallVector<int64_t> augLhsShape(lhsType.getShape());
-  augLhsShape[*lhsKPos] += 1;
+  augLhsShape[*lhsKPos] = augK;
   Value augLhsEmpty =
       tensor::EmptyOp::create(rewriter, loc, augLhsShape, elemType);
-  Value augLhs = insertFullSlice(rewriter, loc, lhs, augLhsEmpty, zeroOffsets);
+  Value augLhsZero =
+      needsZeroFill
+          ? linalg::FillOp::create(rewriter, loc, zeroElem, augLhsEmpty)
+                .getResult(0)
+          : augLhsEmpty;
+  Value augLhs = insertFullSlice(rewriter, loc, lhs, augLhsZero, zeroOffsets);
 
   SmallVector<int64_t> onesSliceShape(augLhsShape);
   onesSliceShape[*lhsKPos] = 1;
@@ -628,14 +743,21 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
   Value zeroFill =
       linalg::FillOp::create(rewriter, loc, zero, newEmpty).getResult(0);
 
-  NamedAttribute indexingMapsAttr(matmul.getIndexingMapsAttrName(),
-                                  matmul.getIndexingMapsAttr());
+  // Use the (possibly transpose-folded, see above) `lhsMap`/`rhsMap`/`outMap`
+  // here, not `matmul`'s own original indexing-maps attr -- when a transpose
+  // was folded in, the original attr still describes the now-discarded
+  // transposed RHS.
+  NamedAttribute indexingMapsAttr(
+      matmul.getIndexingMapsAttrName(),
+      rewriter.getAffineMapArrayAttr({lhsMap, rhsMap, outMap}));
   auto newMatmul = linalg::MatmulOp::create(
       rewriter, loc, TypeRange{outputType}, ValueRange{augLhs, augRhs},
       ValueRange{zeroFill}, ArrayRef<NamedAttribute>{indexingMapsAttr});
   rewriter.replaceOp(resultOp, newMatmul.getResult(0));
   if (biasGeneric && biasGeneric->use_empty()) rewriter.eraseOp(biasGeneric);
   if (postAdd && matmul->use_empty()) rewriter.eraseOp(matmul);
+  if (deadTranspose && deadTranspose->use_empty())
+    rewriter.eraseOp(deadTranspose);
   return success();
 }
 
@@ -662,7 +784,7 @@ struct AMDAIEFoldBiasIntoContractionPass
     IRRewriter rewriter(&getContext());
     for (linalg::MatmulOp matmul : matmuls) {
       rewriter.setInsertionPoint(matmul);
-      (void)foldBiasIntoMatmul(rewriter, matmul);
+      (void)foldBiasIntoMatmul(rewriter, matmul, foldRhsTranspose, kAlign);
     }
     for (linalg::LinalgOp conv : convs) {
       rewriter.setInsertionPoint(conv);

@@ -1,4 +1,6 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction)' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{fold-rhs-transpose=false})' %s | FileCheck %s --check-prefix=NOTRANSPOSE
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{k-align=1})' %s | FileCheck %s --check-prefix=KALIGN1
 
 // A conv2d (NCHW/FCHW: no channels-last conversion) whose accumulator is a
 // `linalg.broadcast` of a 1-D bias is folded into a single conv with one
@@ -98,25 +100,36 @@ func.func @conv_only(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x3x3x3xf32>
 }
 
 // A matmul whose accumulator is a broadcast of a 1-D bias is folded into a
-// single K+1 matmul: bias becomes an extra reduction row of rhs, and lhs gets
-// a matching extra column of the constant 1.0. No bias operand, and no
+// single larger matmul: bias becomes an extra reduction row of rhs, and lhs
+// gets a matching extra column of the constant 1.0. No bias operand, and no
 // separate bias-add, survives.
+//
+// The augmented K is grown past K+1 (129 here) to the next multiple of the
+// pass's K alignment (128), i.e. 256, with the rows/cols past the bias row
+// left at zero -- so they contribute nothing. That alignment is what keeps
+// `AMDAIEPadContractionDispatchesPass` from having to pad this K afterwards,
+// which for a constant weight would replace the constant with the result of a
+// runtime padding dispatch (see both passes' comments). Hence the zero-*filled*
+// bases below rather than bare `tensor.empty`: the tail past the bias row is
+// never written by an insert, so it has to be defined, not undefined.
 
 // CHECK-LABEL: @matmul_bias
 // CHECK-SAME:    %[[LHS:[a-zA-Z0-9]+]]: tensor<64x128xf32>
 // CHECK-SAME:    %[[RHS:[a-zA-Z0-9]+]]: tensor<128x128xf32>
 // CHECK-SAME:    %[[BIAS:[a-zA-Z0-9]+]]: tensor<128xf32>
 // CHECK-NOT: linalg.generic
-// CHECK: %[[RHS_EMPTY:.+]] = tensor.empty() : tensor<129x128xf32>
-// CHECK: %[[RHS_INS:.+]] = tensor.insert_slice %[[RHS]] into %[[RHS_EMPTY]][0, 0] [128, 128] [1, 1]
+// CHECK: %[[RHS_EMPTY:.+]] = tensor.empty() : tensor<256x128xf32>
+// CHECK: %[[RHS_ZERO:.+]] = linalg.fill {{.*}} outs(%[[RHS_EMPTY]] : tensor<256x128xf32>)
+// CHECK: %[[RHS_INS:.+]] = tensor.insert_slice %[[RHS]] into %[[RHS_ZERO]][0, 0] [128, 128] [1, 1]
 // CHECK: %[[BIAS_2D:.+]] = tensor.expand_shape %[[BIAS]] {{.*}} output_shape [1, 128]
 // CHECK: %[[RHS_AUG:.+]] = tensor.insert_slice %[[BIAS_2D]] into %[[RHS_INS]][128, 0] [1, 128] [1, 1]
-// CHECK: %[[LHS_EMPTY:.+]] = tensor.empty() : tensor<64x129xf32>
-// CHECK: %[[LHS_INS:.+]] = tensor.insert_slice %[[LHS]] into %[[LHS_EMPTY]][0, 0] [64, 128] [1, 1]
+// CHECK: %[[LHS_EMPTY:.+]] = tensor.empty() : tensor<64x256xf32>
+// CHECK: %[[LHS_ZERO:.+]] = linalg.fill {{.*}} outs(%[[LHS_EMPTY]] : tensor<64x256xf32>)
+// CHECK: %[[LHS_INS:.+]] = tensor.insert_slice %[[LHS]] into %[[LHS_ZERO]][0, 0] [64, 128] [1, 1]
 // CHECK: %[[ONES:.+]] = linalg.fill
 // CHECK: %[[LHS_AUG:.+]] = tensor.insert_slice %[[ONES]] into %[[LHS_INS]][0, 128] [64, 1] [1, 1]
 // CHECK: %[[ZERO_FILL:.+]] = linalg.fill
-// CHECK: %[[RESULT:.+]] = linalg.matmul ins(%[[LHS_AUG]], %[[RHS_AUG]] : tensor<64x129xf32>, tensor<129x128xf32>) outs(%[[ZERO_FILL]] : tensor<64x128xf32>)
+// CHECK: %[[RESULT:.+]] = linalg.matmul ins(%[[LHS_AUG]], %[[RHS_AUG]] : tensor<64x256xf32>, tensor<256x128xf32>) outs(%[[ZERO_FILL]] : tensor<64x128xf32>)
 // CHECK: return %[[RESULT]]
 func.func @matmul_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
                         %bias: tensor<128xf32>) -> tensor<64x128xf32> {
@@ -216,3 +229,91 @@ func.func @matmul_row_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
                           outs(%bias_bcast : tensor<64x128xf32>) -> tensor<64x128xf32>
   return %result : tensor<64x128xf32>
 }
+
+// -----
+
+// ONNX Gemm(transB=1)'s materialized-transpose form: `linalg.transpose` of
+// the weight feeding a plain (non-permuted) `linalg.matmul`, immediately
+// followed by a separate bias-add (same shape as `matmul_post_add_bias`, but
+// with an explicit transpose in front of rhs). By default
+// (`fold-rhs-transpose=true`, the pass's default) the transpose is folded
+// into the matmul's own indexing map before augmentation -- the result keeps
+// transpose_b ([N,K]) form, and no `linalg.transpose` survives.
+
+// CHECK-LABEL: @matmul_transpose_b
+// CHECK-SAME:    %[[LHS:[a-zA-Z0-9]+]]: tensor<64x128xf32>
+// CHECK-SAME:    %[[RHST:[a-zA-Z0-9]+]]: tensor<128x128xf32>
+// CHECK-SAME:    %[[BIAS:[a-zA-Z0-9]+]]: tensor<128xf32>
+// CHECK-NOT: linalg.transpose
+// CHECK: %[[RESULT:.+]] = linalg.matmul
+// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<64x256xf32>, tensor<128x256xf32>)
+// CHECK: return %[[RESULT]]
+func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf32>,
+                               %bias: tensor<128xf32>) -> tensor<64x128xf32> {
+  %empty_t = tensor.empty() : tensor<128x128xf32>
+  %rhs = linalg.transpose ins(%rhsT : tensor<128x128xf32>) outs(%empty_t : tensor<128x128xf32>) permutation = [1, 0]
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %zero = arith.constant 0.0 : f32
+  %fill = linalg.fill ins(%zero : f32) outs(%empty : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %mm = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                      outs(%fill : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                        affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%mm, %bias : tensor<64x128xf32>, tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%m: f32, %b: f32, %out: f32):
+      %sum = arith.addf %m, %b : f32
+      linalg.yield %sum : f32
+  } -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
+}
+
+// -----
+
+// Same input as @matmul_transpose_b, but with `fold-rhs-transpose=false`
+// (reproduces the pre-2026-09-04 behavior): the transpose is left in place
+// and the matmul keeps a plain (non-transpose_b) RHS.
+
+// NOTRANSPOSE-LABEL: @matmul_transpose_b
+// NOTRANSPOSE: linalg.transpose
+// NOTRANSPOSE: %[[RESULT:.+]] = linalg.matmul
+// NOTRANSPOSE: return %[[RESULT]]
+func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf32>,
+                               %bias: tensor<128xf32>) -> tensor<64x128xf32> {
+  %empty_t = tensor.empty() : tensor<128x128xf32>
+  %rhs = linalg.transpose ins(%rhsT : tensor<128x128xf32>) outs(%empty_t : tensor<128x128xf32>) permutation = [1, 0]
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %zero = arith.constant 0.0 : f32
+  %fill = linalg.fill ins(%zero : f32) outs(%empty : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %mm = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                      outs(%fill : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                        affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%mm, %bias : tensor<64x128xf32>, tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%m: f32, %b: f32, %out: f32):
+      %sum = arith.addf %m, %b : f32
+      linalg.yield %sum : f32
+  } -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
+}
+
+// -----
+
+// With `k-align=1`, the augmentation grows K by exactly 1 (the
+// pre-2026-09-04 behavior): the bases are bare `tensor.empty` with no
+// zero-fill (every element gets overwritten by an insert, since augK == k+1
+// leaves no undefined tail), and the augmented shapes are exactly K+1, not
+// the next multiple of some larger alignment.
+
+// KALIGN1-LABEL: @matmul_bias
+// KALIGN1: %[[RHS_EMPTY:.+]] = tensor.empty() : tensor<129x128xf32>
+// KALIGN1-NEXT: tensor.insert_slice {{.*}} into %[[RHS_EMPTY]]
+// KALIGN1: %[[LHS_EMPTY:.+]] = tensor.empty() : tensor<64x129xf32>
+// KALIGN1-NEXT: tensor.insert_slice {{.*}} into %[[LHS_EMPTY]]
+// KALIGN1: %[[RESULT:.+]] = linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<64x129xf32>, tensor<129x128xf32>)
+// KALIGN1: return %[[RESULT]]

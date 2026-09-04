@@ -73,6 +73,14 @@ struct AMDAIEOptions {
   // input (falling back on the usual detach/no-fuse workaround flags for
   // conv), while matmul + bias is still folded into the same dispatch.
   bool foldConvBiasIntoContraction{true};
+
+  // Debug-only escape hatches for bisecting the 2026-09-04 fold-bias change
+  // (see AMDAIEFoldBiasIntoContraction.cpp). Defaults reproduce today's
+  // verified-working behavior; false / 1 reproduce the pre-2026-09-04
+  // behavior.
+  bool foldRhsTransposeIntoContraction{true};
+  int64_t foldBiasKAlign{128};
+
   bool enableCoalescingLoops{false};
   bool enableCollapsingUnitDims{false};
   OutliningStrategy enableFunctionOutlining{OutliningStrategy::Balanced};
@@ -192,6 +200,25 @@ struct AMDAIEOptions {
             "bias as a separate dispatch input (relying on the usual "
             "detach/no-fuse workaround flags for conv), while matmul + bias "
             "is still folded into the same dispatch."));
+
+    binder.opt<bool>(
+        "iree-amdaie-fold-rhs-transpose-into-contraction",
+        foldRhsTransposeIntoContraction, llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Debug-only: fold a materialized linalg.transpose feeding the "
+            "matmul RHS into the matmul's own indexing maps (transpose_b "
+            "form) before the K+1 bias fold. false reproduces the "
+            "pre-2026-09-04 behavior. For bisecting the fold-bias change; "
+            "not meant for general use."));
+
+    binder.opt<int64_t>(
+        "iree-amdaie-fold-bias-k-align", foldBiasKAlign,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Debug-only: grow the K+1 bias-fold augmentation up to the next "
+            "multiple of this value instead of stopping at exactly K+1. 1 "
+            "reproduces the pre-2026-09-04 behavior. For bisecting the "
+            "fold-bias change; not meant for general use."));
 
     binder.opt<bool>(
         "iree-amd-aie-enable-chess-for-ukernel", useChessForUKernel,

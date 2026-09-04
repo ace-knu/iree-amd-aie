@@ -99,7 +99,21 @@ def AMDAIEFoldBiasIntoContraction :
       "Also apply the K+1 fold to conv2d + bias (not just matmul). Disable "
       "to keep conv's bias as a separate dispatch input (relying on the "
       "usual detach/no-fuse workaround flags for conv), while matmul bias "
-      "is still folded into the same dispatch.">
+      "is still folded into the same dispatch.">,
+    Option<"foldRhsTranspose", "fold-rhs-transpose", "bool", /*default=*/"true",
+      "Fold an explicit linalg.transpose feeding the matmul RHS into the "
+      "matmul's own indexing maps (keeping transpose_b form) before "
+      "augmenting K, instead of letting the K+1 augmentation carry the "
+      "materialized transpose through unchanged. false disables the fold "
+      "unconditionally, reproducing the pre-2026-09-04 behavior. "
+      "Debug-only escape hatch for bisecting the 2026-09-04 fold-bias "
+      "change.">,
+    Option<"kAlign", "k-align", "int64_t", /*default=*/"128",
+      "Grow the bias-augmented reduction dim (K+1) up to the next multiple "
+      "of this value instead of stopping at exactly K+1 (extra rows/cols "
+      "are zero). 1 means 'exactly K+1', the pre-2026-09-04 behavior. "
+      "Debug-only escape hatch for bisecting the 2026-09-04 fold-bias "
+      "change.">
   ];
 }
 

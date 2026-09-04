@@ -68,6 +68,8 @@ struct AMDAIESession
     // bf16 together with the rest of the matmul's operands.
     AMDAIE::AMDAIEFoldBiasIntoContractionOptions foldBiasOptions;
     foldBiasOptions.foldConvBias = options.foldConvBiasIntoContraction;
+    foldBiasOptions.foldRhsTranspose = options.foldRhsTransposeIntoContraction;
+    foldBiasOptions.kAlign = options.foldBiasKAlign;
     passManager.addPass(
         AMDAIE::createAMDAIEFoldBiasIntoContractionPass(foldBiasOptions));
     // Demote contraction (matmul + conv) inputs f32 -> bf16 before the named
