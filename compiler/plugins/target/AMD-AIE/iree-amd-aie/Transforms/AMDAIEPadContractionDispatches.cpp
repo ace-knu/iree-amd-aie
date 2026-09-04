@@ -746,13 +746,19 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     int64_t m = lhsType.getShape()[lhsMPos];
     int64_t k = lhsType.getShape()[lhsKPos];
     int64_t n = rhsType.getShape()[rhsNPos];
-    Type outElemType =
-        cast<RankedTensorType>(info->matmul.getResult(0).getType())
-            .getElementType();
+    // The matmul's own (accumulator) element type -- used only to pick
+    // instruction-size-driven padding multiples below. Kept distinct from
+    // `outElemType` (the dispatch's actual output-binding element type,
+    // resolved below the `padOut` check): a fused elementwise consumer may
+    // legitimately narrow the type between the two (e.g. an f32 accumulator
+    // truncated to bf16 for the next layer), and using the accumulator's
+    // type for the dispatch's own result type in that case would be wrong.
+    Type accElemType = cast<RankedTensorType>(info->matmul.getResult(0).getType())
+                            .getElementType();
 
     std::optional<PaddingMultiples> mult = getPaddingMultiples(
         target, lhsType.getElementType(), rhsType.getElementType(),
-        outElemType);
+        accElemType);
     if (!mult) continue;
 
     int64_t mPad = roundUpToMultiple(m, mult->m);
@@ -832,6 +838,15 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
             hostAffinity, counter);
         dispatch.getArgumentsMutable().slice(accArgNo, 1).assign(accPadded);
       }
+      // The dispatch's own result type: the output binding's element type
+      // (`info->outArg`, non-null here since `padOut` was checked above),
+      // which is `accElemType` in the common direct-store case but may
+      // differ when a fused consumer narrows the type (see the comment
+      // where `accElemType` is computed above).
+      Type outElemType = cast<IREE::TensorExt::DispatchTensorType>(
+                              info->outArg.getType())
+                              .asRankedTensorType()
+                              .getElementType();
       Value result = dispatch.getResult(0);
       result.setType(RankedTensorType::get({mPad, nPad}, outElemType));
       rewriter.setInsertionPointAfter(dispatch);
@@ -907,20 +922,24 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
     if (!info) continue;
     // This pass always splits/grows the output (each N-chunk gets its own
     // output binding via growOutputStore below), which requires the matmul
-    // result to be stored directly (see MatmulInfo's comment). Skip a
-    // dispatch whose store is indirect (e.g. a fused elementwise consumer
-    // sits between the matmul and the store) -- unlike
-    // AMDAIEPadContractionDispatches, there is no K-only-safe fallback here.
+    // result to be stored either directly, or through exactly one recognized
+    // shape-preserving unary elementwise consumer (see MatmulInfo's
+    // comment) -- e.g. a fused ReLU, which is exactly the VGG16 FC-layer
+    // shape this pass exists for once elementwise fusion into contraction
+    // roots isn't disabled by a workaround flag. Skip a dispatch whose store
+    // is indirect through anything else (a reduction-shaped consumer, a
+    // consumer with more than one real input, or a chain of more than one
+    // intervening op) -- unlike AMDAIEPadContractionDispatches, there is no
+    // K-only-safe fallback here.
     //
-    // This also excludes the one indirect shape getMatmulInfo now resolves
-    // (a single shape-preserving unary elementwise consumer, e.g. a fused
-    // ReLU): resolving `store`/`outArg` for that shape only means
-    // AMDAIEPadContractionDispatches knows how to grow the consumer's own
-    // init/result alongside the matmul (via growElementwiseConsumerInit).
-    // This pass does not, so `info->elementwiseConsumer` must be excluded
-    // explicitly here or growOutputStore below would wire a still
-    // full-size (never-chunked) consumer result into a chunk-sized output
-    // binding.
+    // When a recognized consumer IS present, each per-chunk clone below
+    // grows the consumer's own init/result alongside the matmul (via
+    // growElementwiseConsumerInit, the same ordering
+    // AMDAIEPadContractionDispatches uses), and growOutputStore wires the
+    // consumer's (not the matmul's) chunk-sized result into the chunk output
+    // binding -- `isShapePreservingUnaryMapOf` structurally guarantees the
+    // consumer is a per-position map, so it commutes with the N-split:
+    // `f(concat(chunks)) == concat(f(chunk))`.
     //
     // `growMatmulInit` below is always called (every N-chunk gets its own
     // [M, C] accumulator), and for the accumulator-as-bias form
@@ -929,9 +948,7 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
     // that (unlike AMDAIEPadContractionDispatches's accArg handling, which
     // only ever pads the *whole* accumulator once), so `!info->fill` is
     // excluded here too.
-    if (!info->store || !info->outArg || info->elementwiseConsumer ||
-        !info->fill)
-      continue;
+    if (!info->store || !info->outArg || !info->fill) continue;
 
     // Only split when N is the RHS *outer* dim (transpose_b [N,K]), so the weight
     // N-slice is a contiguous outer-dim slice.
@@ -950,14 +967,24 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
 
     auto resultType = cast<RankedTensorType>(info->matmul.getResult(0).getType());
     int64_t M = resultType.getShape()[0];  // matmul output is [M, N]
-    Type elemType = resultType.getElementType();
+    // The matmul's own (accumulator) element type -- used only to pick the
+    // instruction-size-driven chunk size below. Kept distinct from
+    // `outElemType` (the actual output-binding element type, used for the
+    // chunk/concat result types further down): a fused elementwise consumer
+    // may legitimately narrow the type between the two (e.g. an f32
+    // accumulator truncated to bf16 for the next layer).
+    Type accElemType = resultType.getElementType();
+    Type outElemType = cast<IREE::TensorExt::DispatchTensorType>(
+                            info->outArg.getType())
+                            .asRankedTensorType()
+                            .getElementType();
 
     // Even, tile-aligned chunk size (N is already a multiple of the N tile).
     std::optional<PaddingMultiples> mult = getPaddingMultiples(
         target,
         cast<RankedTensorType>(dispatch.getArguments()[lhsArgNo].getType())
             .getElementType(),
-        rhsType.getElementType(), elemType);
+        rhsType.getElementType(), accElemType);
     if (!mult) continue;
     int64_t C = chooseChunkN(N, mult->n, kNChunkMax);
     int64_t nChunks = N / C;
@@ -974,15 +1001,15 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
     if (!origExe) continue;
     StringAttr funcName = entryPoint.getLeafReference();
     Attribute npuAffinity = dispatch->getAttr("stream.affinity");
-    Value lhs = dispatch.getArguments()[lhsArgNo];
     Value weight = dispatch.getArguments()[rhsArgNo];
     Location loc = dispatch.getLoc();
-    auto chunkResultType = RankedTensorType::get({M, C}, elemType);
+    auto chunkResultType = RankedTensorType::get({M, C}, outElemType);
     SmallVector<int64_t, 2> rhsChunk(2);
     rhsChunk[rhsNPos] = C;
     rhsChunk[rhsKPos] = K;
 
     SmallVector<Value> chunkOutputs;
+    bool allChunksOk = true;
     for (int64_t i = 0; i < nChunks; ++i) {
       rewriter.setInsertionPoint(dispatch);
       // View the weight N-slice [i*C:(i+1)*C, :] (an outer-dim contiguous slice).
@@ -1014,7 +1041,22 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
       cloneExport.setFunctionRef(newName);
       cloneFunc.setName(newName);
       std::optional<MatmulInfo> ci = getMatmulInfo(cloneFunc);
-      if (!ci) continue;
+      if (!ci) {
+        // Should not happen: `cloneFunc` is a structural copy of `func`,
+        // which already passed this same `getMatmulInfo` call above. Bail
+        // out on the whole dispatch rather than risk assembling a concat
+        // from an incomplete set of chunks (silently wrong result). Leaves
+        // this iteration's already-created (unused) `wSlice` and `cloneExe`
+        // as dead IR; not worth the extra bookkeeping to clean up a path
+        // that should be unreachable.
+        allChunksOk = false;
+        break;
+      }
+      // Order matters: sever the elementwise consumer's use of the
+      // (possibly shared) old empty/fill *before* growMatmulInit erases
+      // them -- see growElementwiseConsumerInit's comment.
+      if (ci->elementwiseConsumer)
+        growElementwiseConsumerInit(rewriter, *ci, M, C);
       growBinding(rewriter, ci->rhsArg, ci->rhsLoad, rhsChunk);
       growMatmulInit(rewriter, *ci, M, C);
       growOutputStore(rewriter, *ci, M, C);
@@ -1022,8 +1064,8 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
           cloneFunc.getArguments(),
           [](BlockArgument a) { return a.getType(); }));
       cloneFunc.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
-      SmallVector<Value> operands(2);
-      operands[lhsArgNo] = lhs;
+      SmallVector<Value> operands(dispatch.getArguments().begin(),
+                                  dispatch.getArguments().end());
       operands[rhsArgNo] = wSlice;
       rewriter.setInsertionPoint(dispatch);
       auto sub = IREE::Flow::DispatchOp::create(
@@ -1033,6 +1075,7 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
       if (npuAffinity) sub->setAttr("stream.affinity", npuAffinity);
       chunkOutputs.push_back(sub.getResult(0));
     }
+    if (!allChunksOk) continue;
     rewriter.setInsertionPointAfter(dispatch);
     Value concatenated = createConcatDispatch(rewriter, module, chunkOutputs,
                                               {M, N}, C, hostAffinity, counter);

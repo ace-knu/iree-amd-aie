@@ -87,6 +87,23 @@ std::optional<int64_t> getConfigNumRows(
   return attr->getInt();
 }
 
+std::pair<uint32_t, uint32_t> getRowColMultipliers(int64_t M, int64_t N,
+                                                   uint32_t numRows,
+                                                   uint32_t numCols) {
+  // Give the larger physical multiplier to whichever of M/N is larger, so an
+  // M>>N (or N>>M) shape doesn't get stuck with the smaller of the two grid
+  // axes. Only swap on a *strict* mismatch in both comparisons: `M == N`
+  // (tied shape) or `numRows == numCols` (tied grid) must never trigger a
+  // swap, since there is then no data-driven reason to move away from the
+  // historical M->numRows/N->numCols assignment -- using `(M > N) !=
+  // (numRows > numCols)` here instead would swap on every tie whenever
+  // `numRows != numCols` (e.g. M == N on an asymmetric grid), silently
+  // flipping tile sizes for callers that never asked for a swap.
+  bool wantSwap = (M > N && numCols > numRows) || (N > M && numRows > numCols);
+  if (!wantSwap) return {numRows, numCols};
+  return {numCols, numRows};
+}
+
 int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
   // The base L2 reduction (K) tile the pack-peel pipeline packs by. Empirically
   // best at 32 for bf16 (device-independent tuning constant); the 4-level
@@ -319,8 +336,18 @@ bool isMatmulInDefChain(Value operand) {
 
   if (isa<arith::ConstantOp>(defOp)) return false;
 
+  // By the time this is called (post first-level packing), a source matmul
+  // has already become a packed `linalg.generic` whose indexing maps may be
+  // permuted for a transposed operand, so `isMatmul`'s Step 0 op-type
+  // short-circuit no longer applies and its Step 2 map check alone would
+  // reject a transpose_a/transpose_b matmul. Ask all three so a fused
+  // consumer of a transpose_b matmul (e.g. VGG16's FC layers) is still
+  // recognized and skipped here, instead of being (wrongly) promoted to a
+  // second shared-memory buffer.
   if (auto defLinalgOp = dyn_cast_if_present<linalg::LinalgOp>(defOp)) {
-    if (isMatmul(defLinalgOp)) return true;
+    if (isMatmul(defLinalgOp) || isMatmulTransposeA(defLinalgOp) ||
+        isMatmulTransposeB(defLinalgOp))
+      return true;
   }
 
   // If something is being produced from a for/forall loop, we just assume it is
@@ -353,7 +380,13 @@ bool isElementwiseWithMatmulProducer(linalg::LinalgOp linalgOp) {
 /// Utility to identify if `linalgOp` is a matmul-like operation with an
 /// elementwise op as its consumer.
 bool isMatmulWithElementwiseConsumer(linalg::LinalgOp linalgOp) {
-  if (!isMatmul(linalgOp)) return false;
+  // Currently only called (KernelDispatch.cpp) on the unpacked source op,
+  // where `isMatmul`'s Step 0 short-circuit still applies for a
+  // transpose_a/transpose_b matmul, but ask all three for the same reason as
+  // `isMatmulInDefChain` above, in case this is ever called post-packing.
+  if (!isMatmul(linalgOp) && !isMatmulTransposeA(linalgOp) &&
+      !isMatmulTransposeB(linalgOp))
+    return false;
   // Check if the user is an elementwise op but not fill or copy op.
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {

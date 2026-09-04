@@ -480,6 +480,65 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 
 // -----
 
+// Same as @main_relu_mk (M 196->224, K 27->32), but the fused consumer
+// narrows the type (f32 -> bf16, as a real ReLU-then-demote epilogue would
+// for the next bf16 matmul's input). Regression test for the dispatch's own
+// result type (used for the un-cropped [mPad,nPad] result and by the crop
+// dispatch): it must come from the output BINDING (bf16), not from the
+// matmul's own accumulator type (f32) -- getting this wrong is a loud
+// verifier failure (a store of a bf16 value into an f32-typed result), not
+// silently wrong numerics.
+// CHECK-LABEL: func.func @matmul_trunc_mk
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<224x64xbf16>>
+// CHECK:         %[[MM:.+]] = linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<224x32xbf16>, tensor<32x64xbf16>) outs(%{{.+}} : tensor<224x64xf32>)
+// CHECK:         %[[TRUNCINIT:.+]] = tensor.empty() : tensor<224x64xbf16>
+// CHECK:         %[[TRUNC:.+]] = linalg.generic {{.*}} ins(%[[MM]] : tensor<224x64xf32>) outs(%[[TRUNCINIT]] : tensor<224x64xbf16>)
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %[[TRUNC]], %arg2, offsets = [0, 0], sizes = [224, 64]
+
+// CHECK-LABEL: util.func public @main_trunc_mk
+// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0)
+// CHECK-SAME:      : (tensor<196x27xbf16>) -> tensor<224x32xbf16>
+// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_1::@pad_dispatch_1(%arg1)
+// CHECK-SAME:      : (tensor<27x64xbf16>) -> tensor<32x64xbf16>
+// CHECK:         %[[MMR:.+]] = flow.dispatch @dispatch_trunc_mk::@matmul_trunc_mk(%[[LPAD]], %[[RPAD]])
+// CHECK-SAME:      : (tensor<224x32xbf16>, tensor<32x64xbf16>) -> tensor<224x64xbf16>
+// CHECK:         flow.dispatch @crop_executable_{{[0-9]+}}::{{@.+}}(%[[MMR]])
+// CHECK-SAME:      : (tensor<224x64xbf16>) -> tensor<196x64xbf16>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_trunc_mk {
+    flow.executable.export public @matmul_trunc_mk workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_trunc_mk(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<196x27xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<27x64xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196x64xbf16>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [196, 27], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<196x27xbf16>> -> tensor<196x27xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [27, 64], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<27x64xbf16>> -> tensor<27x64xbf16>
+        %2 = tensor.empty() : tensor<196x64xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<196x64xf32>) -> tensor<196x64xf32>
+        %4 = linalg.matmul ins(%0, %1 : tensor<196x27xbf16>, tensor<27x64xbf16>) outs(%3 : tensor<196x64xf32>) -> tensor<196x64xf32>
+        %5 = tensor.empty() : tensor<196x64xbf16>
+        %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%4 : tensor<196x64xf32>) outs(%5 : tensor<196x64xbf16>) {
+        ^bb0(%in: f32, %out: bf16):
+          %7 = arith.truncf %in : f32 to bf16
+          linalg.yield %7 : bf16
+        } -> tensor<196x64xbf16>
+        iree_tensor_ext.dispatch.tensor.store %6, %arg2, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : tensor<196x64xbf16> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196x64xbf16>>
+        return
+      }
+    }
+  }
+  util.func public @main_trunc_mk(%arg0: tensor<196x27xbf16>, %arg1: tensor<27x64xbf16>) -> tensor<196x64xbf16> {
+    %0 = flow.dispatch @dispatch_trunc_mk::@matmul_trunc_mk(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<196x27xbf16>, tensor<27x64xbf16>) -> tensor<196x64xbf16>
+    util.return %0 : tensor<196x64xbf16>
+  }
+}
+
+// -----
+
 // Boundary case that must still be safely skipped: a CHAIN of two
 // shape-preserving elementwise consumers (ReLU then negate) sits between the
 // matmul and the store, with M=196 and K=27 both misaligned. Only a single
