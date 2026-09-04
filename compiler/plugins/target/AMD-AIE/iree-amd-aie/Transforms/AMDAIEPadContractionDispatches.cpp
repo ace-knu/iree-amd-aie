@@ -711,13 +711,19 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     int64_t m = lhsType.getShape()[lhsMPos];
     int64_t k = lhsType.getShape()[lhsKPos];
     int64_t n = rhsType.getShape()[rhsNPos];
-    Type outElemType =
-        cast<RankedTensorType>(info->matmul.getResult(0).getType())
-            .getElementType();
+    // The matmul's own (accumulator) element type -- used only to pick
+    // instruction-size-driven padding multiples below. Kept distinct from
+    // `outElemType` (the dispatch's actual output-binding element type,
+    // resolved below the `padOut` check): a fused elementwise consumer may
+    // legitimately narrow the type between the two (e.g. an f32 accumulator
+    // truncated to bf16 for the next layer), and using the accumulator's
+    // type for the dispatch's own result type in that case would be wrong.
+    Type accElemType = cast<RankedTensorType>(info->matmul.getResult(0).getType())
+                            .getElementType();
 
     std::optional<PaddingMultiples> mult = getPaddingMultiples(
         target, m, lhsType.getElementType(), rhsType.getElementType(),
-        outElemType, /*transposeB=*/rhsNPos < rhsKPos);
+        accElemType, /*transposeB=*/rhsNPos < rhsKPos);
     if (!mult) continue;
 
     int64_t mPad = roundUpToMultiple(m, mult->m);
@@ -797,6 +803,15 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
             hostAffinity, counter);
         dispatch.getArgumentsMutable().slice(accArgNo, 1).assign(accPadded);
       }
+      // The dispatch's own result type: the output binding's element type
+      // (`info->outArg`, non-null here since `padOut` was checked above),
+      // which is `accElemType` in the common direct-store case but may
+      // differ when a fused consumer narrows the type (see the comment
+      // where `accElemType` is computed above).
+      Type outElemType = cast<IREE::TensorExt::DispatchTensorType>(
+                              info->outArg.getType())
+                              .asRankedTensorType()
+                              .getElementType();
       Value result = dispatch.getResult(0);
       result.setType(RankedTensorType::get({mPad, nPad}, outElemType));
       rewriter.setInsertionPointAfter(dispatch);

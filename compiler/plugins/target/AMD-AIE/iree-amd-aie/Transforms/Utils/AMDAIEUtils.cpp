@@ -508,8 +508,18 @@ bool isMatmulInDefChain(Value operand) {
 
   if (isa<arith::ConstantOp>(defOp)) return false;
 
+  // By the time this is called (post first-level packing), a source matmul
+  // has already become a packed `linalg.generic` whose indexing maps may be
+  // permuted for a transposed operand, so `isMatmul`'s Step 0 op-type
+  // short-circuit no longer applies and its Step 2 map check alone would
+  // reject a transpose_a/transpose_b matmul. Ask all three so a fused
+  // consumer of a transpose_b matmul (e.g. VGG16's FC layers) is still
+  // recognized and skipped here, instead of being (wrongly) promoted to a
+  // second shared-memory buffer.
   if (auto defLinalgOp = dyn_cast_if_present<linalg::LinalgOp>(defOp)) {
-    if (isMatmul(defLinalgOp)) return true;
+    if (isMatmul(defLinalgOp) || isMatmulTransposeA(defLinalgOp) ||
+        isMatmulTransposeB(defLinalgOp))
+      return true;
   }
 
   // If something is being produced from a for/forall loop, we just assume it is
@@ -542,7 +552,13 @@ bool isElementwiseWithMatmulProducer(linalg::LinalgOp linalgOp) {
 /// Utility to identify if `linalgOp` is a matmul-like operation with an
 /// elementwise op as its consumer.
 bool isMatmulWithElementwiseConsumer(linalg::LinalgOp linalgOp) {
-  if (!isMatmul(linalgOp)) return false;
+  // Currently only called (KernelDispatch.cpp) on the unpacked source op,
+  // where `isMatmul`'s Step 0 short-circuit still applies for a
+  // transpose_a/transpose_b matmul, but ask all three for the same reason as
+  // `isMatmulInDefChain` above, in case this is ever called post-packing.
+  if (!isMatmul(linalgOp) && !isMatmulTransposeA(linalgOp) &&
+      !isMatmulTransposeB(linalgOp))
+    return false;
   // Check if the user is an elementwise op but not fill or copy op.
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
