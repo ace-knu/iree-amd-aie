@@ -169,6 +169,25 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   //   * with ukernels enabled KernelDispatch picks a factor of K instead, so
   //     padding K at all is unnecessary work. `ukernels` *is* on the target
   //     attr, so that half could be handled without any new plumbing.
+  //
+  // Do NOT widen the K multiple here to `reductionTile * numRows` (128 on
+  // npu4). That was tried, on the theory that a K-tile count not divisible by
+  // numRows hangs -- a theory an isolated, single-dispatch matmul_transpose_b
+  // reproduction did seem to support (K=25120 and K=25152 hung, while
+  // K=25088, K=25216 and K=25344 ran in ~2s). Applied *here* it is
+  // nonetheless wrong: this multiple governs every NPU contraction, conv
+  // dispatches included, and widening it made VGG16 hang on real hardware
+  // (`ert state 8`) in configurations that pass with the multiple left at
+  // the plain reduction tile -- confirmed by flipping just this one value
+  // back and forth on an otherwise identical build and model (58s success vs
+  // 2min timeout). Whatever the isolated repro was measuring, it does not
+  // generalize to the padded conv shapes this pass also feeds.
+  //
+  // A contraction that genuinely needs its K aligned beyond the reduction
+  // tile should arrange that at its source instead, where it can also keep a
+  // constant operand constant (padding a hoisted constant weight through a
+  // dispatch is itself what broke FC1: it turns the NPU dispatch's weight
+  // operand into a runtime-produced buffer).
   bool useUKernel =
       hasUkernel(target.getConfiguration(), "matmul") &&
       hasUKernelTemplate(*device, "matmul",

@@ -15,6 +15,8 @@
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/RegionUtils.h"
 
 #define DEBUG_TYPE "iree-amdaie-linalg-function-outlining"
 
@@ -63,9 +65,55 @@ static FailureOr<func::FuncOp> outline(IRRewriter &rewriter, ModuleOp moduleOp,
   for (Value origOperand : computeOp->getOperands())
     operandMap.map(origOperand, funcArgs[bbArgIndex++]);
 
+  // `computeOp`'s region(s) (e.g. a `linalg.generic`'s payload block) may
+  // reference values from its original enclosing scope that are not among
+  // its ins/outs operands above -- for example, a scalar `arith.constant`
+  // an elementwise consumer's payload (like a ReLU's `cmpf`/`select`
+  // against 0.0) captures directly. This must be detected on `computeOp`
+  // itself, *before* cloning: `computeOp` is still properly nested inside
+  // its original function here, so the enclosing scope is a genuine
+  // ancestor and `getUsedValuesDefinedAbove` can find the capture. Doing
+  // this check after cloning (on `clonedComputeOp`, once it has moved into
+  // the new, disconnected function body) does not work -- the captured
+  // value's defining op is then in an unrelated part of the IR tree with no
+  // ancestor relationship to the clone at all, so the same query silently
+  // finds nothing, even though the clone still structurally holds a
+  // (now-dangling) reference to it.
+  llvm::SetVector<Value> capturedValues;
+  mlir::getUsedValuesDefinedAbove(computeOp->getRegions(), capturedValues);
+
   // Clone the compute op while mapping the operand to the function block
   // arguments.
   Operation *clonedComputeOp = rewriter.clone(*computeOp, operandMap);
+
+  // `computeOp`'s block-argument signature is fixed by its own operand list
+  // (unlike a function-like isolated region), so a capture can't be
+  // resolved by appending an extra block argument the way
+  // `makeRegionIsolatedFromAbove` would for a func body; instead,
+  // re-materialize the (pure, zero-operand) defining op directly inside the
+  // clone's region(s), replacing uses of the original (now-dangling)
+  // captured value there. Without this, the outlined function body is left
+  // referencing a value outside its own isolation boundary and fails to
+  // verify -- which is why, before this fix, outlining anything with a
+  // captured scalar (any fused elementwise consumer, e.g. bias/ReLU) had to
+  // be skipped entirely (see `mustOutlineBalanced` below), leaving its code
+  // duplicated inline at every call site of the outlined compute it's fused
+  // with -- multiplying out to enough core-control-program size to overflow
+  // AIE program memory for shapes like VGG16 conv4 (M=12544, N=128) once
+  // elementwise fusion is enabled.
+  for (Value captured : capturedValues) {
+    Operation *definingOp = captured.getDefiningOp();
+    if (!definingOp || definingOp->getNumOperands() != 0 ||
+        definingOp->getNumResults() != 1 || !mlir::isPure(definingOp)) {
+      return failure();
+    }
+    for (Region &region : clonedComputeOp->getRegions()) {
+      if (region.empty()) continue;
+      rewriter.setInsertionPointToStart(&region.front());
+      Operation *clonedDef = rewriter.clone(*definingOp);
+      mlir::replaceAllUsesInRegionWith(captured, clonedDef->getResult(0), region);
+    }
+  }
 
   // Create terminator op returning the cloned compute op's results.
   rewriter.setInsertionPointToEnd(funcBody);
@@ -78,7 +126,21 @@ static FailureOr<func::FuncOp> outline(IRRewriter &rewriter, ModuleOp moduleOp,
 /// strategy is enabled.
 static bool mustOutlineBalanced(linalg::LinalgOp linalgOp) {
   if (isa<linalg::CopyOp, linalg::FillOp>(linalgOp)) return false;
-  if (isElementwise(linalgOp)) return false;
+  // Elementwise ops (e.g. a fused bias-add or ReLU consumer) used to be
+  // excluded here unconditionally. That was papering over a real bug in
+  // `outline()` above: such ops often capture a value from their enclosing
+  // scope directly in their payload region (e.g. a ReLU's `cmpf`/`select`
+  // against a 0.0 `arith.constant`), which `outline()` used to leave
+  // dangling once the op moved into a new, isolated function body, failing
+  // verification. Now that `outline()` re-materializes such captures, this
+  // exclusion is no longer needed for correctness. Leaving it in place had
+  // a real cost: an elementwise consumer fused with a repeatedly-tiled
+  // contraction (matmul/conv) op is *not* outlined and *not* deduplicated
+  // across call sites the way the contraction itself is, so its code gets
+  // inlined at every one of the (possibly hundreds of) tiled call sites --
+  // multiplying out to enough core-control-program size to overflow AIE
+  // program memory for shapes like VGG16 conv4 (M=12544, N=128) once
+  // elementwise fusion into the matmul dispatch is enabled.
   // TODO(newling) not all remaining ops should be outlined, not even all
   // remaining matmuls: below some threshold on size (m*n*k) it's not worth
   // outlining (function call overhead). We should extend the set of ops that

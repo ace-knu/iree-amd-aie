@@ -758,6 +758,17 @@ static LogicalResult setRootConfigForPackPeelPipeline(
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
+  // NOTE: always M->numRows / N->numCols here, even for an M>>N shape that
+  // would get a larger M0 from the larger grid axis. Swapping the grid
+  // multipliers was tried for this pipeline (unconditionally on M>N, and by
+  // picking whichever orientation minimizes `(M/M0)*(N/N0)`) and both broke
+  // VGG16 convs that already worked, e.g. conv1 (M=50176 >> N=64), with
+  // `'amdaie.connection' op no producer/consumer DMA channel available` from
+  // `AMDAIEAssignChannels.cpp`: the shim/MemTile connection generation assumes
+  // the historical orientation and runs out of channels for the other one.
+  // A swap also needs `getGPUMappingAttributes` (`AMDAIETileAndFuse.cpp`) to
+  // place the thread loops by trip count rather than loop order. See
+  // docs/2026-09-02_grid-orientation-2level-blocked-and-conv4-already-fixed.md.
   auto maybePackPeelTiling =
       ParameterSetting::create(linalgOp, isObjectFifo, deviceModel, numRows,
                                numCols, stackSize, enableAMDAIEUkernels);
