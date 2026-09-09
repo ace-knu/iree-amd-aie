@@ -540,11 +540,125 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// Configuration for the GEMV Pipeline
+//===----------------------------------------------------------------------===//
+
+/// Outputs per core along N. A vector-width multiple so a later matvec ukernel
+/// can block along N; the scalar path has no constraint.
+constexpr int64_t kGemvNTilePerCore = 32;
+/// K elements streamed through L1 per step. 8x pack-peel's 32: 1/8 the DMA
+/// programmings and, for bf16, 512 B contiguous DRAM runs instead of 64 B.
+constexpr int64_t kGemvKTile = 256;
+
+/// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
+/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim,
+/// no fused elementwise consumer) whose M is below `getGemvMThreshold`, i.e. an
+/// M that pack-peel would have to zero-pad up to `numRows * instrM`.
+static bool isGemvLike(linalg::LinalgOp linalgOp, AMDAIEDeviceModel deviceModel,
+                       uint32_t numRows) {
+  if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
+    return false;
+  for (Operation *userOp : linalgOp->getUsers()) {
+    if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
+      if (isElementwise(linalgUser) &&
+          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser))
+        return false;
+    }
+  }
+  FailureOr<InputDimsAndSizes> maybeDims = getInputDimsAndSizes(linalgOp);
+  if (failed(maybeDims) || maybeDims->mSizes.size() != 1 ||
+      maybeDims->nSizes.size() != 1 || maybeDims->kSizes.size() != 1)
+    return false;
+  int64_t M = maybeDims->mSizes[0];
+  if (ShapedType::isDynamic(M) || ShapedType::isDynamic(maybeDims->nSizes[0]) ||
+      ShapedType::isDynamic(maybeDims->kSizes[0]))
+    return false;
+  // Without a vector instruction for these element types `getPackedSize` packs
+  // M by at most 4; mirror that so e.g. f32 M=1 takes this path too.
+  FailureOr<std::array<uint32_t, 3>> instr =
+      getMatmulInstructionSize(linalgOp, deviceModel);
+  int64_t instrM = succeeded(instr) ? (*instr)[0] : 4;
+  return M < getGemvMThreshold(numRows, instrM);
+}
+
+/// GEMV pipeline root config. M is left untiled (below one row-group of vector
+/// instruction rows, tiling it over `numRows` would only distribute zero
+/// padding), N is spread over all `numRows * numCols` cores by one 1-D forall
+/// with `n1Tile` outputs per core, and K is streamed through L1 in `kTile`
+/// steps. There is no packing_config: data moves as plain copies. The scalar
+/// core code gains nothing from a packed layout, and keeping the weight in its
+/// DRAM layout makes each L3->L2 transfer a single 2-D DMA whose contiguous run
+/// is `kTile` elements.
+static LogicalResult setRootConfigForGemvPipeline(
+    mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
+    AMDAIEDeviceModel deviceModel, uint32_t numRows, uint32_t numCols) {
+  FailureOr<InputDimsAndSizes> maybeDims = getInputDimsAndSizes(linalgOp);
+  if (failed(maybeDims)) return failure();
+  unsigned nDim = maybeDims->nDims[0];
+  unsigned kDim = maybeDims->kDims[0];
+  int64_t M = maybeDims->mSizes[0];
+  int64_t N = maybeDims->nSizes[0];
+  int64_t K = maybeDims->kSizes[0];
+
+  auto bytesOf = [](Value v) {
+    return cast<ShapedType>(v.getType()).getElementTypeBitWidth() / 8;
+  };
+  int64_t nBytesLhs = bytesOf(linalgOp.getDpsInputOperand(0)->get());
+  int64_t nBytesRhs = bytesOf(linalgOp.getDpsInputOperand(1)->get());
+  int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
+
+  // Per-core N tile, then the L0 N block: as many cores as N has factors for,
+  // ideally all of them (numRows * numCols * n1Tile).
+  int64_t numCores = static_cast<int64_t>(numRows) * numCols;
+  int64_t n1Tile = findLargestFactor(N, kGemvNTilePerCore);
+  int64_t n0Tile = findLargestFactor(N, numCores * n1Tile, n1Tile);
+
+  // K tile: shrink from the default until the double-buffered A, B and C tiles
+  // fit in core memory (M is small but not necessarily 1).
+  int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
+  auto l1Bytes = [&](int64_t k) {
+    return 2 * (M * k * nBytesLhs + n1Tile * k * nBytesRhs +
+                M * n1Tile * nBytesOut);
+  };
+  int64_t kTile = findLargestFactor(K, kGemvKTile);
+  while (kTile > 1 && l1Bytes(kTile) > l1Limit)
+    kTile = findLargestFactor(K, kTile / 2);
+  if (l1Bytes(kTile) > l1Limit) {
+    return linalgOp.emitOpError("GEMV tiles (M=")
+           << M << ", n1=" << n1Tile << ", k=" << kTile
+           << ") do not fit in core memory (" << l1Limit << " bytes).";
+  }
+
+  unsigned numLoops = linalgOp.getNumLoops();
+  SmallVector<int64_t> tileSizeLevel0(numLoops, 0);
+  tileSizeLevel0[nDim] = n0Tile;
+  SmallVector<int64_t> tileSizeLevel1(numLoops, 0);
+  tileSizeLevel1[kDim] = kTile;
+  SmallVector<int64_t> tileSizeLevel2(numLoops, 0);
+  tileSizeLevel2[nDim] = n1Tile;
+
+  MLIRContext *context = entryPointFn.getContext();
+  auto pipelineConfig = DictionaryAttr::get(
+      context, {NamedAttribute(StringAttr::get(context, kTilePipelineOverrideName),
+                               StringAttr::get(context, kGemvPipelineName))});
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPointFn, linalgOp,
+      TileSizesListType{tileSizeLevel0, tileSizeLevel1, tileSizeLevel2},
+      IREE::Codegen::DispatchLoweringPassPipeline::Custom,
+      /*workgroupSize=*/{}, /*subgroupSize=*/{}, pipelineConfig);
+}
+
 static LogicalResult setRootConfigForPackPeelPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     LowerToAIEPassPipeline useLowerToAIEPipeline, AMDAIEDevice targetDevice,
     uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels) {
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
+  // Small-M shapes leave pack-peel here; see `isGemvLike`.
+  if (isGemvLike(linalgOp, deviceModel, numRows)) {
+    return setRootConfigForGemvPipeline(entryPointFn, linalgOp, deviceModel,
+                                        numRows, numCols);
+  }
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
   auto maybePackPeelTiling =

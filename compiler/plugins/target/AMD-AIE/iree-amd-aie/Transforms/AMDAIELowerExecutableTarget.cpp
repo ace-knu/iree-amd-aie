@@ -82,7 +82,22 @@ void AMDAIELowerExecutableTargetPass::runOnOperation() {
     case IREE::Codegen::DispatchLoweringPassPipeline::None:
       return;
     case IREE::Codegen::DispatchLoweringPassPipeline::Custom: {
-      if (useTilePipeline == TilePassPipeline::PackPeelPipeline) {
+      // A per-dispatch override set by the lowering strategy wins over the
+      // global tile pipeline option (a module mixes conv matmuls and M=1 FC
+      // matmuls, which need different pipelines).
+      StringAttr pipelineOverride;
+      if (DictionaryAttr config = translationInfo.getConfiguration()) {
+        pipelineOverride =
+            config.getAs<StringAttr>(kTilePipelineOverrideName);
+      }
+      if (pipelineOverride) {
+        if (pipelineOverride.getValue() != kGemvPipelineName) {
+          funcOp.emitOpError("unknown tile pipeline override '")
+              << pipelineOverride.getValue() << "'";
+          return signalPassFailure();
+        }
+        addGemvPassPipeline(executableLoweringPipeline);
+      } else if (useTilePipeline == TilePassPipeline::PackPeelPipeline) {
         addPackPeelBasedPassPipeline(executableLoweringPipeline,
                                      TilePassPipeline::PackPeelPipeline);
       } else if (useTilePipeline ==

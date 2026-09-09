@@ -66,6 +66,11 @@ void addGeneralCopyPassPipeline(OpPassManager &passManager,
                                 TilePassPipeline useTilePipeline,
                                 Operation *rootOp);
 
+/// Populates passes needed to lower a small-M (GEMV-like) matmul: pack-peel's
+/// loop structure with copies in place of packs. Selected per dispatch by the
+/// lowering strategy (see `kTilePipelineOverrideName`).
+void addGemvPassPipeline(OpPassManager &passManager);
+
 /// Populates passes needed to link HAL executables across AIE targets.
 void buildAMDAIELinkingPassPipeline(OpPassManager &passManager);
 
@@ -262,7 +267,8 @@ std::unique_ptr<Pass> createAMDAIEFuseProducerIntoLoopPass(
 
 /// Create a pass to insert copy operations on inputs and results of the
 /// targeted operation.
-std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass();
+std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass(
+    AMDAIEInsertCopyOpsOptions options = {});
 
 /// Create pass to insert `amdaie.core` operations inside the innermost
 /// `scf.forall` operations selected for parallel execution.

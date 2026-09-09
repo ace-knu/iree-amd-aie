@@ -1,4 +1,5 @@
 // RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-amdaie-insert-copy-ops))" %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-amdaie-insert-copy-ops{use-init-as-result-dest=true}))" %s | FileCheck %s --check-prefix=INIT-DEST
 
 // CHECK: func.func @softmax_insert_copy_ops
 // CHECK:   %[[FILL:.*]] = linalg.fill {{.*}}) -> tensor<1x32xbf16>
@@ -67,4 +68,35 @@ func.func @generic_insert_copy_ops(%arg0: tensor<128x128xbf16>) -> tensor<128xbf
     linalg.yield %6 : bf16
   } -> tensor<128xbf16>
   return %5 : tensor<128xbf16>
+}
+
+// -----
+
+// A named contraction op is a target too. By default the result is copied to a
+// fresh allocation; with `use-init-as-result-dest` it is copied back into the
+// tensor the init came from (here the copy standing in for a lower copy level),
+// as an unpack would after a pack.
+// CHECK: func.func @matmul_second_copy_level
+// CHECK:   %[[INIT:.*]] = linalg.copy ins(%arg2 : tensor<1x32xf32>)
+// CHECK:   %[[COPYA:.*]] = linalg.copy ins(%arg0 : tensor<1x64xbf16>)
+// CHECK:   %[[COPYB:.*]] = linalg.copy ins(%arg1 : tensor<32x64xbf16>)
+// CHECK:   %[[COPYINIT:.*]] = linalg.copy ins(%[[INIT]] : tensor<1x32xf32>)
+// CHECK:   %[[MATMUL:.*]] = linalg.matmul {{.*}} ins(%[[COPYA]], %[[COPYB]] : {{.*}}) outs(%[[COPYINIT]] : tensor<1x32xf32>)
+// CHECK:   %[[ALLOC:.*]] = bufferization.alloc_tensor() : tensor<1x32xf32>
+// CHECK:   %[[COPYOUT:.*]] = linalg.copy ins(%[[MATMUL]] : tensor<1x32xf32>) outs(%[[ALLOC]] : tensor<1x32xf32>)
+// CHECK:   return %[[COPYOUT]]
+// INIT-DEST: func.func @matmul_second_copy_level
+// INIT-DEST:   %[[INIT:.*]] = linalg.copy ins(%arg2 : tensor<1x32xf32>)
+// INIT-DEST:   %[[MATMUL:.*]] = linalg.matmul
+// INIT-DEST-NOT: bufferization.alloc_tensor
+// INIT-DEST:   %[[COPYOUT:.*]] = linalg.copy ins(%[[MATMUL]] : tensor<1x32xf32>) outs(%[[INIT]] : tensor<1x32xf32>)
+// INIT-DEST:   return %[[COPYOUT]]
+func.func @matmul_second_copy_level(%arg0: tensor<1x64xbf16>, %arg1: tensor<32x64xbf16>, %arg2: tensor<1x32xf32>) -> tensor<1x32xf32> {
+  %0 = bufferization.alloc_tensor() : tensor<1x32xf32>
+  %1 = linalg.copy ins(%arg2 : tensor<1x32xf32>) outs(%0 : tensor<1x32xf32>) -> tensor<1x32xf32>
+  %2 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                                      affine_map<(d0, d1, d2) -> (d1, d2)>,
+                                      affine_map<(d0, d1, d2) -> (d0, d1)>]
+       ins(%arg0, %arg1 : tensor<1x64xbf16>, tensor<32x64xbf16>) outs(%1 : tensor<1x32xf32>) -> tensor<1x32xf32>
+  return %2 : tensor<1x32xf32>
 }

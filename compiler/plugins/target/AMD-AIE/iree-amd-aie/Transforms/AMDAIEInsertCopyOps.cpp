@@ -44,7 +44,11 @@ FailureOr<Value> promoteValue(IRRewriter &rewriter, Location loc, Value v,
   return copy.getResult(0);
 }
 
-LogicalResult promoteResults(IRRewriter &rewriter, Operation *op) {
+/// `initDest`, when set, is the tensor the op's init was read from before its
+/// inputs were promoted; the result is copied back into it (the copy level
+/// below already writes that tensor out to the forall's output).
+LogicalResult promoteResults(IRRewriter &rewriter, Operation *op,
+                             Value initDest = Value()) {
   OpBuilder::InsertionGuard g(rewriter);
 
   // Only a single output is supported.
@@ -58,8 +62,9 @@ LogicalResult promoteResults(IRRewriter &rewriter, Operation *op) {
 
   // Handle case where the target op is inside scf.forall and we want to use
   // block arguments as copy destinations.
-  Value outputBuffer;
-  if (auto forallOp = op->getParentOfType<scf::ForallOp>()) {
+  Value outputBuffer = initDest;
+  if (auto forallOp = op->getParentOfType<scf::ForallOp>();
+      forallOp && !outputBuffer) {
     if (forallOp.getNumResults() != 1)
       return forallOp->emitError("expected a single output");
 
@@ -137,6 +142,8 @@ class AMDAIEInsertCopyOpsPass
 
   AMDAIEInsertCopyOpsPass() = default;
   AMDAIEInsertCopyOpsPass(const AMDAIEInsertCopyOpsPass &pass){};
+  AMDAIEInsertCopyOpsPass(const AMDAIEInsertCopyOpsOptions &options)
+      : AMDAIEInsertCopyOpsBase(options) {}
   void runOnOperation() override;
 };
 
@@ -145,20 +152,36 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
   IRRewriter rewriter(context);
   mlir::FunctionOpInterface funcOp = getOperation();
   SmallVector<Operation *> targetOps;
+  // Named contraction ops are included for the GEMV pipeline, which moves the
+  // matmul operands with copies instead of packs (a pack would have turned the
+  // named op into a generic before this point).
   funcOp->walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (isa<linalg::SoftmaxOp>(op) || isa<linalg::GenericOp>(op))
+    if (isa<linalg::SoftmaxOp, linalg::GenericOp,
+            linalg::ContractionOpInterface>(op))
       targetOps.push_back(op);
   });
   for (Operation *targetOp : targetOps) {
+    // Captured before the init is replaced by its promoted copy.
+    Value initDest;
+    if (useInitAsResultDest) {
+      auto dstStyleOp = dyn_cast<DestinationStyleOpInterface>(targetOp);
+      if (!dstStyleOp || dstStyleOp.getNumDpsInits() != 1) {
+        targetOp->emitError("expected a destination style op with one init");
+        return signalPassFailure();
+      }
+      initDest = dstStyleOp.getDpsInits()[0];
+    }
     if (failed(promoteInputs(rewriter, targetOp))) return signalPassFailure();
-    if (failed(promoteResults(rewriter, targetOp))) return signalPassFailure();
+    if (failed(promoteResults(rewriter, targetOp, initDest)))
+      return signalPassFailure();
   }
 }
 
 }  // namespace
 
-std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass() {
-  return std::make_unique<AMDAIEInsertCopyOpsPass>();
+std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass(
+    AMDAIEInsertCopyOpsOptions options) {
+  return std::make_unique<AMDAIEInsertCopyOpsPass>(options);
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

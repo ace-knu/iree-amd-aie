@@ -463,6 +463,12 @@ def AMDAIEInsertCopyOps :
       InterfacePass<"iree-amdaie-insert-copy-ops", "mlir::FunctionOpInterface"> {
   let summary = "Insert copy ops on the inputs and results of the targeted operation.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEInsertCopyOpsPass()";
+  let options = [
+    Option<"useInitAsResultDest", "use-init-as-result-dest", "bool", /*default=*/"false",
+      "Copy the result back into the tensor the init was read from, the way an "
+      "unpack undoes a pack, instead of into the enclosing forall's output slice. "
+      "Used for a second copy level added inside an existing one.">
+  ];
 }
 
 def AMDAIEInsertCores :

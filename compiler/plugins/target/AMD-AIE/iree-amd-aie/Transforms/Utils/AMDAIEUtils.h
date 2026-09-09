@@ -49,6 +49,14 @@ std::optional<int64_t> getConfigNumRows(
 /// 2 = 4-level tiling).
 int64_t getPackPeelReductionTile(int64_t kPackScaleL1);
 
+/// Returns the M extent below which a 2-D matmul takes the GEMV pipeline
+/// instead of pack-peel. Pack-peel tiles M over the `numRows` core rows with at
+/// least one vector-instruction M tile (`instrM`) per row, so any M below
+/// `numRows * instrM` is zero-padded up to it -- for M=1 that makes 31 of 32
+/// output rows, and 3 of 4 core rows, padding. Shared by `KernelDispatch` and
+/// the Flow-phase pad/split passes so they agree on which dispatches are GEMV.
+int64_t getGemvMThreshold(int64_t numRows, int64_t instrM);
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);
 

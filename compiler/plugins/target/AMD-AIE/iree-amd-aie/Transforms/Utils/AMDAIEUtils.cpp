@@ -94,6 +94,10 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
   return kPackScaleL1 * 32;
 }
 
+int64_t getGemvMThreshold(int64_t numRows, int64_t instrM) {
+  return numRows * instrM;
+}
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr) {
   std::optional<int64_t> res = getConstantIntValue(ofr);

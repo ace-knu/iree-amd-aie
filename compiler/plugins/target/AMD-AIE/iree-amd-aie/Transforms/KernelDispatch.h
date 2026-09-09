@@ -69,6 +69,14 @@ enum class PacketFlowStrategy {
 
 enum class AllocScheme { Sequential, BankAware, None };
 
+/// Entry in `translation_info`'s configuration dictionary that overrides the
+/// global `--iree-amdaie-tile-pipeline` for one dispatch, and the value that
+/// selects the GEMV pipeline. Set by the lowering strategy from the root op's
+/// shape (a module mixes conv matmuls and M=1 FC matmuls, so a global option
+/// cannot pick per dispatch); read by `AMDAIELowerExecutableTarget`.
+constexpr llvm::StringLiteral kTilePipelineOverrideName = "amdaie.tile_pipeline";
+constexpr llvm::StringLiteral kGemvPipelineName = "gemv";
+
 LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
                                   TilePassPipeline useTilePipeline,
                                   LowerToAIEPassPipeline useLowerToAIEPipeline,
