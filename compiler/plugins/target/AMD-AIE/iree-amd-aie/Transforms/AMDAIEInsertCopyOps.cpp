@@ -8,6 +8,8 @@
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -75,16 +77,36 @@ LogicalResult promoteResults(IRRewriter &rewriter, Operation *op,
     if (!blockArgType)
       return forallOp->emitError("expected ranked tensor block argument");
 
-    // Create tensor.extract_slice on block arg.
+    // Create tensor.extract_slice on block arg. The slice the result occupies
+    // is whatever the forall's terminator inserts it at: take the offsets from
+    // that `tensor.parallel_insert_slice`, so a forall over any dim (e.g. the
+    // GEMV pipeline tiles N, dim 1) lands on the right slice. Fall back to
+    // "one induction variable per leading dim" when the result is not
+    // inserted directly.
     rewriter.setInsertionPoint(op);
     SmallVector<OpFoldResult> offsets, sizes, strides;
-    for (Value iv : forallOp.getInductionVars()) offsets.push_back(iv);
-    // Pad offset with zeros if iv size is smaller than the rank.
-    for (unsigned i = numIvs; i < resultType.getRank(); ++i)
-      offsets.push_back(rewriter.getIndexAttr(0));
-    for (int64_t d : resultType.getShape())
-      sizes.push_back(rewriter.getIndexAttr(d));
-    strides.assign(resultType.getRank(), rewriter.getIndexAttr(1));
+    tensor::ParallelInsertSliceOp insertOp;
+    for (Operation &termOp : forallOp.getTerminator().getYieldingOps()) {
+      auto candidate = dyn_cast<tensor::ParallelInsertSliceOp>(termOp);
+      if (candidate && candidate.getSource() == result &&
+          candidate.getDest() == blockArg) {
+        insertOp = candidate;
+        break;
+      }
+    }
+    if (insertOp) {
+      offsets = insertOp.getMixedOffsets();
+      sizes = insertOp.getMixedSizes();
+      strides = insertOp.getMixedStrides();
+    } else {
+      for (Value iv : forallOp.getInductionVars()) offsets.push_back(iv);
+      // Pad offset with zeros if iv size is smaller than the rank.
+      for (unsigned i = numIvs; i < resultType.getRank(); ++i)
+        offsets.push_back(rewriter.getIndexAttr(0));
+      for (int64_t d : resultType.getShape())
+        sizes.push_back(rewriter.getIndexAttr(d));
+      strides.assign(resultType.getRank(), rewriter.getIndexAttr(1));
+    }
 
     outputBuffer = rewriter.create<tensor::ExtractSliceOp>(
         op->getLoc(), blockArg, offsets, sizes, strides);
