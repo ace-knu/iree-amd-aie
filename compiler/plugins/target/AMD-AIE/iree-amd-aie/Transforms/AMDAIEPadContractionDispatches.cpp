@@ -610,6 +610,115 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   return dispatchOp.getResult(0);
 }
 
+/// Zero-pads the raw contents of `srcAttr` -- read as a 2-D row-major
+/// `srcType`, which is what a matmul operand is by the time it gets here --
+/// up to `dstType`. Returns {} when the attribute is not in a form this can
+/// safely rewrite, in which case the caller falls back to a padding dispatch.
+static DenseElementsAttr padConstantRowMajor(DenseElementsAttr srcAttr,
+                                             RankedTensorType srcType,
+                                             RankedTensorType dstType) {
+  // A splat's raw data is a single element, so it cannot be copied row-wise;
+  // it is also not a shape real weights take.
+  if (srcAttr.isSplat()) return {};
+  Type elemType = srcType.getElementType();
+  if (!elemType.isIntOrFloat()) return {};
+  unsigned bitWidth = elemType.getIntOrFloatBitWidth();
+  // Sub-byte types are bit-packed, so a row is not a whole number of bytes.
+  if (bitWidth == 0 || bitWidth % 8 != 0) return {};
+  int64_t elemBytes = bitWidth / 8;
+
+  int64_t srcRows = srcType.getDimSize(0), srcCols = srcType.getDimSize(1);
+  int64_t dstRows = dstType.getDimSize(0), dstCols = dstType.getDimSize(1);
+  ArrayRef<char> src = srcAttr.getRawData();
+  // Guard the layout assumption rather than trusting it: if the raw buffer is
+  // not exactly the dense row-major extent, this is some encoding we do not
+  // understand and must not reinterpret.
+  if (src.size() != static_cast<size_t>(srcRows * srcCols * elemBytes))
+    return {};
+
+  // Zero bytes are +0.0 for f32/bf16 and 0 for integers, i.e. exactly what
+  // `createPaddingDispatch`'s `tensor.pad` writes.
+  SmallVector<char> dst(dstRows * dstCols * elemBytes, 0);
+  for (int64_t r = 0; r < srcRows; ++r) {
+    std::memcpy(dst.data() + r * dstCols * elemBytes,
+                src.data() + r * srcCols * elemBytes, srcCols * elemBytes);
+  }
+  return DenseElementsAttr::getFromRawBuffer(dstType, dst);
+}
+
+/// If `v` is a weight -- a constant already hoisted into a global by
+/// const-eval, reached only through reshapes -- materializes its zero-padded
+/// form as a new constant global here, at compile time, and returns a load of
+/// it. Returns {} when that is not possible.
+///
+/// This is what keeps weight padding off the per-inference path. Const-eval
+/// cannot do it for us: it runs inside GlobalOptimization while these paddings
+/// are decided two phases later, in the Flow pipeline, and nothing re-runs it.
+/// Deferring the work to module load instead (a `util.initializer` that runs
+/// the padding dispatch once) does not work either: whether the global is
+/// declared mutable or not, stream lifetime refinement settles on
+/// `!stream.resource<constant>` for a value written once and read thereafter,
+/// and the HAL will not let a host dispatch fill a constant-pool buffer
+/// (`PERMISSION_DENIED ... requires MAPPING_PERSISTENT`). Computing the padded
+/// bytes here sidesteps all of that -- no initializer, no dispatch, and the
+/// unpadded global is left dead for SymbolDCE.
+static Value createPaddedConstantGlobal(IRRewriter &rewriter, ModuleOp module,
+                                        Value v, ArrayRef<int64_t> dstShape,
+                                        int &counter) {
+  auto srcType = cast<RankedTensorType>(v.getType());
+  if (srcType.getRank() != 2 || dstShape.size() != 2) return {};
+
+  // Look through reshapes: a hoisted conv weight arrives as a 4-D global
+  // reshaped to the 2-D matmul operand, and a reshape leaves row-major order
+  // (and the raw buffer) untouched.
+  Value root = v;
+  while (auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>())
+    root = reshapeOp.getSource();
+  auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>();
+  if (!loadOp || !loadOp.getIsImmutable()) return {};
+  auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
+      loadOp, loadOp.getGlobalAttr());
+  if (!globalOp) return {};
+  auto srcAttr = dyn_cast_or_null<DenseElementsAttr>(
+      globalOp.getInitialValueAttr());
+  if (!srcAttr) return {};
+
+  auto dstType = RankedTensorType::get(dstShape, srcType.getElementType());
+  DenseElementsAttr paddedAttr = padConstantRowMajor(srcAttr, srcType, dstType);
+  if (!paddedAttr) return {};
+
+  // Declared at the top of the module, where const-eval puts the weight
+  // globals: `UtilToStream` expands a tensor global into a resource + size
+  // pair and records it in a map its load pattern then looks up, so a global
+  // declared after its uses is converted too late for them.
+  Location loc = v.getLoc();
+  OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
+  auto paddedGlobalOp = IREE::Util::GlobalOp::create(
+      moduleBuilder, loc, "__padded_const_" + std::to_string(counter++),
+      /*isMutable=*/false, dstType, std::optional<TypedAttr>{paddedAttr});
+  SymbolTable::setSymbolVisibility(paddedGlobalOp,
+                                   SymbolTable::Visibility::Private);
+  if (auto affinity = globalOp->getAttr("stream.affinity.default"))
+    paddedGlobalOp->setAttr("stream.affinity.default", affinity);
+
+  return paddedGlobalOp.createLoadOp(loc, rewriter)->getResult(0);
+}
+
+/// Pads `v` up to `dstShape`, preferring to fold the padding into a new
+/// constant when `v` is a weight (see `createPaddedConstantGlobal`) and
+/// falling back to a host dispatch for real runtime values.
+static Value createPaddingDispatchOrConstant(
+    IRRewriter &rewriter, ModuleOp module, Value v, ArrayRef<int64_t> dstShape,
+    IREE::HAL::DeviceAffinityAttr hostAffinity, int &counter) {
+  auto srcType = cast<RankedTensorType>(v.getType());
+  if (dstShape == srcType.getShape()) return v;
+  if (Value folded =
+          createPaddedConstantGlobal(rewriter, module, v, dstShape, counter))
+    return folded;
+  return createPaddingDispatch(rewriter, module, v, dstShape, hostAffinity,
+                               counter);
+}
+
 /// Creates a `flow.executable` + `flow.dispatch` that crops `v` down to
 /// `dstShape` (low corner via `tensor.extract_slice`), placed on `hostAffinity`.
 /// Returns the cropped value, or `v` unchanged if `dstShape` already matches.
@@ -794,14 +903,17 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
     }
 
-    // Pad this caller's host operands to the padded shapes, then rewire.
+    // Pad this caller's host operands to the padded shapes, then rewire. A
+    // weight operand is a constant, so its padding is folded into a new
+    // constant here instead of costing a dispatch on every inference; the
+    // activation LHS is a runtime value and keeps its dispatch.
     rewriter.setInsertionPoint(dispatch);
-    Value lhsPadded =
-        createPaddingDispatch(rewriter, module, dispatch.getArguments()[lhsArgNo],
-                              lhsPad, hostAffinity, counter);
-    Value rhsPadded =
-        createPaddingDispatch(rewriter, module, dispatch.getArguments()[rhsArgNo],
-                              rhsPad, hostAffinity, counter);
+    Value lhsPadded = createPaddingDispatchOrConstant(
+        rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
+        hostAffinity, counter);
+    Value rhsPadded = createPaddingDispatchOrConstant(
+        rewriter, module, dispatch.getArguments()[rhsArgNo], rhsPad,
+        hostAffinity, counter);
     dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
 
