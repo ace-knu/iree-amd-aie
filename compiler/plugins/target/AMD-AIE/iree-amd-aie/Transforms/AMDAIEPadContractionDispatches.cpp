@@ -543,7 +543,7 @@ static int firstFreeHelperIndex(ModuleOp module) {
   return next;
 }
 
-/// Creates a `flow.executable` + `flow.dispatch` that zero-pads `v` up to
+/// Creates a `flow.executable` + `flow.dispatch` that pads `v` up to
 /// `dstShape` (high padding via `tensor.pad`), placed on `hostAffinity`. Returns
 /// the padded value, or `v` unchanged if `dstShape` already matches. A dispatch
 /// (unlike `flow.tensor.update`, which only copies contiguous outer-dim
@@ -551,10 +551,26 @@ static int firstFreeHelperIndex(ModuleOp module) {
 /// dimension. `counter` uniquifies the symbol names.
 /// `padValue`, when set, is the constant to pad with instead of 0 (the pooling
 /// pass passes its dispatch's init fill value, -inf for max).
+///
+/// `onesPad` pads with 1.0 instead of 0.0, for the LHS of a contraction whose
+/// bias has been folded into K (see the "Accumulator-bias K-column fold"
+/// section): the ones the fold contracts against sit at K index `k`, which is
+/// the first padded column. The remaining padded columns are 1.0 too rather
+/// than 0.0, which is exact rather than merely close -- the folded weight's
+/// rows past `k` are +0.0, and 1.0 * 0.0 == 0.0 -- and it keeps this dispatch
+/// a bare `tensor.pad`, the one shape the host backend reliably distributes.
+/// (Padding with zeros and then writing the ones column with a second op does
+/// not: the CPU backend picks one root, leaves the other write untiled, and
+/// rejects it with "write affecting operations on global resources are
+/// restricted to workgroup distributed contexts".) Padded *rows* likewise
+/// become 1.0, which is equally immaterial: the grown output rows they produce
+/// are cropped away. Requires a float element type, which is the bias fold's
+/// own precondition and is checked before it decides to fold.
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
                                    Value v, ArrayRef<int64_t> dstShape,
                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
-                                   int &counter, TypedAttr padValue = nullptr) {
+                                   int &counter, TypedAttr padValue = nullptr,
+                                   bool onesPad = false) {
   Location loc = v.getLoc();
   auto srcType = cast<RankedTensorType>(v.getType());
   if (dstShape == srcType.getShape()) return v;
@@ -564,20 +580,23 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   auto outBinding = IREE::TensorExt::DispatchTensorType::get(
       IREE::TensorExt::TensorAccess::WriteOnly, dstType);
   std::string idx = std::to_string(counter++);
+  std::string prefix = onesPad ? "pad_ones" : "pad";
 
-  // Worker func: load the full input, high-pad it with zeros, store.
+  // Worker func: load the full input, high-pad it, store.
   auto funcOp = func::FuncOp::create(
-      loc, "pad_dispatch_" + idx,
+      loc, prefix + "_dispatch_" + idx,
       rewriter.getFunctionType({inBinding, outBinding}, {}));
   funcOp.setPublic();
   Block *entry = funcOp.addEntryBlock();
   OpBuilder fb = OpBuilder::atBlockBegin(entry);
   Type elemType = srcType.getElementType();
-  TypedAttr fillAttr = padValue ? padValue : fb.getZeroAttr(elemType);
-  Value zero = fb.create<arith::ConstantOp>(loc, fillAttr);
+  TypedAttr fillAttr = onesPad ? cast<TypedAttr>(fb.getFloatAttr(elemType, 1.0))
+                     : padValue ? padValue
+                                : cast<TypedAttr>(fb.getZeroAttr(elemType));
+  Value padScalar = fb.create<arith::ConstantOp>(loc, fillAttr);
   Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
-  Value padded = tensor::createPadHighOp(dstType, loaded, zero,
+  Value padded = tensor::createPadHighOp(dstType, loaded, padScalar,
                                          /*nofold=*/false, loc, fb);
   fb.create<IREE::TensorExt::DispatchTensorStoreOp>(
       loc, padded, entry->getArgument(1), /*targetDynamicDims=*/ValueRange{});
@@ -585,8 +604,8 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
 
   // Executable wrapping the func, with a default workgroup-count region.
   OpBuilder mb(&module.getBody()->back());
-  auto exeOp =
-      IREE::Flow::ExecutableOp::create(mb, loc, "pad_executable_" + idx);
+  auto exeOp = IREE::Flow::ExecutableOp::create(mb, loc,
+                                               prefix + "_executable_" + idx);
   exeOp.setPrivate();
   OpBuilder exeBuilder = OpBuilder::atBlockBegin(&exeOp.getBlock());
   auto innerModule = mlir::ModuleOp::create(exeBuilder, loc);
@@ -719,6 +738,265 @@ static Value createPaddingDispatchOrConstant(
                                counter);
 }
 
+//===----------------------------------------------------------------------===//
+// Accumulator-bias K-column fold
+//
+// A convolution lowered through im2col arrives here as
+//   matmul ins(%im2col : [M,K], %weight : [K,N]) outs(%bias_bcast : [M,N])
+// where `%bias_bcast` is a *third* dispatch operand: a host dispatch that
+// broadcasts the constant bias vector to the full [M,N] accumulator. The NPU
+// backend cannot bind a third L3->L2 operand ("'amdaie.connection' op no
+// producer DMA channel available"), and the broadcast itself is one of the
+// larger host writes in the model.
+//
+// Both go away by moving the bias into the contraction's K dimension:
+//   LHS' = [M, K+1] with column K set to 1.0
+//   RHS' = [K+1, N] with row    K set to the bias
+// so that sum_k LHS'[m,k] * RHS'[k,n] == sum_k LHS[m,k] * RHS[k,n] + bias[n],
+// and the accumulator becomes a plain zero fill again.
+//
+// The reason this is worth doing *here*, in the padding pass, rather than on
+// the convolution before im2col (folding the bias into an extra input
+// *channel*): K = C*kh*kw, so one extra channel
+// buys nine extra K positions of which eight are structurally zero, and it
+// costs a full copy of the activation into a (C+1)-channel buffer plus a fill
+// for the ones plane -- two host dispatches per convolution. Here the ones
+// column is written by the K-padding dispatch that has to run anyway (K+1 is
+// never tile-divisible, so the LHS is padded either way), and the bias row is
+// folded into a compile-time constant, so the fold is free.
+//===----------------------------------------------------------------------===//
+
+/// Returns the `DenseElementsAttr` behind `v` when `v` is a compile-time
+/// constant reached only through reshapes -- either an inlined `arith.constant`
+/// or an immutable `util.global` (which is where const-eval leaves weights and
+/// biases). Returns {} otherwise.
+static DenseElementsAttr matchConstantAttr(Value v) {
+  Value root = v;
+  while (auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>())
+    root = reshapeOp.getSource();
+  if (auto cstOp = root.getDefiningOp<arith::ConstantOp>())
+    return dyn_cast<DenseElementsAttr>(cstOp.getValue());
+  auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>();
+  if (!loadOp || !loadOp.getIsImmutable()) return {};
+  auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
+      loadOp, loadOp.getGlobalAttr());
+  if (!globalOp) return {};
+  return dyn_cast_or_null<DenseElementsAttr>(globalOp.getInitialValueAttr());
+}
+
+/// Resolves `v` to the immutable weight global it loads from (through
+/// reshapes) together with that global's dense initial value, in exactly the
+/// form `padConstantRowMajor` can rewrite. Returns false without touching the
+/// out-params when `v` is not such a weight -- letting a caller decide whether
+/// the constant fold is possible *before* it starts mutating IR.
+static bool matchConstantWeight(Value v, IREE::Util::GlobalOp &globalOp,
+                                DenseElementsAttr &attr) {
+  auto srcType = dyn_cast<RankedTensorType>(v.getType());
+  if (!srcType || srcType.getRank() != 2) return false;
+  Value root = v;
+  while (auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>())
+    root = reshapeOp.getSource();
+  auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>();
+  if (!loadOp || !loadOp.getIsImmutable()) return false;
+  auto candidate = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
+      loadOp, loadOp.getGlobalAttr());
+  if (!candidate) return false;
+  auto candidateAttr =
+      dyn_cast_or_null<DenseElementsAttr>(candidate.getInitialValueAttr());
+  // Same restrictions `padConstantRowMajor` enforces on the raw buffer, so a
+  // caller that gets `true` here can rely on the pad succeeding.
+  if (!candidateAttr || candidateAttr.isSplat()) return false;
+  Type elemType = srcType.getElementType();
+  if (!elemType.isIntOrFloat()) return false;
+  unsigned bitWidth = elemType.getIntOrFloatBitWidth();
+  if (bitWidth == 0 || bitWidth % 8 != 0) return false;
+  int64_t elemBytes = bitWidth / 8;
+  if (candidateAttr.getRawData().size() !=
+      static_cast<size_t>(srcType.getNumElements() * elemBytes))
+    return false;
+  globalOp = candidate;
+  attr = candidateAttr;
+  return true;
+}
+
+/// Recognizes the host dispatch that materializes a contraction's
+/// accumulator-as-bias operand: a single `linalg.generic` that broadcasts a
+/// constant 1-D bias along the outer (M) dim and stores it. Returns the bias
+/// values, or {} when `acc` is anything else -- a runtime accumulator, a
+/// partial-sum carried in from another dispatch, a bias that is not a
+/// compile-time constant, or any broadcast shape other than "constant per
+/// output column".
+static DenseElementsAttr matchBroadcastBiasDispatch(Value acc, ModuleOp module) {
+  // const-eval hoists a broadcast whose result is small enough into a global
+  // filled by a `util.initializer`, so the accumulator arrives as a load of
+  // that global rather than as the broadcast dispatch itself. Look through it
+  // to the value the initializer stores; the recognition below is the same
+  // either way, and folding the bias leaves the whole initializer dead.
+  if (auto loadOp = acc.getDefiningOp<IREE::Util::GlobalLoadOp>()) {
+    if (!loadOp.getIsImmutable()) return {};
+    SmallVector<IREE::Util::GlobalStoreOp> stores;
+    module.walk([&](IREE::Util::GlobalStoreOp s) {
+      if (s.getGlobalAttr() == loadOp.getGlobalAttr()) stores.push_back(s);
+    });
+    if (stores.size() != 1) return {};
+    acc = stores.front().getValue();
+  }
+  auto dispatch = acc.getDefiningOp<IREE::Flow::DispatchOp>();
+  if (!dispatch || dispatch->getNumResults() != 1) return {};
+  func::FuncOp func = getDispatchFunc(dispatch, module);
+  if (!func) return {};
+
+  SmallVector<linalg::GenericOp> generics;
+  func.walk([&](linalg::GenericOp g) { generics.push_back(g); });
+  if (generics.size() != 1) return {};
+  linalg::GenericOp generic = generics.front();
+  if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1) return {};
+  if (generic->getNumResults() != 1) return {};
+  if (generic.getNumLoops() != 2) return {};
+  for (utils::IteratorType it : generic.getIteratorTypesArray())
+    if (it != utils::IteratorType::parallel) return {};
+  MLIRContext *ctx = generic.getContext();
+  SmallVector<AffineMap> maps = generic.getIndexingMapsArray();
+  // ins: (d0, d1) -> (d1)   -- the same value for every row
+  // outs:(d0, d1) -> (d0, d1)
+  if (maps[0] != AffineMap::get(2, 0, {getAffineDimExpr(1, ctx)}, ctx)) return {};
+  if (maps[1] != AffineMap::getMultiDimIdentityMap(2, ctx)) return {};
+  // The body must be a bare copy. Unlike `isShapePreservingUnaryMapOf` (where
+  // the structural checks alone make any body safe) the body matters here: we
+  // are about to reproduce its result as a constant, so it must not compute
+  // anything.
+  Block &body = generic.getRegion().front();
+  if (!llvm::hasSingleElement(body.getOperations())) return {};
+  auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+  if (!yield || yield->getNumOperands() != 1) return {};
+  if (yield->getOperand(0) != body.getArgument(0)) return {};
+  // Exactly one store, of the broadcast itself.
+  SmallVector<IREE::TensorExt::DispatchTensorStoreOp> stores;
+  func.walk(
+      [&](IREE::TensorExt::DispatchTensorStoreOp s) { stores.push_back(s); });
+  if (stores.size() != 1) return {};
+  if (stores.front().getValue() != generic.getResult(0)) return {};
+
+  // The bias itself: either inlined into the executable as a constant, or
+  // passed in as an operand that is a constant on the host side.
+  Value in = generic.getDpsInputOperand(0)->get();
+  DenseElementsAttr biasAttr;
+  if (auto cstOp = in.getDefiningOp<arith::ConstantOp>()) {
+    biasAttr = dyn_cast<DenseElementsAttr>(cstOp.getValue());
+  } else if (auto load = getFullTensorLoad(in)) {
+    auto arg = dyn_cast<BlockArgument>(load.getSource());
+    if (!arg) return {};
+    unsigned argNo = arg.getArgNumber();
+    if (argNo >= dispatch.getArguments().size()) return {};
+    biasAttr = matchConstantAttr(dispatch.getArguments()[argNo]);
+  }
+  if (!biasAttr) return {};
+  auto biasType = dyn_cast<RankedTensorType>(biasAttr.getType());
+  if (!biasType || biasType.getRank() != 1) return {};
+  if (!isa<FloatType>(biasType.getElementType())) return {};
+  return biasAttr;
+}
+
+/// Materializes `weight` zero-padded to `dstShape` *with the bias spliced into
+/// K position `kIdx`* as a new compile-time constant global, and returns a
+/// load of it. `kPos`/`nPos` are the weight's own K/N dim positions, so both
+/// the plain [K,N] and the transpose_b [N,K] layouts are handled.
+///
+/// The bias arrives in the accumulator's element type (f32) while the weight
+/// has usually been demoted to bf16; it is converted through `APFloat` and
+/// re-encoded by `DenseElementsAttr` itself, so no assumption is made about
+/// the raw layout of either type.
+static Value createBiasFoldedWeightGlobal(
+    IRRewriter &rewriter, ModuleOp module, Value weight,
+    ArrayRef<int64_t> dstShape, DenseElementsAttr biasAttr, unsigned kPos,
+    unsigned nPos, int64_t kIdx, int64_t n, int &counter) {
+  IREE::Util::GlobalOp globalOp;
+  DenseElementsAttr srcAttr;
+  if (!matchConstantWeight(weight, globalOp, srcAttr)) return {};
+  auto srcType = cast<RankedTensorType>(weight.getType());
+  Type elemType = srcType.getElementType();
+  auto floatType = dyn_cast<FloatType>(elemType);
+  if (!floatType) return {};
+  auto dstType = RankedTensorType::get(dstShape, elemType);
+
+  DenseElementsAttr paddedAttr = padConstantRowMajor(srcAttr, srcType, dstType);
+  if (!paddedAttr) return {};
+
+  // Convert the bias to the weight's element type and let DenseElementsAttr
+  // encode it, then copy those bytes into place.
+  SmallVector<APFloat> converted;
+  converted.reserve(n);
+  for (APFloat v : biasAttr.getValues<APFloat>()) {
+    bool losesInfo = false;
+    APFloat c = v;
+    c.convert(floatType.getFloatSemantics(), APFloat::rmNearestTiesToEven,
+              &losesInfo);
+    converted.push_back(c);
+    if (static_cast<int64_t>(converted.size()) == n) break;
+  }
+  if (static_cast<int64_t>(converted.size()) != n) return {};
+  auto rowAttr = DenseElementsAttr::get(
+      RankedTensorType::get({n}, elemType), converted);
+  ArrayRef<char> rowRaw = rowAttr.getRawData();
+  int64_t elemBytes = floatType.getIntOrFloatBitWidth() / 8;
+  if (rowRaw.size() != static_cast<size_t>(n * elemBytes)) return {};
+
+  SmallVector<char> dst(paddedAttr.getRawData().begin(),
+                        paddedAttr.getRawData().end());
+  int64_t dstCols = dstShape[1];
+  for (int64_t j = 0; j < n; ++j) {
+    // The bias occupies K index `kIdx` and N index `j`, placed at whichever
+    // of the two dims each of those is for this weight's layout.
+    int64_t coords[2];
+    coords[kPos] = kIdx;
+    coords[nPos] = j;
+    std::memcpy(dst.data() + (coords[0] * dstCols + coords[1]) * elemBytes,
+                rowRaw.data() + j * elemBytes, elemBytes);
+  }
+  auto foldedAttr = DenseElementsAttr::getFromRawBuffer(dstType, dst);
+  if (!foldedAttr) return {};
+
+  // Declared at the top of the module for the same reason
+  // `createPaddedConstantGlobal` does -- see its comment.
+  Location loc = weight.getLoc();
+  OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
+  auto foldedGlobalOp = IREE::Util::GlobalOp::create(
+      moduleBuilder, loc, "__bias_folded_const_" + std::to_string(counter++),
+      /*isMutable=*/false, dstType, std::optional<TypedAttr>{foldedAttr});
+  SymbolTable::setSymbolVisibility(foldedGlobalOp,
+                                   SymbolTable::Visibility::Private);
+  if (auto affinity = globalOp->getAttr("stream.affinity.default"))
+    foldedGlobalOp->setAttr("stream.affinity.default", affinity);
+  return foldedGlobalOp.createLoadOp(loc, rewriter)->getResult(0);
+}
+
+/// Rewrites the matmul's accumulator from the incoming bias binding to a plain
+/// zero `fill`, erases the now-unused binding from the executable, and updates
+/// `info` to the fill/empty form (so the padding helpers that follow take
+/// their fill path). The caller must erase the corresponding host operand.
+static void replaceAccWithZeroFill(IRRewriter &rewriter, MatmulInfo &info,
+                                   func::FuncOp func) {
+  linalg::MatmulOp matmul = info.matmul;
+  Location loc = matmul.getLoc();
+  auto accType = cast<RankedTensorType>(info.accLoad.getResult().getType());
+  Type elemType = accType.getElementType();
+  rewriter.setInsertionPoint(matmul);
+  auto emptyOp = rewriter.create<tensor::EmptyOp>(loc, accType.getShape(),
+                                                  elemType);
+  Value zero =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elemType));
+  auto fillOp = rewriter.create<linalg::FillOp>(loc, ValueRange{zero},
+                                                ValueRange{emptyOp.getResult()});
+  matmul.setDpsInitOperand(0, fillOp.getResult(0));
+  unsigned accArgNo = info.accArg.getArgNumber();
+  rewriter.eraseOp(info.accLoad);
+  (void)func.eraseArgument(accArgNo);
+  info.accLoad = nullptr;
+  info.accArg = nullptr;
+  info.fill = fillOp;
+  info.empty = emptyOp;
+}
+
 /// Creates a `flow.executable` + `flow.dispatch` that crops `v` down to
 /// `dstShape` (low corner via `tensor.extract_slice`), placed on `hostAffinity`.
 /// Returns the cropped value, or `v` unchanged if `dstShape` already matches.
@@ -809,6 +1087,12 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
   // Executables rewritten already (shared by multiple dispatches): rewrite the
   // executable once, but pad/crop each caller's operands/result.
   DenseSet<Operation *> paddedExecutables;
+  // Executables whose accumulator-bias operand has been folded into K (see the
+  // "Accumulator-bias K-column fold" section above). Tracked separately from
+  // `paddedExecutables` because the fold changes the executable's *signature*:
+  // a second caller of such an executable cannot be handled by padding its
+  // operands alone.
+  DenseSet<Operation *> biasFoldedExecutables;
 
   for (IREE::Flow::DispatchOp dispatch : dispatches) {
     IREE::HAL::ExecutableTargetAttr target = getDispatchTarget(dispatch, module);
@@ -854,9 +1138,45 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
         accElemType, /*transposeB=*/rhsNPos < rhsKPos);
     if (!mult) continue;
 
+    // Accumulator-bias K-column fold: recognized only when the accumulator is
+    // a host broadcast of a constant bias *and* the weight is a constant this
+    // pass can rewrite at compile time. Both are decided here, before any IR
+    // is touched, so the fold either applies fully or not at all -- there is
+    // no half-folded state to unwind. Null in the ordinary two-operand case
+    // (`info->fill` set), which is every dispatch when the pre-im2col
+    // convolution fold is left on.
+    DenseElementsAttr biasAttr;
+    int64_t accArgNo = -1;
+    if (info->accArg) {
+      accArgNo = info->accArg.getArgNumber();
+      IREE::Util::GlobalOp weightGlobal;
+      DenseElementsAttr weightAttr;
+      if (matchConstantWeight(dispatch.getArguments()[rhsArgNo], weightGlobal,
+                              weightAttr) &&
+          isa<FloatType>(lhsType.getElementType()) &&
+          isa<FloatType>(rhsType.getElementType())) {
+        biasAttr =
+            matchBroadcastBiasDispatch(dispatch.getArguments()[accArgNo], module);
+        if (biasAttr &&
+            cast<RankedTensorType>(biasAttr.getType()).getDimSize(0) != n)
+          biasAttr = {};
+      }
+    }
+    // A shared executable that has already had its bias folded has one fewer
+    // binding than this caller passes operands for. Padding this caller's
+    // operands would not make that consistent, so leave the dispatch alone
+    // and let the divisibility check downstream report it, rather than
+    // producing IR that only looks right. Unreachable while executable
+    // deduplication is off, which this model requires anyway.
+    if (!biasAttr && biasFoldedExecutables.contains(func.getOperation()))
+      continue;
+
     int64_t mPad = roundUpToMultiple(m, mult->m);
     int64_t nPad = roundUpToMultiple(n, mult->n);
-    int64_t kPad = roundUpToMultiple(k, mult->k);
+    // The bias lives at K index `k`, so the contraction's logical K grows by
+    // one before rounding. K+1 is never a tile multiple, so a folded operand
+    // is always padded -- which is precisely what makes the ones column free.
+    int64_t kPad = roundUpToMultiple(biasAttr ? k + 1 : k, mult->k);
     if (mPad == m && nPad == n && kPad == k) continue;  // already divisible
     // Any output dim (M outer and/or N inner) may be padded; the grown result is
     // cropped back on the host by a single extract_slice dispatch.
@@ -887,6 +1207,13 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // and store binding too (the dispatch stays fully divisible, cropped on
     // host). The output is always [M,N], so its grown shape is [mPad, nPad].
     if (paddedExecutables.insert(func.getOperation()).second) {
+      // Before growing anything: turn the bias binding into a zero fill, so
+      // the padding below sees the ordinary two-operand form (and `padOut`
+      // takes `growMatmulInit`'s fill path).
+      if (biasAttr) {
+        replaceAccWithZeroFill(rewriter, *info, func);
+        biasFoldedExecutables.insert(func.getOperation());
+      }
       growBinding(rewriter, info->lhsArg, info->lhsLoad, lhsPad);
       growBinding(rewriter, info->rhsArg, info->rhsLoad, rhsPad);
       if (padOut) {
@@ -908,14 +1235,35 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // constant here instead of costing a dispatch on every inference; the
     // activation LHS is a runtime value and keeps its dispatch.
     rewriter.setInsertionPoint(dispatch);
-    Value lhsPadded = createPaddingDispatchOrConstant(
-        rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
-        hostAffinity, counter);
-    Value rhsPadded = createPaddingDispatchOrConstant(
-        rewriter, module, dispatch.getArguments()[rhsArgNo], rhsPad,
-        hostAffinity, counter);
+    Value lhsPadded =
+        biasAttr ? createPaddingDispatch(
+                       rewriter, module, dispatch.getArguments()[lhsArgNo],
+                       lhsPad, hostAffinity, counter, /*padValue=*/nullptr,
+                       /*onesPad=*/true)
+                 : createPaddingDispatchOrConstant(
+                       rewriter, module, dispatch.getArguments()[lhsArgNo],
+                       lhsPad, hostAffinity, counter);
+    Value rhsPadded =
+        biasAttr ? createBiasFoldedWeightGlobal(
+                       rewriter, module, dispatch.getArguments()[rhsArgNo],
+                       rhsPad, biasAttr, rhsKPos, rhsNPos, k, n, counter)
+                 : createPaddingDispatchOrConstant(
+                       rewriter, module, dispatch.getArguments()[rhsArgNo],
+                       rhsPad, hostAffinity, counter);
+    // `createBiasFoldedWeightGlobal` re-validates what `matchConstantWeight`
+    // requires and returns {} rather than guessing. That cannot happen here
+    // (the same conditions were checked above, before the executable was
+    // rewritten), and if it ever does the only honest thing left is to fail
+    // loudly rather than emit a dispatch reading an unpadded operand.
+    if (!lhsPadded || !rhsPadded) {
+      dispatch.emitError("failed to materialize padded contraction operands");
+      return signalPassFailure();
+    }
     dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
+    // Drop the bias operand last, so the assignments above still address the
+    // original operand positions.
+    if (biasAttr) dispatch.getArgumentsMutable().erase(accArgNo);
 
     // Grow this caller's result to [mPad, nPad] and crop it back to [m, n] on
     // the host with an extract_slice dispatch (handles the inner N dim too).
