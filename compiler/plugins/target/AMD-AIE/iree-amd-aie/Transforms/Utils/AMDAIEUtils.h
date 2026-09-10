@@ -57,6 +57,10 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1);
 /// the Flow-phase pad/split passes so they agree on which dispatches are GEMV.
 int64_t getGemvMThreshold(int64_t numRows, int64_t instrM);
 
+/// Whether small-M matmuls take the GEMV pipeline for this target
+/// (`gemv_pipeline` in the executable target config; absent means enabled).
+bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr);
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);
 

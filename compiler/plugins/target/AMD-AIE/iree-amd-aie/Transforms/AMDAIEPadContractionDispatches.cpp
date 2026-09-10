@@ -128,7 +128,11 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
       /*m=*/*numRows * (*instr)[0],
       /*n=*/*numCols * (*instr)[1],
       /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1),
-      /*gemvMThreshold=*/getGemvMThreshold(*numRows, (*instr)[0])};
+      // With the GEMV pipeline switched off no M is "GEMV-like" (threshold 0),
+      // so every matmul is padded and split as before.
+      /*gemvMThreshold=*/getConfigEnableGemvPipeline(target)
+          ? getGemvMThreshold(*numRows, (*instr)[0])
+          : 0};
 }
 
 /// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch

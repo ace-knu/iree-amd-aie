@@ -184,6 +184,9 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // Set microkernel enabling flag.
     addConfig("ukernels",
               StringAttr::get(context, options.enableAMDAIEUkernels));
+    // Set the GEMV pipeline routing flag (read per dispatch by the Flow pad /
+    // split passes and by KernelDispatch).
+    addConfig("gemv_pipeline", BoolAttr::get(context, options.enableGemvPipeline));
     // Set number of rows/cols used in an AIE array.
     addConfig("num_rows",
               IntegerAttr::get(IntegerType::get(context, 32), nRows));

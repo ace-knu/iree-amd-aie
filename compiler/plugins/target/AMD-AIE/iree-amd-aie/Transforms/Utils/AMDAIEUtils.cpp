@@ -98,6 +98,12 @@ int64_t getGemvMThreshold(int64_t numRows, int64_t instrM) {
   return numRows * instrM;
 }
 
+bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr =
+      getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");
+  return !attr || attr->getValue();
+}
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr) {
   std::optional<int64_t> res = getConstantIntValue(ofr);

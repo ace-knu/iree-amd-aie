@@ -104,6 +104,10 @@ struct AMDAIEOptions {
   }
 
   std::string enableAMDAIEUkernels{"none"};
+  // Route small-M (GEMV-like) matmuls to the GEMV tile pipeline and skip their
+  // M/N padding and N-splitting (KernelDispatch, AMDAIEPadContractionDispatches).
+  // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
+  bool enableGemvPipeline{true};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
   bool enableCtrlPkt{false};
 
@@ -188,6 +192,13 @@ struct AMDAIEOptions {
         llvm::cl::desc("Enables microkernels in the amdaie backend. May be "
                        "`none`, `all`, or a comma-separated list of specific "
                        "unprefixed microkernels to enable, e.g. `matmul`."));
+
+    binder.opt<bool>(
+        "iree-amdaie-enable-gemv-pipeline", enableGemvPipeline,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Lower small-M (GEMV-like) matmuls with the GEMV tile "
+                       "pipeline instead of pack-peel (and skip their M/N "
+                       "padding and N-splitting). Default true."));
 
     /// Command line option for selecting the lowering pipeline to use to
     /// generate AIE DMA configurations, core code and control code.

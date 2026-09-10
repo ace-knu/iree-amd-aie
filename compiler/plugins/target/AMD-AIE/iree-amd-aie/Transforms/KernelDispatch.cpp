@@ -654,8 +654,11 @@ static LogicalResult setRootConfigForPackPeelPipeline(
     LowerToAIEPassPipeline useLowerToAIEPipeline, AMDAIEDevice targetDevice,
     uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels) {
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
-  // Small-M shapes leave pack-peel here; see `isGemvLike`.
-  if (isGemvLike(linalgOp, deviceModel, numRows)) {
+  // Small-M shapes leave pack-peel here; see `isGemvLike`. The target config
+  // can switch this off (`--iree-amdaie-enable-gemv-pipeline=false`).
+  if (getConfigEnableGemvPipeline(
+          IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn)) &&
+      isGemvLike(linalgOp, deviceModel, numRows)) {
     return setRootConfigForGemvPipeline(entryPointFn, linalgOp, deviceModel,
                                         numRows, numCols);
   }
