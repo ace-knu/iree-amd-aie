@@ -129,6 +129,18 @@ def AMDAIESplitLargeContractionDispatches :
   let summary = "Split a large-(K,N) transpose_b NPU matmul dispatch into N-chunk sub-dispatches (weight sliced along N) concatenated on the host, keeping each weight L3->L2 shim DMA within the shim's addressing limits.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIESplitLargeContractionDispatchesPass()";
+  let options = [
+    Option<"nChunkMax", "n-chunk-max", "int64_t", /*default=*/"1024",
+      "Max N per split chunk (kNChunkMax). The built-in 1024 is the largest "
+      "value validated on real hardware (VGG-16, bf16, npu4: 7/7 runs "
+      "correct); 2048 hangs reproducibly (2/2) -- see the pass's own comment "
+      "for why this is an empirical, not derived, number. Also usable as an "
+      "escape hatch for other (K,N) shapes: set >= N to disable splitting "
+      "for a dispatch entirely (still gated by kKThreshold). A wrong value "
+      "does not miscompute -- it hangs the NPU run (ert state 8), so any "
+      "non-default value needs its own real-hardware verification before "
+      "being trusted.">
+  ];
 }
 
 def AMDAIEAssignLogicalObjectFifoDepth :

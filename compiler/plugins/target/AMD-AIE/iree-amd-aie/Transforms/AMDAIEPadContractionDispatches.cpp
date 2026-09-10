@@ -891,6 +891,8 @@ class AMDAIESplitLargeContractionDispatchesPass
     : public impl::AMDAIESplitLargeContractionDispatchesBase<
           AMDAIESplitLargeContractionDispatchesPass> {
  public:
+  using AMDAIESplitLargeContractionDispatchesBase::
+      AMDAIESplitLargeContractionDispatchesBase;
   void runOnOperation() override;
 };
 
@@ -902,10 +904,20 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
   // These two numbers were found by experiment, not derived, and that has three
   // consequences worth knowing before reusing them:
   //
-  //  - They were validated on exactly one dispatch: VGG-16's dense0
-  //    (K=25088, N=4096) in bf16 on npu4. Its other two fully connected layers
-  //    (K=4096, N=4096 and K=4096, N=1000) both have K == kKThreshold and so do
-  //    not split at all. No other element type or device was measured.
+  //  - kKThreshold was validated on exactly one dispatch: VGG-16's dense0
+  //    (K=25088, N=4096) in bf16 on npu4. No other element type or device was
+  //    measured. `nChunkMax`'s default has since been bisected on real
+  //    hardware (docs/2026-09-09_split-n-chunk-max-experimental-bisection.md):
+  //    1024 is safe (7/7 correct runs), 2048 hangs reproducibly (2/2), so the
+  //    default is 1024 and 2048 is the known upper wall. Note that the
+  //    "K == kKThreshold, so it does not split" case
+  //    the threshold was originally calibrated against no longer occurs in
+  //    VGG-16: AMDAIEFoldBiasIntoContraction absorbs the bias as a K+1
+  //    reduction element, so dense1/dense2 arrive here at K=4224 (4096 -> 4097,
+  //    then alignment padding) rather than K=4096, and both now split (8-way
+  //    and 2-way) even though they ran fine unsplit before the fold. That is an
+  //    accident of this empirical threshold, not a DMA requirement -- see
+  //    docs/2026-09-07_dev-vs-fold-dispatch-dump-comparison.md section 1.
   //  - kKThreshold is compared in ELEMENTS, while the shim limit it stands in
   //    for is a limit on words. An f32 weight at K=2048 has the same byte
   //    footprint as a bf16 weight at the K=4096 boundary, but sits even further
@@ -923,7 +935,10 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
   // element type the dispatch actually targets -- `target` is already resolved
   // per dispatch below.
   constexpr int64_t kKThreshold = 4096;  // split only when reduction K exceeds this
-  constexpr int64_t kNChunkMax = 512;    // max N per chunk (validated good chunk)
+  // max N per chunk (validated good chunk at the 1024 default; see the
+  // `nChunkMax` option's own doc in Passes.td for why any override needs
+  // real-hardware re-verification before being trusted).
+  int64_t kNChunkMax = nChunkMax;
 
   ModuleOp module = getOperation();
   IRRewriter rewriter(module.getContext());
@@ -1111,8 +1126,9 @@ std::unique_ptr<Pass> createAMDAIEPadContractionDispatchesPass() {
   return std::make_unique<AMDAIEPadContractionDispatchesPass>();
 }
 
-std::unique_ptr<Pass> createAMDAIESplitLargeContractionDispatchesPass() {
-  return std::make_unique<AMDAIESplitLargeContractionDispatchesPass>();
+std::unique_ptr<Pass> createAMDAIESplitLargeContractionDispatchesPass(
+    AMDAIESplitLargeContractionDispatchesOptions options) {
+  return std::make_unique<AMDAIESplitLargeContractionDispatchesPass>(options);
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

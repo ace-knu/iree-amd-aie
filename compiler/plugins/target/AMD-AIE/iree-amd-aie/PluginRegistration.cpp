@@ -101,8 +101,11 @@ struct AMDAIESession
     // N-chunk sub-dispatches so each weight's L3->L2 shim DMA stays within the
     // shim addressing limits (a single large-N weight DMA degrades and stalls).
     // No-op for conv / small matmuls / non-amd-aie dispatches.
+    AMDAIE::AMDAIESplitLargeContractionDispatchesOptions splitOptions;
+    splitOptions.nChunkMax = options.splitLargeContractionNChunkMax;
     passManager.addPass(
-        AMDAIE::createAMDAIESplitLargeContractionDispatchesPass());
+        AMDAIE::createAMDAIESplitLargeContractionDispatchesPass(
+            splitOptions));
   }
 
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) override {

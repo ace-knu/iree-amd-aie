@@ -81,6 +81,15 @@ struct AMDAIEOptions {
   bool foldRhsTransposeIntoContraction{true};
   int64_t foldBiasKAlign{128};
 
+  // Max N per AMDAIESplitLargeContractionDispatchesPass split chunk (see its
+  // own comment in AMDAIEPadContractionDispatches.cpp). 1024 is the largest
+  // value validated on real hardware; 2048 fails reproducibly (`ert state 8`,
+  // 2/2). A wrong value does not miscompute, it hangs the NPU run, so any
+  // other value needs its own real-hardware verification before being
+  // trusted. See docs/2026-09-09c_nchunk1024-measured-benefit-data-movement-
+  // and-time.md for the 512-vs-1024 measurement this default is based on.
+  int64_t splitLargeContractionNChunkMax{1024};
+
   bool enableCoalescingLoops{false};
   bool enableCollapsingUnitDims{false};
   OutliningStrategy enableFunctionOutlining{OutliningStrategy::Balanced};
@@ -219,6 +228,17 @@ struct AMDAIEOptions {
             "multiple of this value instead of stopping at exactly K+1. 1 "
             "reproduces the pre-2026-09-04 behavior. For bisecting the "
             "fold-bias change; not meant for general use."));
+
+    binder.opt<int64_t>(
+        "iree-amdaie-split-n-chunk-max", splitLargeContractionNChunkMax,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Max N per AMDAIESplitLargeContractionDispatchesPass split chunk. "
+            "The built-in 1024 is the largest value validated on real "
+            "hardware (VGG-16, bf16, npu4: 7/7 runs correct); 2048 fails "
+            "reproducibly with an NPU timeout. Any other value needs its own "
+            "real-hardware re-verification -- a wrong value hangs the NPU run "
+            "rather than miscomputing."));
 
     binder.opt<bool>(
         "iree-amd-aie-enable-chess-for-ukernel", useChessForUKernel,

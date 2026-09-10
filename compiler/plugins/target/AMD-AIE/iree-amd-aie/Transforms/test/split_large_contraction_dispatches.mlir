@@ -1,4 +1,12 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-split-large-contraction-dispatches)' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-split-large-contraction-dispatches{n-chunk-max=512})' %s | FileCheck %s
+
+// `n-chunk-max` is pinned rather than left at the pass default on purpose: the
+// cases below exercise the *mechanics* of the N-split (slice views, per-chunk
+// cloned executables, host concat) and were written around a 512 chunk, so the
+// N=1024 case here splits 2-way. The pipeline default is 1024 (see the option's
+// doc in Passes.td) -- that value is a hardware-verified policy choice, not
+// something lit can check, so pinning here keeps these expectations stable
+// across default changes instead of silently retuning what is covered.
 
 // A transpose_b matmul (RHS = [N,K], the layout an ONNX Gemm lowers to) with a
 // large reduction K=8192 (> 4096) and output N=1024 (> 512) is split along N into
