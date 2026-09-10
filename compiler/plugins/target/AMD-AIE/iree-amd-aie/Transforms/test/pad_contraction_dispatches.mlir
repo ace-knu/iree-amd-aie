@@ -720,3 +720,140 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
     util.return %0 : tensor<196x64xf32>
   }
 }
+
+// -----
+
+// Accumulator-bias K-column fold: the accumulator is a host broadcast of a
+// constant bias and the weight is a constant global, so instead of padding the
+// bias operand the bias is folded into the contraction's K dim -- the weight
+// grows one K row holding the bias (a new compile-time constant), the LHS is
+// padded with 1.0 so K index 3 contracts against it, and the bias binding is
+// dropped, leaving a two-operand dispatch with a plain zero-init. That is what
+// makes a convolution's bias reach the NPU at all: a third L3->L2 operand has
+// no shim DMA producer channel to bind to.
+//
+// K=3 -> 4 -> 32, and N=1 -> 64 so the output side is grown and cropped too,
+// exercising the fold together with `padOut` (VGG16's conv11~13 shape).
+
+// The folded weight is a fresh constant, declared at the top of the module.
+// CHECK-LABEL: util.global private @__bias_folded_const_
+// CHECK-SAME:    : tensor<32x64xbf16>
+
+// CHECK-LABEL: func.func @matmul_biasfold
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x32xbf16>>
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x64xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x64xf32>>
+// The bias binding is gone; the accumulator is a zero fill again.
+// CHECK-NOT:     dispatch.tensor.load %arg2
+// CHECK:         %[[FILL:.+]] = linalg.fill
+// CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<32x32xbf16>, tensor<32x64xbf16>) outs(%[[FILL]] : tensor<32x64xf32>)
+
+// The LHS padding dispatch pads with 1.0, not 0.0.
+// CHECK-LABEL: func.func @pad_ones_dispatch_
+// CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
+// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 29]
+// CHECK:           tensor.yield %[[ONE]]
+
+// CHECK-LABEL: util.func public @main_biasfold
+// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_ones_executable_{{[0-9]+}}::@pad_ones_dispatch_{{[0-9]+}}(%arg0)
+// CHECK-SAME:      : (tensor<32x3xbf16>) -> tensor<32x32xbf16>
+// CHECK:         %[[W:.+]] = util.global.load @__bias_folded_const_
+// CHECK:         %[[MM:.+]] = flow.dispatch @dispatch_biasfold::@matmul_biasfold(%[[LPAD]], %[[W]])
+// CHECK-SAME:      : (tensor<32x32xbf16>, tensor<32x64xbf16>) -> tensor<32x64xf32>
+// CHECK:         flow.dispatch @crop_executable_{{[0-9]+}}::@crop_dispatch_{{[0-9]+}}(%[[MM]])
+// CHECK-SAME:      : (tensor<32x64xf32>) -> tensor<32x1xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight = dense<[[1.000000e+00], [2.000000e+00], [3.000000e+00]]> : tensor<3x1xbf16>
+  util.global private @bias = dense<7.000000e+00> : tensor<1xf32>
+  flow.executable private @dispatch_bcast {
+    flow.executable.export public @bcast workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @bcast(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [1], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1xf32>> -> tensor<1xf32>
+        %1 = tensor.empty() : tensor<32x1xf32>
+        %2 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%0 : tensor<1xf32>) outs(%1 : tensor<32x1xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          linalg.yield %in : f32
+        } -> tensor<32x1xf32>
+        iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : tensor<32x1xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>
+        return
+      }
+    }
+  }
+  flow.executable private @dispatch_biasfold {
+    flow.executable.export public @matmul_biasfold workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_biasfold(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x3xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x1xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x1xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [32, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x3xbf16>> -> tensor<32x3xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [3, 1], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x1xbf16>> -> tensor<3x1xbf16>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x1xf32>> -> tensor<32x1xf32>
+        %3 = linalg.matmul ins(%0, %1 : tensor<32x3xbf16>, tensor<3x1xbf16>) outs(%2 : tensor<32x1xf32>) -> tensor<32x1xf32>
+        iree_tensor_ext.dispatch.tensor.store %3, %arg3, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : tensor<32x1xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_biasfold(%arg0: tensor<32x3xbf16>) -> tensor<32x1xf32> {
+    %w = util.global.load immutable @weight : tensor<3x1xbf16>
+    %b = util.global.load immutable @bias : tensor<1xf32>
+    %acc = flow.dispatch @dispatch_bcast::@bcast(%b) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<1xf32>) -> tensor<32x1xf32>
+    %0 = flow.dispatch @dispatch_biasfold::@matmul_biasfold(%arg0, %w, %acc) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<32x3xbf16>, tensor<3x1xbf16>, tensor<32x1xf32>) -> tensor<32x1xf32>
+    util.return %0 : tensor<32x1xf32>
+  }
+}
+
+// -----
+
+// Same shapes and the same constant weight as above, but the accumulator is a
+// runtime value rather than a broadcast of a constant bias. The fold needs
+// *both* halves to be constant -- it has to produce the bias row at compile
+// time -- so it does not apply, and the dispatch keeps its three operands:
+// K is padded to 32 (not 4 -> 32), the weight is padded by the ordinary
+// constant path, and the bias operand is zero-padded like any other value.
+
+// CHECK-LABEL: util.global private @__padded_const_
+// CHECK-NOT:   @__bias_folded_const_
+
+// CHECK-LABEL: func.func @matmul_runtimeacc
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x64xf32>>
+// CHECK:         %[[ACC:.+]] = iree_tensor_ext.dispatch.tensor.load %arg2
+// CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<32x32xbf16>, tensor<32x64xbf16>) outs(%[[ACC]] : tensor<32x64xf32>)
+
+// CHECK-LABEL: util.func public @main_runtimeacc
+// CHECK-NOT:     @pad_ones_executable_
+// CHECK:         flow.dispatch @dispatch_runtimeacc::@matmul_runtimeacc(
+// CHECK-SAME:      : (tensor<32x32xbf16>, tensor<32x64xbf16>, tensor<32x64xf32>) -> tensor<32x64xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight2 = dense<[[1.000000e+00], [2.000000e+00], [3.000000e+00]]> : tensor<3x1xbf16>
+  flow.executable private @dispatch_runtimeacc {
+    flow.executable.export public @matmul_runtimeacc workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_runtimeacc(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x3xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x1xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x1xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [32, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x3xbf16>> -> tensor<32x3xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [3, 1], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x1xbf16>> -> tensor<3x1xbf16>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x1xf32>> -> tensor<32x1xf32>
+        %3 = linalg.matmul ins(%0, %1 : tensor<32x3xbf16>, tensor<3x1xbf16>) outs(%2 : tensor<32x1xf32>) -> tensor<32x1xf32>
+        iree_tensor_ext.dispatch.tensor.store %3, %arg3, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : tensor<32x1xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_runtimeacc(%arg0: tensor<32x3xbf16>, %arg1: tensor<32x1xf32>) -> tensor<32x1xf32> {
+    %w = util.global.load immutable @weight2 : tensor<3x1xbf16>
+    %0 = flow.dispatch @dispatch_runtimeacc::@matmul_runtimeacc(%arg0, %w, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<32x3xbf16>, tensor<3x1xbf16>, tensor<32x1xf32>) -> tensor<32x1xf32>
+    util.return %0 : tensor<32x1xf32>
+  }
+}

@@ -68,11 +68,28 @@ struct AMDAIEOptions {
   // if the placement rules change.
   bool demoteContractionInputsToBf16{false};
 
-  // Also fold conv2d + bias into a single dispatch (K+1 augmentation), not
-  // just matmul + bias. Disable to keep conv's bias as a separate dispatch
-  // input (falling back on the usual detach/no-fuse workaround flags for
-  // conv), while matmul + bias is still folded into the same dispatch.
-  bool foldConvBiasIntoContraction{true};
+  // Fold conv2d + bias here, before im2col, by augmenting the *activation*
+  // with a constant-one input channel (K+1 on the convolution). Off by
+  // default: `AMDAIEPadContractionDispatches` folds the same bias into a
+  // single K column of the post-im2col matmul instead, which is strictly
+  // cheaper on a convolution whose weight and bias are compile-time
+  // constants. K = C*kh*kw, so one extra input channel buys nine extra K
+  // positions of which eight are structurally zero, and it costs a full copy
+  // of the activation into a (C+1)-channel buffer plus a fill for the ones
+  // plane -- two host dispatches per convolution. On VGG16 that is 26 of
+  // 105 dispatches; folding at the K column instead brings the model to 79
+  // with the ones written by the K-padding dispatch that has to run anyway
+  // (verified on npu4: corr 0.999994, argmax match; see
+  // docs/2026-09-10_cpu-dispatch-reduction-plan.md).
+  //
+  // Turn it back on for a convolution whose weight or bias is *not* a
+  // compile-time constant: the K-column fold has to materialize the bias row
+  // as a constant, so it does not apply there, and without either fold the
+  // bias stays a third dispatch operand -- which the NPU cannot bind
+  // ("'amdaie.connection' op no producer DMA channel available", every conv).
+  // Matmul + bias is folded here regardless of this flag; it is the
+  // convolution path alone that this gates.
+  bool foldConvBiasIntoContraction{false};
 
   // Debug-only escape hatches for bisecting the 2026-09-04 fold-bias change
   // (see AMDAIEFoldBiasIntoContraction.cpp). Defaults reproduce today's
@@ -204,11 +221,13 @@ struct AMDAIEOptions {
         "iree-amdaie-fold-conv-bias-into-contraction",
         foldConvBiasIntoContraction, llvm::cl::cat(category),
         llvm::cl::desc(
-            "Also fold conv2d + bias into a single dispatch (K+1 "
-            "augmentation), not just matmul + bias. Disable to keep conv's "
-            "bias as a separate dispatch input (relying on the usual "
-            "detach/no-fuse workaround flags for conv), while matmul + bias "
-            "is still folded into the same dispatch."));
+            "Fold conv2d + bias before im2col by augmenting the activation "
+            "with a constant-one input channel. Off by default because "
+            "AMDAIEPadContractionDispatches folds the same bias into one K "
+            "column of the post-im2col matmul at no dispatch cost (VGG16: "
+            "105 -> 79 dispatches). Enable for a convolution whose weight or "
+            "bias is not a compile-time constant, which the K-column fold "
+            "cannot handle. Matmul + bias is folded regardless."));
 
     binder.opt<bool>(
         "iree-amdaie-fold-rhs-transpose-into-contraction",
