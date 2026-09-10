@@ -67,9 +67,10 @@ static int64_t roundUpToMultiple(int64_t value, int64_t multiple) {
 /// Tile multiples a matmul's M, N, K must be padded up to on a given target.
 struct PaddingMultiples {
   int64_t m, n, k;
-  // M extents below this take the GEMV pipeline (see `getGemvMThreshold`),
-  // which tiles neither M nor a fixed N tile, so they need no M/N padding.
-  int64_t gemvMThreshold;
+  // Whether the target routes M == 1 matmuls to the GEMV pipeline (see
+  // `isGemvMExtent`), which tiles neither M nor a fixed N tile, so those need
+  // no M/N padding and no N-split.
+  bool gemvPipeline;
 };
 
 /// Resolves the amd-aie executable target a dispatch is pinned to via its
@@ -128,11 +129,7 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
       /*m=*/*numRows * (*instr)[0],
       /*n=*/*numCols * (*instr)[1],
       /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1),
-      // With the GEMV pipeline switched off no M is "GEMV-like" (threshold 0),
-      // so every matmul is padded and split as before.
-      /*gemvMThreshold=*/getConfigEnableGemvPipeline(target)
-          ? getGemvMThreshold(*numRows, (*instr)[0])
-          : 0};
+      /*gemvPipeline=*/getConfigEnableGemvPipeline(target)};
 }
 
 /// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
@@ -576,14 +573,14 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
         outElemType);
     if (!mult) continue;
 
-    // A small-M (GEMV-like) matmul is lowered by the GEMV pipeline
-    // (KernelDispatch, same threshold), which leaves M untiled and spreads N
-    // over the cores by whatever factor N has, so neither dim is padded: for
-    // M=1 that removes the 32x zero-padding of the output rows and, for
-    // N=1000, the weight pad that a runtime dispatch would otherwise redo on
-    // every inference. K keeps its multiple: the pipeline takes any K, but a
-    // 32-aligned K keeps the DMA runs long.
-    bool isGemv = m < mult->gemvMThreshold;
+    // An M == 1 (GEMV) matmul is lowered by the GEMV pipeline (KernelDispatch,
+    // same predicate), which leaves M untiled and spreads N over the cores by
+    // whatever factor N has, so neither dim is padded: that removes the 32x
+    // zero-padding of the output rows and, for N=1000, the weight pad that a
+    // runtime dispatch would otherwise redo on every inference. K keeps its
+    // multiple: the pipeline takes any K, but a 32-aligned K keeps the DMA runs
+    // long.
+    bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
     int64_t mPad = isGemv ? m : roundUpToMultiple(m, mult->m);
     int64_t nPad = isGemv ? n : roundUpToMultiple(n, mult->n);
     int64_t kPad = roundUpToMultiple(k, mult->k);
@@ -730,12 +727,12 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
             .getElementType(),
         rhsType.getElementType(), elemType);
     if (!mult) continue;
-    // Small-M shapes take the GEMV pipeline, whose weight L3->L2 DMA is a single
+    // M == 1 shapes take the GEMV pipeline, whose weight L3->L2 DMA is a single
     // 2-D pattern per K step that subsumes the whole K loop into one
     // descriptor (dense0: 65 shim DMA programmings for the merged dispatch,
     // fewer than one of these chunks under pack-peel), so the reason to split
     // does not apply to them.
-    if (M < mult->gemvMThreshold) continue;
+    if (mult->gemvPipeline && isGemvMExtent(M)) continue;
     int64_t C = chooseChunkN(N, mult->n, kNChunkMax);
     int64_t nChunks = N / C;
     if (nChunks < 2) continue;

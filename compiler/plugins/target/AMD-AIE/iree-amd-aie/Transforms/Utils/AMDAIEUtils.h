@@ -49,13 +49,16 @@ std::optional<int64_t> getConfigNumRows(
 /// 2 = 4-level tiling).
 int64_t getPackPeelReductionTile(int64_t kPackScaleL1);
 
-/// Returns the M extent below which a 2-D matmul takes the GEMV pipeline
-/// instead of pack-peel. Pack-peel tiles M over the `numRows` core rows with at
-/// least one vector-instruction M tile (`instrM`) per row, so any M below
-/// `numRows * instrM` is zero-padded up to it -- for M=1 that makes 31 of 32
-/// output rows, and 3 of 4 core rows, padding. Shared by `KernelDispatch` and
-/// the Flow-phase pad/split passes so they agree on which dispatches are GEMV.
-int64_t getGemvMThreshold(int64_t numRows, int64_t instrM);
+/// Returns true if a 2-D matmul with `m` rows takes the GEMV pipeline instead
+/// of pack-peel. Today that is M == 1 only (a vector times a matrix). Pack-peel
+/// zero-pads any M below numRows * instr_m (32 on npu4 bf16) up to it, so
+/// 2 <= M < 32 would also profit, but the GEMV lowering's L2 split
+/// (`AMDAIESplitLogicalObjFifos`) still splits along the first non-unit dim and
+/// for M >= 2 that is M, not N: every core then writes C into one memtile and
+/// channel assignment fails. Those shapes stay on pack-peel until that is
+/// fixed. Shared by `KernelDispatch` and the Flow-phase pad/split passes so
+/// they agree on which dispatches are GEMV.
+bool isGemvMExtent(int64_t m);
 
 /// Whether small-M matmuls take the GEMV pipeline for this target
 /// (`gemv_pipeline` in the executable target config; absent means enabled).

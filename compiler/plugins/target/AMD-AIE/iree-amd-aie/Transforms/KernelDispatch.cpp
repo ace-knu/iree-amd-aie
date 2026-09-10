@@ -553,10 +553,8 @@ constexpr int64_t kGemvKTile = 256;
 
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
 /// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim,
-/// no fused elementwise consumer) whose M is below `getGemvMThreshold`, i.e. an
-/// M that pack-peel would have to zero-pad up to `numRows * instrM`.
-static bool isGemvLike(linalg::LinalgOp linalgOp, AMDAIEDeviceModel deviceModel,
-                       uint32_t numRows) {
+/// no fused elementwise consumer) with M == 1 (see `isGemvMExtent`).
+static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
   for (Operation *userOp : linalgOp->getUsers()) {
@@ -574,12 +572,7 @@ static bool isGemvLike(linalg::LinalgOp linalgOp, AMDAIEDeviceModel deviceModel,
   if (ShapedType::isDynamic(M) || ShapedType::isDynamic(maybeDims->nSizes[0]) ||
       ShapedType::isDynamic(maybeDims->kSizes[0]))
     return false;
-  // Without a vector instruction for these element types `getPackedSize` packs
-  // M by at most 4; mirror that so e.g. f32 M=1 takes this path too.
-  FailureOr<std::array<uint32_t, 3>> instr =
-      getMatmulInstructionSize(linalgOp, deviceModel);
-  int64_t instrM = succeeded(instr) ? (*instr)[0] : 4;
-  return M < getGemvMThreshold(numRows, instrM);
+  return isGemvMExtent(M);
 }
 
 /// GEMV pipeline root config. M is left untiled (below one row-group of vector
@@ -658,7 +651,7 @@ static LogicalResult setRootConfigForPackPeelPipeline(
   // can switch this off (`--iree-amdaie-enable-gemv-pipeline=false`).
   if (getConfigEnableGemvPipeline(
           IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn)) &&
-      isGemvLike(linalgOp, deviceModel, numRows)) {
+      isGemvLike(linalgOp)) {
     return setRootConfigForGemvPipeline(entryPointFn, linalgOp, deviceModel,
                                         numRows, numCols);
   }

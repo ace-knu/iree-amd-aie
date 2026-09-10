@@ -1,9 +1,10 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8})' %s | FileCheck %s
 
-// Small-M (GEMV-like) matmuls take the GEMV pipeline instead of pack-peel: M is
-// left untiled, N is spread over all 32 cores (L0 block = 32 cores x 32), K is
+// M == 1 (GEMV) matmuls take the GEMV pipeline instead of pack-peel: M is left
+// untiled, N is spread over all 32 cores (L0 block = 32 cores x 32), K is
 // streamed in tiles of 256, there is no packing_config, and translation_info
-// carries the per-dispatch pipeline override.
+// carries the per-dispatch pipeline override. Every other M stays on pack-peel
+// (see isGemvMExtent for why 2..31 is not taken yet).
 
 // VGG-16 fc1 as ONNX Gemm lowers it: M=1, transpose_b weight [N, K].
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
@@ -78,23 +79,20 @@ module {
 
 // -----
 
-// Plain (non-transposed) matmul, M=16: still below the threshold 4 rows x 8, so
-// GEMV. A/B/C tiles at k=256 are 2*(16*256*2 + 32*256*2 + 16*32*4) = 52 KB.
-// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
-// CHECK-SAME:      [0, 1024, 0], [0, 0, 256], [0, 32, 0]
-// CHECK-SAME:  ]>
-// CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "gemv"}>
-// CHECK-NOT:   packing_config
-// CHECK:       func.func @gemv_m16_plain
-// CHECK:       linalg.matmul
-// CHECK-SAME:    {lowering_config = #config}
+// M=16 (a batch of 16) is not a GEMV shape today: only M == 1 is routed, so
+// it keeps the pack-peel config and packing_config, with no pipeline override.
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = {{.*}}>
+// CHECK:       #packingConfig = #amdaie.packing_config
+// CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom>
+// CHECK:       func.func @packpeel_m16
+// CHECK:       linalg.matmul {lowering_config = #config, packing_config = #packingConfig}
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   <storage_buffer>,
   <storage_buffer>,
   <storage_buffer>
 ]>
 module {
-  func.func @gemv_m16_plain() {
+  func.func @packpeel_m16() {
     %cst = arith.constant 0.000000e+00 : f32
     %c0 = arith.constant 0 : index
     %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<16x4096xbf16>>
@@ -112,43 +110,40 @@ module {
 
 // -----
 
-// M=31: at k=256 the tiles are 2*(31*512 + 32*512 + 31*128) = 70.75 KB > 64 KB,
-// so the K tile shrinks to 128 (39.25 KB).
-// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
-// CHECK-SAME:      [0, 1024, 0], [0, 0, 128], [0, 32, 0]
-// CHECK-SAME:  ]>
-// CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "gemv"}>
-// CHECK-NOT:   packing_config
-// CHECK:       func.func @gemv_m31_k_tile_shrinks
-// CHECK:       linalg.matmul
-// CHECK-SAME:    {lowering_config = #config}
+// M=24 likewise stays on pack-peel (the Flow pad pass would have padded it to 32
+// before codegen; here M is already a multiple of the 8-row instruction).
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = {{.*}}>
+// CHECK:       #packingConfig = #amdaie.packing_config
+// CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom>
+// CHECK:       func.func @packpeel_m24
+// CHECK:       linalg.matmul {lowering_config = #config, packing_config = #packingConfig}
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   <storage_buffer>,
   <storage_buffer>,
   <storage_buffer>
 ]>
 module {
-  func.func @gemv_m31_k_tile_shrinks() {
+  func.func @packpeel_m24() {
     %cst = arith.constant 0.000000e+00 : f32
     %c0 = arith.constant 0 : index
-    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<31x4096xbf16>>
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<24x4096xbf16>>
     %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4096x4096xbf16>>
-    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<31x4096xf32>>
-    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [31, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<31x4096xbf16>> -> tensor<31x4096xbf16>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<24x4096xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [24, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<24x4096xbf16>> -> tensor<24x4096xbf16>
     %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [4096, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4096x4096xbf16>> -> tensor<4096x4096xbf16>
-    %5 = tensor.empty() : tensor<31x4096xf32>
-    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<31x4096xf32>) -> tensor<31x4096xf32>
-    %7 = linalg.matmul ins(%3, %4 : tensor<31x4096xbf16>, tensor<4096x4096xbf16>) outs(%6 : tensor<31x4096xf32>) -> tensor<31x4096xf32>
-    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [31, 4096], strides = [1, 1] : tensor<31x4096xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<31x4096xf32>>
+    %5 = tensor.empty() : tensor<24x4096xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<24x4096xf32>) -> tensor<24x4096xf32>
+    %7 = linalg.matmul ins(%3, %4 : tensor<24x4096xbf16>, tensor<4096x4096xbf16>) outs(%6 : tensor<24x4096xf32>) -> tensor<24x4096xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [24, 4096], strides = [1, 1] : tensor<24x4096xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<24x4096xf32>>
     return
   }
 }
 
 // -----
 
-// f32 has no matmul vector instruction on npu4; the threshold falls back to
-// 4 rows x 4 = 16, so f32 M=1 is GEMV too (pack-peel used to abort on it). 4-byte
-// operands halve the K tile: 2*(256*4 + 32*256*4 + 32*4) = 66.25 KB > 64 KB.
+// The GEMV predicate is M == 1 regardless of element type, so f32 M=1 (npu4 has
+// no f32 matmul vector instruction; pack-peel used to abort on it) is GEMV too.
+// 4-byte operands halve the K tile: 2*(256*4 + 32*256*4 + 32*4) = 66.25 KB > 64 KB.
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
 // CHECK-SAME:      [0, 1024, 0], [0, 0, 128], [0, 32, 0]
 // CHECK-SAME:  ]>

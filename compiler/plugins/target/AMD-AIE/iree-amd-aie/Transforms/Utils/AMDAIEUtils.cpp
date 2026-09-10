@@ -94,9 +94,7 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
   return kPackScaleL1 * 32;
 }
 
-int64_t getGemvMThreshold(int64_t numRows, int64_t instrM) {
-  return numRows * instrM;
-}
+bool isGemvMExtent(int64_t m) { return m == 1; }
 
 bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<BoolAttr> attr =
