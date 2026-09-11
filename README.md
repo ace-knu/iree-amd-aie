@@ -237,7 +237,44 @@ BERT를 IREE-AMD-AIE 백엔드(NPU)에서 이기종(CPU+NPU)으로 end-to-end �
 
 - BERT-tiny / BERT-base CPU+NPU 이기종 e2e 실행 (`models/bert_tiny/`, `models/bert_base/`)
 - batch matmul의 tile-multiple padding 누락 수정 (row-overflow 버그 근본 수정)
-- int8 batched matmul을 위한 iree submodule 업데이트 + batch-0 lock-pre-charge race 수정
+- int8 batched matmul에서 **batch 0 출력이 통째로 0**이 되던 문제 근본 수정
+  (objectFifo lock을 producer마다 하나씩 — 자세한 내용은 아래)
 - ONNX → dispatch 프론트엔드 lowering 과정 설명 문서 (`docs/2026-08-16_frontend_lowering_passes.md`)
 
 자세한 내용/알려진 한계는 각 모델 README 참고.
+
+### batch-0 all-zero 수정 (2026-09-11)
+
+AIE lock은 카운팅 세마포어라 `AcquireGreaterEqual(N)`이 "릴리즈가 N번 있었다"만 보장하고
+**누가 했는지는 담지 못합니다.** 독립적인 DMA producer 여럿이 한 버퍼의 겹치지 않는 구역을
+나눠 쓰고 consumer 하나가 전체를 꺼내가는 구조에서, lock 쌍을 하나만 두고 크레딧을
+`numProducers * depth`로 부풀리면 앞서 나간 producer의 릴리즈가 아직 아무것도 쓰지 않은
+producer의 몫까지 열어버립니다. consumer는 초기화되지 않은 구역(=0)을 그대로 실어가고,
+그 자리가 batch 0이면 **배치 하나가 통째로 0**이 됩니다.
+
+producer마다 lock 쌍을 주어 고쳤습니다. AIE2의 DMA BD는 acquire/release lock을 각각
+하나씩만 들 수 있으므로 consumer 전송을 producer 슬라이스별 BD로 분할하는 것이 함께
+따라오며, 분할이 원본과 같은 바이트를 같은 순서로 옮기는지는 컴파일 타임에 검사합니다.
+
+이전에 있던 우회책(코어마다 첫 lock release 앞 busy-wait)은 제거했습니다. 증상을 가리기만
+했고 규모가 커지면 스스로 오답을 만들었습니다 — 그 delay가 켜져 있으면 12층 attention의
+배치 matmul 12개가 **전부** 틀렸습니다(0.12~0.45, `col % 8 == 0`에 집중).
+
+검증: int8 모델 27개 · 320회 실행. 같은 양자화 ONNX를 onnxruntime(CPU)로 돌린 값 대비
+**26개가 비트 단위 일치**(max abs error 0), 전부 실행간 출력 1종. 나머지 1개(16층 체인)는
+결정론적이며 차이가 모두 출력 양자화 step의 정수배 = 반올림 tie.
+
+### ⚠️ int8 batched matmul을 쓰려면 별도 패치가 필요합니다
+
+torch-mlir에 `aten.bmm`의 int8 양자화 경로가 없습니다(2D `aten.mm`은 이미 있음). ONNX의
+배치 MatMul은 `aten.matmul`이 아니라 `aten.bmm`으로 임포트되므로 양자화가 조용히 건너뛰어집니다.
+커밋 1개(2개 파일, +66줄)로 해결되지만, 해당 서브모듈의 리모트가 우리 포크가 아니라 upstream
+`iree-org/torch-mlir`이라 푸쉬할 수 없어 **패치 파일로 따로 공유**합니다.
+
+`third_party/iree` 포인터는 `origin/vgg16-onnx`/`origin/dev`와 같은 공유 커밋을 가리키므로
+그대로 체크아웃됩니다. 위 두 컴파일러 수정은 플러그인 전용이라 서브모듈 리비전과 무관하게
+빌드됩니다.
+
+**알려진 한계**: per-channel(축별) 가중치 스케일은 아직 지원되지 않습니다
+(`linalg.quantized_matmul`이 zero-point를 스칼라로만 받아 표현 불가 → f32 폴백 후 백엔드에서
+컴파일 실패). 양자화는 per-tensor로 하십시오 (`quantize_static(..., per_channel=False)`, 기본값).
