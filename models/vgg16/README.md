@@ -70,7 +70,7 @@ build/tools/iree-run-module --device=amdxdna --device=local-task \
 The entry function name comes from the ONNX graph name; read it back with
 `grep -oE "func.func @[A-Za-z0-9_]+" /tmp/vgg.mlir | head -1`.
 
-Measured on npu4: compile ~127 s, run ~71 s, 79 dispatches, output `[1,1000]`
+Measured on npu4: compile ~125 s, run ~71 s, 66 dispatches, output `[1,1000]`
 correlates 0.999994 with a torch reference and the argmax matches (bf16
 demotion, see below, is why this isn't 1.00000 — see 3b). The dispatch count
 and compile time depend on defaults that have moved since this was first
