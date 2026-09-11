@@ -75,12 +75,20 @@ class AIEDeviceBuilder {
       ArrayRef<int64_t> sizes, ArrayRef<int64_t> strides);
 
   /// Utility to create DMA blocks and add them to `memOp`.
+  ///
+  /// `lockPairs` normally holds a single (acquire, release) lock pair. It holds
+  /// more than one only for the DMA that synchronizes against several
+  /// independent parties writing disjoint slices of the same buffers: an AIE2
+  /// BD carries exactly one acquire and one release lock, so this transfer is
+  /// split into one BD per slice, each using its own pair. See the comment on
+  /// lock-pair-per-producer in AMDAIEObjFifoBufferization.cpp for why a single
+  /// counting-semaphore pair cannot express that synchronization.
   LogicalResult createDMABlocks(
       Operation *memOp, AIE::DMAChannelDir channelDir, int channelIndex,
       ArrayRef<int64_t> sizes, ArrayRef<int64_t> strides, size_t acqNum,
       size_t relNum, int64_t offset,
       const SmallVector<AIE::BufferOp> &bufferOps,
-      const std::pair<AIE::LockOp, AIE::LockOp> &locks,
+      ArrayRef<std::pair<AIE::LockOp, AIE::LockOp>> lockPairs,
       std::optional<uint8_t> pktId);
 
   /// Utility to create flow ops from connection ops.
