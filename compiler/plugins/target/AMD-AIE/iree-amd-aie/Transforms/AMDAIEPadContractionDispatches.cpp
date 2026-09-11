@@ -629,6 +629,132 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   return dispatchOp.getResult(0);
 }
 
+/// Computes the `tensor.collapse_shape` reassociation that turns `srcShape`
+/// into the 2-D `dstShape`, or {} when the split does not fall on a dim
+/// boundary. Used to fold a producer's own N-D result into the 2-D matmul
+/// operand shape the `flow.tensor.reshape` between them was performing.
+static std::optional<SmallVector<ReassociationIndices>> collapseTo2D(
+    ArrayRef<int64_t> srcShape, ArrayRef<int64_t> dstShape) {
+  if (dstShape.size() != 2 || srcShape.size() < 2) return std::nullopt;
+  ReassociationIndices outer, inner;
+  int64_t acc = 1;
+  size_t i = 0;
+  // Every group must take at least one dim -- `acc == dstShape[0]` is already
+  // true before the first iteration when that extent is 1, and an empty
+  // reassociation group is not a legal collapse.
+  while (i < srcShape.size() && (outer.empty() || acc < dstShape[0])) {
+    acc *= srcShape[i];
+    outer.push_back(i++);
+  }
+  if (acc != dstShape[0] || i == srcShape.size()) return std::nullopt;
+  acc = 1;
+  for (; i < srcShape.size(); ++i) {
+    acc *= srcShape[i];
+    inner.push_back(i);
+  }
+  if (acc != dstShape[1] || inner.empty()) return std::nullopt;
+  return SmallVector<ReassociationIndices>{outer, inner};
+}
+
+/// Tries to make the host dispatch that *produces* `v` write the padded shape
+/// itself, instead of emitting a separate padding dispatch downstream of it.
+/// Returns the producer's (re-typed) result on success, or {} to fall back.
+///
+/// This is what removes the model's largest host write. A convolution's LHS is
+/// produced by the im2col dispatch and then padded, so the same 155 MiB is
+/// written, read back and written again one tile wider; growing the producer's
+/// own output binding and padding inside it makes that one write. The
+/// `tensor.pad` fuses into the producer generic -- it is a consumer of the
+/// dispatch's existing root, not a second root -- which is exactly why this
+/// shape compiles where "pad, then write the ones column with a second op"
+/// does not (see `createPaddingDispatch`'s `onesPad` comment).
+///
+/// Deliberately narrow. The producer must be a host dispatch with one caller,
+/// one result, one use, and a single full-tensor store, so that nothing else
+/// can observe the shape change; anything else falls back to a standalone
+/// padding dispatch, which is always correct, just slower.
+static Value growProducerDispatchToPadded(
+    IRRewriter &rewriter, ModuleOp module, Value v, ArrayRef<int64_t> dstShape,
+    bool onesPad, IREE::HAL::DeviceAffinityAttr hostAffinity) {
+  auto srcType = cast<RankedTensorType>(v.getType());
+  Type elemType = srcType.getElementType();
+  if (!isa<FloatType>(elemType)) return {};
+  if (srcType.getRank() != 2 || dstShape.size() != 2) return {};
+  // Nothing to fold in: this operand is already the padded shape (only the
+  // other operand's dims grew). Rewriting the producer anyway would flatten
+  // its output binding for no reason.
+  if (dstShape == srcType.getShape()) return {};
+
+  // v = [flow.tensor.reshape of] the producer dispatch's single result.
+  auto reshapeOp = v.getDefiningOp<IREE::Flow::TensorReshapeOp>();
+  Value produced = reshapeOp ? reshapeOp.getSource() : v;
+  if (reshapeOp && !reshapeOp.getResult().hasOneUse()) return {};
+  auto producer = produced.getDefiningOp<IREE::Flow::DispatchOp>();
+  if (!producer || producer->getNumResults() != 1) return {};
+  if (!producer.getResult(0).hasOneUse()) return {};
+  if (producer->getAttr("stream.affinity") != hostAffinity) return {};
+
+  func::FuncOp func = getDispatchFunc(producer, module);
+  if (!func) return {};
+  // One caller only: the rewrite changes the executable's signature, so a
+  // second caller would be left passing the old shape.
+  int callers = 0;
+  module.walk([&](IREE::Flow::DispatchOp d) {
+    if (getDispatchFunc(d, module) == func) ++callers;
+  });
+  if (callers != 1) return {};
+
+  SmallVector<IREE::TensorExt::DispatchTensorStoreOp> stores;
+  func.walk(
+      [&](IREE::TensorExt::DispatchTensorStoreOp s) { stores.push_back(s); });
+  if (stores.size() != 1) return {};
+  IREE::TensorExt::DispatchTensorStoreOp store = stores.front();
+  auto outArg = dyn_cast<BlockArgument>(store.getTarget());
+  if (!outArg) return {};
+  auto outType = dyn_cast<IREE::TensorExt::DispatchTensorType>(outArg.getType());
+  if (!outType || outType.getAccess() != IREE::TensorExt::TensorAccess::WriteOnly)
+    return {};
+  for (OpFoldResult o : store.getMixedOffsets())
+    if (!isConstantIntValue(o, 0)) return {};
+  for (OpFoldResult s : store.getMixedStrides())
+    if (!isConstantIntValue(s, 1)) return {};
+  auto storedType = dyn_cast<RankedTensorType>(store.getValue().getType());
+  if (!storedType || storedType.getElementType() != elemType) return {};
+  if (storedType.getShape() != outType.asRankedTensorType().getShape())
+    return {};
+
+  // The reshape this absorbs has to be expressible as a collapse of the
+  // producer's own result dims.
+  std::optional<SmallVector<ReassociationIndices>> reassoc =
+      collapseTo2D(storedType.getShape(), srcType.getShape());
+  if (!reassoc) return {};
+
+  auto dstType = RankedTensorType::get(dstShape, elemType);
+  Location loc = store.getLoc();
+  rewriter.setInsertionPoint(store);
+  Value flat = storedType.getRank() == 2
+                   ? store.getValue()
+                   : rewriter.create<tensor::CollapseShapeOp>(
+                         loc, store.getValue(), *reassoc).getResult();
+  Value padScalar = rewriter.create<arith::ConstantOp>(
+      loc, onesPad ? cast<TypedAttr>(rewriter.getFloatAttr(elemType, 1.0))
+                   : cast<TypedAttr>(rewriter.getZeroAttr(elemType)));
+  Value padded = tensor::createPadHighOp(dstType, flat, padScalar,
+                                         /*nofold=*/false, loc, rewriter);
+  outArg.setType(IREE::TensorExt::DispatchTensorType::get(
+      IREE::TensorExt::TensorAccess::WriteOnly, dstType));
+  rewriter.create<IREE::TensorExt::DispatchTensorStoreOp>(
+      loc, padded, outArg, /*targetDynamicDims=*/ValueRange{});
+  rewriter.eraseOp(store);
+  SmallVector<Type> argTypes(llvm::map_range(
+      func.getArguments(), [](BlockArgument a) { return a.getType(); }));
+  func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
+
+  producer.getResult(0).setType(dstType);
+  if (reshapeOp) rewriter.replaceOp(reshapeOp, producer.getResult(0));
+  return producer.getResult(0);
+}
+
 /// Zero-pads the raw contents of `srcAttr` -- read as a 2-D row-major
 /// `srcType`, which is what a matmul operand is by the time it gets here --
 /// up to `dstType`. Returns {} when the attribute is not in a form this can
@@ -1235,14 +1361,24 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // constant here instead of costing a dispatch on every inference; the
     // activation LHS is a runtime value and keeps its dispatch.
     rewriter.setInsertionPoint(dispatch);
-    Value lhsPadded =
-        biasAttr ? createPaddingDispatch(
-                       rewriter, module, dispatch.getArguments()[lhsArgNo],
-                       lhsPad, hostAffinity, counter, /*padValue=*/nullptr,
-                       /*onesPad=*/true)
-                 : createPaddingDispatchOrConstant(
-                       rewriter, module, dispatch.getArguments()[lhsArgNo],
-                       lhsPad, hostAffinity, counter);
+    // Prefer growing the LHS's own producer dispatch over adding a padding
+    // dispatch behind it: for a convolution that turns im2col's 155 MiB
+    // write + read + wider re-write into a single write.
+    Value lhsPadded = growProducerDispatchToPadded(
+        rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
+        /*onesPad=*/biasAttr != nullptr, hostAffinity);
+    if (!lhsPadded) {
+      rewriter.setInsertionPoint(dispatch);
+      lhsPadded =
+          biasAttr ? createPaddingDispatch(
+                         rewriter, module, dispatch.getArguments()[lhsArgNo],
+                         lhsPad, hostAffinity, counter, /*padValue=*/nullptr,
+                         /*onesPad=*/true)
+                   : createPaddingDispatchOrConstant(
+                         rewriter, module, dispatch.getArguments()[lhsArgNo],
+                         lhsPad, hostAffinity, counter);
+    }
+    rewriter.setInsertionPoint(dispatch);
     Value rhsPadded =
         biasAttr ? createBiasFoldedWeightGlobal(
                        rewriter, module, dispatch.getArguments()[rhsArgNo],
