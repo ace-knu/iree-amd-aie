@@ -89,9 +89,10 @@ LogicalResult AIEDeviceBuilder::createDMABlocks(
     Operation *memOp, AIE::DMAChannelDir channelDir, int channelIndex,
     ArrayRef<int64_t> sizes, ArrayRef<int64_t> strides, size_t acqNum,
     size_t relNum, int64_t offset, const SmallVector<AIE::BufferOp> &bufferOps,
-    const std::pair<AIE::LockOp, AIE::LockOp> &locks,
+    ArrayRef<std::pair<AIE::LockOp, AIE::LockOp>> lockPairs,
     std::optional<uint8_t> pktId) {
   OpBuilder::InsertionGuard g(rewriter);
+  assert(!lockPairs.empty() && "expected at least one lock pair");
 
   Block &endBlock = memOp->getRegion(0).getBlocks().back();
   assert(!endBlock.getOps<AIE::EndOp>().empty() &&
@@ -110,8 +111,9 @@ LogicalResult AIEDeviceBuilder::createDMABlocks(
   auto createDMAOps = [&](Block *succ, AIE::BufferOp buff,
                           AIE::BDDimLayoutArrayAttr dims, bool shouldAcqLock,
                           bool shouldRelLock, int64_t transferLength,
-                          int64_t offset) {
-    AIE::LockOp acqLock = locks.first, relLock = locks.second;
+                          int64_t offset, size_t lockPairIndex) {
+    AIE::LockOp acqLock = lockPairs[lockPairIndex].first,
+                relLock = lockPairs[lockPairIndex].second;
     if (shouldAcqLock) {
       rewriter.create<AIE::UseLockOp>(rewriter.getUnknownLoc(), acqLock,
                                       AIE::LockAction::AcquireGreaterEqual,
@@ -165,6 +167,63 @@ LogicalResult AIEDeviceBuilder::createDMABlocks(
   for (int64_t i = indexRange.size() - 2; i >= 0; i--)
     cartesianDivisors[i] = cartesianDivisors[i + 1] * sizes[i + 1];
 
+  // With more than one lock pair, this transfer synchronizes against several
+  // independent parties, each owning one slice of the buffer. Emit one BD per
+  // slice so each can acquire/release that party's own lock pair.
+  size_t numLockPairs = lockPairs.size();
+  int64_t sliceLength = transferLength;
+  int64_t sliceStride = 0;
+  AIE::BDDimLayoutArrayAttr sliceDims = dims;
+  if (numLockPairs > 1) {
+    int64_t numParties = static_cast<int64_t>(numLockPairs);
+    if (numIters != 1) {
+      return memOp->emitOpError()
+             << "cannot split a repeated DMA transfer into per-party BDs, "
+                "needed to synchronize against "
+             << numParties << " parties";
+    }
+    if (transferLength % numParties != 0) {
+      return memOp->emitOpError()
+             << "DMA transfer length " << transferLength
+             << " is not divisible by the number of synchronizing parties "
+             << numParties;
+    }
+    sliceLength = transferLength / numParties;
+    ArrayRef<AIE::BDDimLayoutAttr> dimValues = dims.getValue();
+    if (dimValues.empty()) {
+      // Plain contiguous transfer: slice `i` is just [i * sliceLength, +len).
+      sliceStride = sliceLength;
+    } else if (static_cast<int64_t>(dimValues.front().getSize()) == numParties &&
+               static_cast<int64_t>(dimValues.front().getStride()) ==
+                   sliceLength) {
+      // The outermost dimension *is* the party dimension (one iteration of it
+      // per party, stepping exactly one slice). Peel it off: every party's BD
+      // keeps the inner access pattern, based at its own slice.
+      sliceStride = sliceLength;
+      ArrayRef<AIE::BDDimLayoutAttr> innerDims = dimValues.drop_front();
+      // A single innermost contiguous dimension is expressed as *empty* dims,
+      // matching `convertSizeStrideToBDDimLayoutArrayAttr`.
+      if (innerDims.size() == 1 && innerDims.front().getStride() == 1) {
+        sliceDims = AIE::BDDimLayoutArrayAttr::get(
+            rewriter.getContext(), ArrayRef<AIE::BDDimLayoutAttr>{});
+      } else {
+        sliceDims =
+            AIE::BDDimLayoutArrayAttr::get(rewriter.getContext(), innerDims);
+      }
+    } else {
+      return memOp->emitOpError()
+             << "cannot split this DMA access pattern into per-party BDs: its "
+                "outermost dimension (size "
+             << dimValues.front().getSize() << ", stride "
+             << dimValues.front().getStride() << ") is not "
+             << numParties << " steps of one " << sliceLength
+             << "-element slice, needed to synchronize against " << numParties
+             << " parties";
+    }
+    assert(acqNum == 1 && relNum == 1 &&
+           "each per-party BD acquires and releases its own lock pair once");
+  }
+
   // Create blocks with DMA ops.
   Block *succ = nullptr, *curr = bdBlock;
   for (size_t blockIndex = 0; blockIndex < bufferOps.size(); ++blockIndex) {
@@ -177,18 +236,24 @@ LogicalResult AIEDeviceBuilder::createDMABlocks(
       bool isFirst = llvm::all_of(indices, [](int64_t v) { return v == 0; });
       bool isLast = llvm::all_of(
           indexRange, [&](size_t i) { return indices[i] == (sizes[i] - 1); });
-      if (blockIndex == bufferOps.size() - 1 && isLast) {
-        succ = bdBlock;
-      } else {
-        succ = rewriter.createBlock(&endBlock);
-      }
-      rewriter.setInsertionPointToStart(curr);
       int64_t addOffset = 0;
       for (size_t i = 0; i < indexRange.size(); i++)
         addOffset += (indices[i] * strides[i]);
-      createDMAOps(succ, bufferOps[blockIndex], dims, isFirst, isLast,
-                   transferLength, offset + addOffset);
-      curr = succ;
+      for (size_t pair = 0; pair < numLockPairs; ++pair) {
+        if (blockIndex == bufferOps.size() - 1 && isLast &&
+            pair == numLockPairs - 1) {
+          succ = bdBlock;
+        } else {
+          succ = rewriter.createBlock(&endBlock);
+        }
+        rewriter.setInsertionPointToStart(curr);
+        createDMAOps(
+            succ, bufferOps[blockIndex], sliceDims, isFirst, isLast,
+            sliceLength,
+            offset + addOffset + static_cast<int64_t>(pair) * sliceStride,
+            pair);
+        curr = succ;
+      }
     }
   }
   return success();
@@ -463,6 +528,97 @@ LogicalResult AIEDeviceBuilder::bufferToAIE(AMDAIE::BufferOp bufferOp,
   return success();
 }
 
+/// Collect, in increasing order, the distinct base offsets that the provided
+/// producers of a logical objFifo write to. Every producer of a multi-producer
+/// objFifo owns one disjoint slice of the buffers, and the offset it writes is
+/// what identifies that slice.
+static FailureOr<SmallVector<size_t>> getSortedProducerOffsets(
+    Operation *objFifoOp, ArrayRef<CopyOpInterface> producers) {
+  SmallVector<size_t> offsets;
+  for (CopyOpInterface producer : producers) {
+    auto producerConnectionOp =
+        dyn_cast<AMDAIE::ConnectionOp>(producer.getOperation());
+    if (!producerConnectionOp) {
+      return objFifoOp->emitOpError()
+             << "has a producer that is not an `amdaie.connection` op, so the "
+                "buffer slice it owns can't be identified";
+    }
+    FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> producerDmaOp =
+        producerConnectionOp.getNpuCircularDmaCpyNdUser();
+    if (failed(producerDmaOp)) {
+      return objFifoOp->emitOpError()
+             << "has a producer connection without a circular NPU DMA op user";
+    }
+    std::optional<size_t> producerOffset =
+        producerDmaOp->getTargetStaticBaseOffset();
+    if (!producerOffset) {
+      return objFifoOp->emitOpError()
+             << "has a producer without a static target base offset";
+    }
+    offsets.push_back(producerOffset.value());
+  }
+  llvm::sort(offsets);
+  offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+  if (offsets.size() != producers.size()) {
+    return objFifoOp->emitOpError()
+           << "has " << producers.size() << " producers writing only "
+           << offsets.size()
+           << " distinct base offsets, so they don't own disjoint slices";
+  }
+  return offsets;
+}
+
+/// Rank of `offset` among the distinct base offsets written by `producers`.
+/// This is the index of the lock pair that the producer writing `offset` owns.
+static FailureOr<size_t> getProducerSliceIndex(
+    Operation *objFifoOp, ArrayRef<CopyOpInterface> producers, size_t offset) {
+  FailureOr<SmallVector<size_t>> offsets =
+      getSortedProducerOffsets(objFifoOp, producers);
+  if (failed(offsets)) return failure();
+  auto it = llvm::find(offsets.value(), offset);
+  if (it == offsets.value().end()) {
+    return objFifoOp->emitOpError()
+           << "has a producer writing base offset " << offset
+           << ", which is not among the offsets of its producers";
+  }
+  return static_cast<size_t>(std::distance(offsets.value().begin(), it));
+}
+
+/// Verify that the producers of a multi-producer objFifo exactly tile the
+/// single consumer's transfer: their base offsets have to be
+/// `consumerOffset + i * sliceLength` in increasing order. Only then does
+/// splitting that transfer into one BD per producer (see `createDMABlocks`)
+/// move the same bytes in the same order as the unsplit transfer did.
+static LogicalResult verifyProducersTileBufferInOrder(
+    Operation *objFifoOp, ArrayRef<CopyOpInterface> producers,
+    size_t consumerOffset, ArrayRef<int64_t> consumerSizes) {
+  FailureOr<SmallVector<size_t>> offsets =
+      getSortedProducerOffsets(objFifoOp, producers);
+  if (failed(offsets)) return failure();
+  int64_t totalLength =
+      std::accumulate(consumerSizes.begin(), consumerSizes.end(), int64_t{1},
+                      std::multiplies<>());
+  int64_t numProducers = static_cast<int64_t>(producers.size());
+  if (numProducers == 0 || totalLength % numProducers != 0) {
+    return objFifoOp->emitOpError()
+           << "consumer transfer length " << totalLength
+           << " is not divisible by its " << numProducers << " producers";
+  }
+  size_t sliceLength = static_cast<size_t>(totalLength / numProducers);
+  for (auto [i, producerOffset] : llvm::enumerate(offsets.value())) {
+    size_t expectedOffset = consumerOffset + i * sliceLength;
+    if (producerOffset != expectedOffset) {
+      return objFifoOp->emitOpError()
+             << "producer " << i << " writes base offset " << producerOffset
+             << " but the consumer's slice " << i << " starts at "
+             << expectedOffset
+             << "; the producers have to tile the consumer's transfer "
+                "contiguously and in order";
+    }
+  }
+  return success();
+}
+
 /// Convert the `amdaie.connection` operation into DMA operations. Depending on
 /// the location of the source/target of the connection, different DMA ops are
 /// created:
@@ -590,18 +746,16 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
           [&](AMDAIE::LockOp lockOp) {
             return cast<AIE::LockOp>(mapper.lookup(lockOp.getOperation()));
           });
-      if (producerLocks.size() != 1) {
+      if (producerLocks.size() != consumerLocks.size()) {
         return sourceObjFifo.emitOpError()
-               << "expected a single producer lock for tile: "
+               << "expected as many producer as consumer locks for tile: "
                << channel.getTile() << ", channel: " << channel.getResult();
       }
-      if (consumerLocks.size() != 1) {
+      if (producerLocks.empty()) {
         return sourceObjFifo.emitOpError()
-               << "expected a single consumer lock for tile: "
+               << "expected at least one lock pair for tile: "
                << channel.getTile() << ", channel: " << channel.getResult();
       }
-      std::pair<AIE::LockOp, AIE::LockOp> lockPair =
-          std::make_pair(consumerLocks[0], producerLocks[0]);
       SmallVector<int64_t> canonicalizedSizes, canonicalizedStrides;
       if (failed(foldDimsAndReturnAsStatic(
               rewriter, deviceModel, maybeNpuDmaUserOp->getSourceMixedSizes(),
@@ -611,12 +765,39 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
               [&]() { return maybeNpuDmaUserOp->emitOpError(); }))) {
         return failure();
       };
+      // A multi-producer objFifo hands out one lock pair per producer (see
+      // AMDAIEObjFifoBufferization.cpp). This DMA is its single consumer, so it
+      // has to synchronize against each producer separately: pass every pair
+      // and let `createDMABlocks` emit one BD per producer slice, acquiring and
+      // releasing that producer's own pair once.
+      SmallVector<std::pair<AIE::LockOp, AIE::LockOp>> lockPairs;
+      size_t channelAcqNum = acqNum;
+      if (producerLocks.size() > 1) {
+        if (producerLocks.size() != static_cast<size_t>(acqNum)) {
+          return sourceObjFifo.emitOpError()
+                 << "has " << producerLocks.size()
+                 << " lock pairs but synchronizes against " << acqNum
+                 << " producers";
+        }
+        if (failed(verifyProducersTileBufferInOrder(
+                sourceObjFifo, objFifoProducers, maybeOffset.value(),
+                canonicalizedSizes))) {
+          return failure();
+        }
+        for (auto [consumerLock, producerLock] :
+             llvm::zip_equal(consumerLocks, producerLocks))
+          lockPairs.emplace_back(consumerLock, producerLock);
+        channelAcqNum = 1;
+      } else {
+        lockPairs.emplace_back(consumerLocks[0], producerLocks[0]);
+      }
       rewriter.moveOpBefore(memOp, deviceBlock,
                             deviceBlock->without_terminator().end());
       if (failed(createDMABlocks(
               memOp, AIE::DMAChannelDir::MM2S, channel.getValue(),
-              canonicalizedSizes, canonicalizedStrides, acqNum, acqNum,
-              maybeOffset.value(), buffers, lockPair, packetId))) {
+              canonicalizedSizes, canonicalizedStrides, channelAcqNum,
+              channelAcqNum, maybeOffset.value(), buffers, lockPairs,
+              packetId))) {
         return sourceObjFifo.emitOpError() << "could not create DMA operations";
       }
     }
@@ -695,18 +876,36 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
           [&](AMDAIE::LockOp lockOp) {
             return cast<AIE::LockOp>(mapper.lookup(lockOp.getOperation()));
           });
-      if (producerLocks.size() != 1) {
+      if (producerLocks.size() != consumerLocks.size()) {
         return targetObjFifo.emitOpError()
-               << "expected a single producer lock for tile: "
+               << "expected as many producer as consumer locks for tile: "
                << channel.getTile();
       }
-      if (consumerLocks.size() != 1) {
+      if (producerLocks.empty()) {
         return targetObjFifo.emitOpError()
-               << "expected a single consumer lock for tile: "
+               << "expected at least one lock pair for tile: "
                << channel.getTile();
       }
-      std::pair<AIE::LockOp, AIE::LockOp> lockPair =
-          std::make_pair(producerLocks[0], consumerLocks[0]);
+      // A multi-producer objFifo hands out one lock pair per producer. This DMA
+      // is one of those producers, so it has to pick its own pair -- and pick
+      // the same one the single consumer will wait on for this slice. The
+      // consumer reads the slices back in increasing buffer-offset order, so
+      // the pair is identified by the rank of the offset this producer writes.
+      size_t lockPairIndex = 0;
+      if (producerLocks.size() > 1) {
+        FailureOr<size_t> maybeIndex = getProducerSliceIndex(
+            targetObjFifo, objFifoProducers, maybeOffset.value());
+        if (failed(maybeIndex)) return failure();
+        lockPairIndex = maybeIndex.value();
+        if (lockPairIndex >= producerLocks.size()) {
+          return targetObjFifo.emitOpError()
+                 << "producer slice index " << lockPairIndex
+                 << " is out of range for " << producerLocks.size()
+                 << " lock pairs";
+        }
+      }
+      SmallVector<std::pair<AIE::LockOp, AIE::LockOp>> lockPairs{
+          {producerLocks[lockPairIndex], consumerLocks[lockPairIndex]}};
       SmallVector<int64_t> canonicalizedSizes, canonicalizedStrides;
       if (failed(foldDimsAndReturnAsStatic(
               rewriter, deviceModel, maybeNpuDmaUserOp->getTargetMixedSizes(),
@@ -721,7 +920,7 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
       if (failed(createDMABlocks(
               memOp, AIE::DMAChannelDir::S2MM, channel.getValue(),
               canonicalizedSizes, canonicalizedStrides, acqNum, acqNum,
-              maybeOffset.value(), buffers, lockPair, packetId))) {
+              maybeOffset.value(), buffers, lockPairs, packetId))) {
         return targetObjFifo.emitOpError() << "could not create DMA operations";
       }
     }
