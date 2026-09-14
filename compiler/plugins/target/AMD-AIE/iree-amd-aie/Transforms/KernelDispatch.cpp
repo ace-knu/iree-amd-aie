@@ -544,9 +544,10 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 // Configuration for the GEMV Pipeline
 //===----------------------------------------------------------------------===//
 
-/// Outputs per core along N. A vector-width multiple so a later matvec ukernel
-/// can block along N; the scalar path has no constraint.
-constexpr int64_t kGemvNTilePerCore = 32;
+/// Preferred multiple of the per-core N tile: the N width of the bf16 vector
+/// MAC (`mac_8x8_8x8T`), so a later matvec ukernel can block along N without a
+/// remainder. The scalar path has no constraint; this only breaks ties.
+constexpr int64_t kGemvNVectorMultiple = 8;
 /// K elements streamed through L1 per step. 8x pack-peel's 32: 1/8 the DMA
 /// programmings and, for bf16, 512 B contiguous DRAM runs instead of 64 B.
 constexpr int64_t kGemvKTile = 256;
@@ -601,26 +602,54 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t nBytesRhs = bytesOf(linalgOp.getDpsInputOperand(1)->get());
   int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
 
-  // Per-core N tile, then the L0 N block: as many cores as N has factors for,
-  // ideally all of them (numRows * numCols * n1Tile).
-  int64_t numCores = static_cast<int64_t>(numRows) * numCols;
-  int64_t n1Tile = findLargestFactor(N, kGemvNTilePerCore);
-  int64_t n0Tile = findLargestFactor(N, numCores * n1Tile, n1Tile);
-
-  // K tile: shrink from the default until the double-buffered A, B and C tiles
-  // fit in core memory (M is small but not necessarily 1).
-  int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
-  auto l1Bytes = [&](int64_t k) {
-    return 2 * (M * k * nBytesLhs + n1Tile * k * nBytesRhs +
-                M * n1Tile * nBytesOut);
-  };
+  // K tile, and the core memory taken by double-buffered A, B and C tiles for
+  // a given per-core N tile.
   int64_t kTile = findLargestFactor(K, kGemvKTile);
-  while (kTile > 1 && l1Bytes(kTile) > l1Limit)
-    kTile = findLargestFactor(K, kTile / 2);
-  if (l1Bytes(kTile) > l1Limit) {
+  int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
+  auto l1Bytes = [&](int64_t n1) {
+    return 2 * (M * kTile * nBytesLhs + n1 * kTile * nBytesRhs +
+                M * n1 * nBytesOut);
+  };
+
+  // Per-core N tile and L0 N block. The core code is compute bound, so the
+  // time scales with the number of cores a block puts to work: over the
+  // divisors of N that fit in core memory, take the tile whose block covers
+  // the most cores; break ties toward a vector-width multiple, then toward the
+  // largest tile (fewest blocks). A block must fill whole columns (or stay in
+  // one): SplitLogicalObjFifos splits the L2 weight block gcd(cores, columns
+  // used) ways, so only then does every memtile feed exactly one column (with
+  // 25 cores over 7 columns the block is not split at all and overflows a
+  // memtile). With whole columns the per-memtile share is numRows * the L1
+  // weight tile, which is far below memtile capacity. N=4096: 32 x 32 cores.
+  // N=1000 (fc3): no divisor reaches 32 or 24 cores, so 50 x 20 cores in one
+  // block (32 cores would need N padding, which this pipeline avoids).
+  int64_t numCores = static_cast<int64_t>(numRows) * numCols;
+  int64_t n1Tile = 0, n0Tile = 0, bestCores = 0;
+  for (int64_t n1 = 1; n1 <= N && l1Bytes(n1) <= l1Limit; ++n1) {
+    if (N % n1 != 0) continue;
+    int64_t cores = 0;
+    for (int64_t c = numCores; c >= 1; --c) {
+      if (N % (c * n1) != 0 || (c > numRows && c % numRows != 0)) continue;
+      cores = c;
+      break;
+    }
+    int64_t n0 = cores * n1;
+    bool isVectorMultiple = n1 % kGemvNVectorMultiple == 0;
+    bool bestIsVectorMultiple =
+        n1Tile != 0 && n1Tile % kGemvNVectorMultiple == 0;
+    if (cores > bestCores ||
+        (cores == bestCores && isVectorMultiple > bestIsVectorMultiple) ||
+        (cores == bestCores && isVectorMultiple == bestIsVectorMultiple &&
+         n1 > n1Tile)) {
+      n1Tile = n1;
+      n0Tile = n0;
+      bestCores = cores;
+    }
+  }
+  if (n1Tile == 0) {
     return linalgOp.emitOpError("GEMV tiles (M=")
-           << M << ", n1=" << n1Tile << ", k=" << kTile
-           << ") do not fit in core memory (" << l1Limit << " bytes).";
+           << M << ", n1=1, k=" << kTile << ") do not fit in core memory ("
+           << l1Limit << " bytes).";
   }
 
   unsigned numLoops = linalgOp.getNumLoops();

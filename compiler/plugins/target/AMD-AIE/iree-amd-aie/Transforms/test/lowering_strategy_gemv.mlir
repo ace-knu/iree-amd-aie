@@ -42,10 +42,12 @@ module {
 
 // -----
 
-// N=1000 (fc3, unpadded): 1000 has no factor of 32, so 25 outputs per core and
-// an L0 block of 500 = 20 cores. No padding is required by this pipeline.
+// N=1000 (fc3, unpadded): no divisor of 1000 spreads it over 32 (or 24) cores
+// in whole columns, so the tile reaching the most cores is picked, largest
+// first: 50 outputs per core x 20 cores (5 columns) in one L0 block of 1000.
+// No padding is required by this pipeline.
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
-// CHECK-SAME:      [0, 500, 0], [0, 0, 256], [0, 25, 0]
+// CHECK-SAME:      [0, 1000, 0], [0, 0, 256], [0, 50, 0]
 // CHECK-SAME:  ]>
 // CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "gemv"}>
 // CHECK-NOT:   packing_config
@@ -143,9 +145,10 @@ module {
 
 // The GEMV predicate is M == 1 regardless of element type, so f32 M=1 (npu4 has
 // no f32 matmul vector instruction; pack-peel used to abort on it) is GEMV too.
-// 4-byte operands halve the K tile: 2*(256*4 + 32*256*4 + 32*4) = 66.25 KB > 64 KB.
+// 4-byte operands halve the N tile (the K tile stays 256): n1=32 needs
+// 2*(256*4 + 32*256*4 + 32*4) = 66.25 KB > 64 KB, n1=16 still covers 32 cores.
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
-// CHECK-SAME:      [0, 1024, 0], [0, 0, 128], [0, 32, 0]
+// CHECK-SAME:      [0, 512, 0], [0, 0, 256], [0, 16, 0]
 // CHECK-SAME:  ]>
 // CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "gemv"}>
 // CHECK-NOT:   packing_config
