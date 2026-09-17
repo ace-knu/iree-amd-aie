@@ -204,3 +204,25 @@ upstream `iree-org/torch-mlir` 이라 푸쉬할 수 없어 **패치 파일로 �
   2개인데 bias 같은 3번째 텐서가 필요해지면 `packet-flow-strategy=inputs` 가 강제되고,
   그것이 fan-out + 공유 lock + ping-pong 패턴을 만들어 하드웨어에서 행(hang)합니다.
 - **공유 호스트용 NPU/빌드 락 스크립트** (`scripts/lock/`) — 각자 관리.
+
+---
+
+## 5. (2026-09-17 추가) attention 작업을 재현하려면 — IREE 쪽 패치 하나 더
+
+서브모듈 포인터는 §3 그대로 `c73928f` 를 유지합니다. 다만 K축 bias 접합
+(`bb_kpadq`)과 attention 의 융합 `transpose_b` 구성을 **문서에 적힌 대로 재현하려면**
+IREE 본체에 7줄짜리 수정이 하나 더 필요합니다.
+
+`GlobalOptimization/DetachElementwiseFromNamedOps.cpp` 의 "이미 처리됨" 건너뛰기가
+`linalg.fill` 로 초기화된 accumulator 만 제외합니다. 그래서 `linalg.broadcast` 로
+초기화된 것 — AMD-AIE 의 `AMDAIEFoldBroadcastAddIntoDestPass` 가 broadcast 된 bias 를
+contraction 자체의 accumulator 로 접는 방식 — 은 항상 zero-fill + add 로 다시
+분리되고, 그 접합 패스가 9 패스 뒤에 조용히 무효가 됩니다.
+
+§4 와 같은 이유(해당 커밋이 `ace-knu/iree` 에 없음)로 포인터 대신 패치로 드립니다:
+`0002-iree-detach-elementwise-broadcast-init.patch`, 적용 위치는 `third_party/iree`.
+`c73928f` 위에 깨끗이 붙는 것을 확인했습니다. 두 패치의 적용법은 같이 드리는
+`README_third_party_patches.md` 참고.
+
+이 패치 없이도 플러그인은 빌드되고 대부분의 디스패치는 동작하지만, bias 가 접히지
+않은 구성이 되므로 산출물 MD5 는 달라집니다.
