@@ -82,7 +82,13 @@ void AMDAIELowerExecutableTargetPass::runOnOperation() {
     case IREE::Codegen::DispatchLoweringPassPipeline::None:
       return;
     case IREE::Codegen::DispatchLoweringPassPipeline::Custom: {
-      if (useTilePipeline == TilePassPipeline::PackPeelPipeline) {
+      // Softmax has only a copy-based lowering. Other dispatches in the same
+      // module continue to use the selected matmul pipeline.
+      if (isa<linalg::SoftmaxOp>(getRootOp(funcOp))) {
+        addGeneralCopyPassPipeline(executableLoweringPipeline,
+                                   TilePassPipeline::GeneralCopyPipeline,
+                                   getRootOp(funcOp));
+      } else if (useTilePipeline == TilePassPipeline::PackPeelPipeline) {
         addPackPeelBasedPassPipeline(executableLoweringPipeline,
                                      TilePassPipeline::PackPeelPipeline);
       } else if (useTilePipeline ==

@@ -76,14 +76,27 @@ struct AMDAIESession
     // phase). The topology's symbol references keep the CPU device global
     // alive through SymbolDCE. No dispatches exist yet, so no affinity is set
     // here. No-op unless both an amd-aie and an llvm-cpu device are declared.
-    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
+    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(
+        softmaxUkernelEnabled()));
+  }
+
+
+  /// Whether the softmax microkernel is enabled. `--iree-amdaie-enable-ukernels`
+  /// takes `none`, `all`, or a comma-separated list.
+  bool softmaxUkernelEnabled() const {
+    StringRef list(options.enableAMDAIEUkernels);
+    if (list == "all") return true;
+    SmallVector<StringRef> names;
+    list.split(names, ',');
+    return llvm::is_contained(names, "softmax");
   }
 
   void extendFlowTransformPassPipeline(OpPassManager &passManager) override {
     // Heterogeneous placement: pin contraction/conv dispatches to the amd-aie
     // (NPU) device and everything else (transposes, casts) to the CPU device.
     // No-op unless both an amd-aie and an llvm-cpu device are declared.
-    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
+    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(
+        softmaxUkernelEnabled()));
     // With affinity known per-dispatch, pad NPU contraction operands up to the
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.

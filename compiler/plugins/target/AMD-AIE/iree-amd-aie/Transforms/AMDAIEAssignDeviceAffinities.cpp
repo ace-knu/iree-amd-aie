@@ -26,6 +26,7 @@
 // multiple same-role devices currently uses the first one (see policy TODO).
 
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIESoftmaxUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
@@ -111,10 +112,25 @@ static bool executableIsContractionOrConv(IREE::Flow::ExecutableOp exe) {
   return found;
 }
 
+/// Whether the executable is nothing but a quantized softmax, which amd-aie
+/// can run only because there is a microkernel for exactly that shape. Unlike
+/// the contraction predicate above this is deliberately whole-executable and
+/// exact: a softmax with anything else fused alongside it has no lowering, so
+/// letting it through would place a dispatch the backend then fails on.
+static bool executableIsQuantizedSoftmax(IREE::Flow::ExecutableOp exe) {
+  ModuleOp innerModule = exe.getInnerModule();
+  if (!innerModule) return false;
+  return isQuantizedSoftmaxOnly(innerModule);
+}
+
 class AMDAIEAssignDeviceAffinitiesPass
     : public impl::AMDAIEAssignDeviceAffinitiesBase<
           AMDAIEAssignDeviceAffinitiesPass> {
  public:
+  AMDAIEAssignDeviceAffinitiesPass() = default;
+  explicit AMDAIEAssignDeviceAffinitiesPass(bool enableSoftmaxUkernel) {
+    this->enableSoftmaxUkernel = enableSoftmaxUkernel;
+  }
   void runOnOperation() override;
 };
 
@@ -159,7 +175,9 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   // affinity onto accelerator work (it minimizes transfers otherwise).
   DenseMap<StringRef, bool> executableIsAccel;
   for (auto exe : moduleOp.getOps<IREE::Flow::ExecutableOp>())
-    executableIsAccel[exe.getSymName()] = executableIsContractionOrConv(exe);
+    executableIsAccel[exe.getSymName()] =
+        executableIsContractionOrConv(exe) ||
+        (enableSoftmaxUkernel && executableIsQuantizedSoftmax(exe));
   moduleOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
     bool onAccel = false;
     for (SymbolRefAttr entryPoint : dispatchOp.getEntryPointRefs()) {
@@ -198,8 +216,10 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
 
 }  // namespace
 
-std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass() {
-  return std::make_unique<AMDAIEAssignDeviceAffinitiesPass>();
+std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass(
+    bool enableSoftmaxUkernel) {
+  return std::make_unique<AMDAIEAssignDeviceAffinitiesPass>(
+      enableSoftmaxUkernel);
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

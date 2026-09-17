@@ -85,6 +85,13 @@ def AMDAIEAssignDeviceAffinities :
   let summary = "Pin each flow.dispatch to a device (contraction/conv -> NPU, else -> CPU) for heterogeneous CPU+NPU execution.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
+    let options = [
+      Option<"enableSoftmaxUkernel", "enable-softmax-ukernel", "bool",
+             /*default=*/"false",
+             "Also place a dispatch that is nothing but a quantized softmax on "
+             "the accelerator. Only correct when the softmax microkernel is "
+             "enabled, since that is what gives amd-aie a softmax at all.">,
+    ];
 }
 
 def AMDAIEPadContractionDispatches :
