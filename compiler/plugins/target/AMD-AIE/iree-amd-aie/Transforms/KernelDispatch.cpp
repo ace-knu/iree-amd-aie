@@ -558,6 +558,16 @@ constexpr int64_t kGemvKTile = 256;
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
+  // TODO(gemv): support a fused elementwise consumer (bias add / ReLU) as an
+  // epilogue. Today such an M == 1 dispatch is rejected here and then fails in
+  // pack-peel as well ("instruction size ... does not divide M (1)"), and the
+  // Flow pad pass only matches a plain `fill -> matmul -> store` dispatch, so
+  // fusion into contraction roots must stay disabled
+  // (`--iree-dispatch-creation-no-fuse-into-contraction-conv-roots`) and the
+  // FC bias/ReLU runs as a separate host dispatch. The natural place for the
+  // epilogue is the peeled last K step of `addGemvPassPipeline`, applied to the
+  // per-core L1 C tile before its copy back to L2 (`tileElementwise` is off
+  // there for now).
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
       if (isElementwise(linalgUser) &&
@@ -682,6 +692,14 @@ static LogicalResult setRootConfigForGemvPipeline(
 static bool takesGemvPipeline(mlir::FunctionOpInterface entryPointFn,
                               linalg::LinalgOp linalgOp,
                               TilePassPipeline passPipeline) {
+  // TODO(gemv): the Flow pad/split passes (AMDAIEPadContractionDispatches.cpp)
+  // decide "this dispatch is GEMV" from the `gemv_pipeline` target attr and
+  // `isGemvMExtent` alone; they cannot see the global tile pipeline. Any
+  // condition added here (or a new global pipeline that handles matmuls) must
+  // be mirrored there, or M == 1 arrives unpadded at a pipeline that expects
+  // M % instr_m == 0. Consider carrying the decision in one shared predicate
+  // (target attr + shape) used by both sides, or folding the global pipeline
+  // into the target attr, so the two cannot drift.
   if (passPipeline != TilePassPipeline::PackPeelPipeline &&
       passPipeline != TilePassPipeline::PackPeel4LevelTilingPipeline)
     return false;
