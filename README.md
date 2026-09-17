@@ -264,6 +264,29 @@ producer마다 lock 쌍을 주어 고쳤습니다. AIE2의 DMA BD는 acquire/rel
 **26개가 비트 단위 일치**(max abs error 0), 전부 실행간 출력 1종. 나머지 1개(16층 체인)는
 결정론적이며 차이가 모두 출력 양자화 step의 정수배 = 반올림 tie.
 
+### 공유 호스트에서는 NPU/빌드 락을 쓰십시오 (2026-09-17)
+
+`ace-amd01`은 물리 NPU 한 대와 Docker 데몬 하나를 여러 사용자가 같이 씁니다. 실 NPU를
+동시에 돌리면 장치가 경합/행에 걸리고, 전체 빌드가 겹치면 RAM을 초과해 호스트가 멈춥니다.
+`scripts/lock/`이 `/run/lock/iree-amd-aie/` 아래 `flock`으로 둘 다 클러스터 전역에서
+직렬화합니다 (tmpfs라 재부팅 시 자동 소멸, 잡은 프로세스가 죽으면 자동 해제).
+
+무엇을 하기 전이든 **매번**:
+
+1. `./scripts/lock/status.sh` — 대기 없이 두 락의 보유자를 보여줍니다.
+2. `./scripts/lock/check-containers.sh` — 실행 중인 컨테이너가 락 디렉터리를
+   bind-mount 하고 있는지 감사합니다. 이 스크립트 이전에 띄운 컨테이너는 **락에 보이지
+   않으므로**, `NPU: free`만으로 장치가 놀고 있다고 단정하면 안 됩니다.
+3. 실행을 감쌉니다:
+   - 임의의 실 NPU 명령: `./scripts/lock/with-npu-lock.sh <command...>`
+   - `scripts/build/build.sh`, `scripts/docker/run-deploy.sh`, `run-debug.sh`는 스스로
+     락을 잡습니다.
+   - `scripts/docker/run-dev.sh`는 락 디렉터리를 마운트만 하므로, 그 셸 안에서 도는
+     명령은 위 방식으로 직접 감싸야 합니다.
+
+배경: `docs/2026-07-06_env_setup/DEV_CONTAINER.md` §5, 빠른 시작:
+`docs/2026-07-06_env_setup/USER_GUIDE.md`.
+
 ### ⚠️ int8 batched matmul을 쓰려면 별도 패치가 필요합니다
 
 torch-mlir에 `aten.bmm`의 int8 양자화 경로가 없습니다(2D `aten.mm`은 이미 있음). ONNX의
