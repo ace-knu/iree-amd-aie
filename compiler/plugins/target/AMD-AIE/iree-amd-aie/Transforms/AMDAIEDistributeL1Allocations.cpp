@@ -125,6 +125,51 @@ SmallVector<AffineExpr> composeThroughPack(linalg::PackOp packOp,
   return sourceExprs;
 }
 
+/// Returns the destination-style writer of `value`, if it has exactly one.
+/// Memrefs have their allocation as their SSA definition, so their actual
+/// writer has to be found through the DPS init operand instead.
+static Operation *getUniqueDpsWriter(Value value) {
+  Operation *writer = nullptr;
+  for (OpOperand &use : value.getUses()) {
+    auto dstStyle = dyn_cast<DestinationStyleOpInterface>(use.getOwner());
+    if (!dstStyle || !dstStyle.isDpsInit(&use)) continue;
+    if (writer && writer != use.getOwner()) return nullptr;
+    writer = use.getOwner();
+  }
+  return writer;
+}
+
+/// If `value` is ultimately initialized by a constant fill through only
+/// layout-preserving copies and packs, return that fill. A fill has the same
+/// value in every element, so the intervening layout changes are irrelevant:
+/// emitting the fill at the final packed destination is equivalent and avoids
+/// materializing the otherwise dead memtile round trip.
+static linalg::FillOp findConstantFillProducer(Value value) {
+  DenseSet<Value> visited;
+  while (visited.insert(value).second) {
+    Operation *writer = getUniqueDpsWriter(value);
+    if (!writer) return {};
+    if (auto fillOp = dyn_cast<linalg::FillOp>(writer)) return fillOp;
+    if (auto packOp = dyn_cast<linalg::PackOp>(writer)) {
+      value = packOp.getSource();
+      continue;
+    }
+    auto genericOp = dyn_cast<linalg::GenericOp>(writer);
+    if (!genericOp || genericOp.getNumDpsInputs() != 1 ||
+        genericOp.getNumDpsInits() != 1 ||
+        !genericOp.getRegion().hasOneBlock())
+      return {};
+    auto yieldOp = dyn_cast<linalg::YieldOp>(
+        genericOp.getRegion().front().getTerminator());
+    if (!yieldOp || yieldOp.getValues().size() != 1 ||
+        yieldOp.getValues().front() !=
+            genericOp.getRegion().front().getArgument(0))
+      return {};
+    value = genericOp.getDpsInputs()[0];
+  }
+  return {};
+}
+
 /// Rebuild, as a single `linalg.generic` writing directly into `finalDest`,
 /// the producer chain that computed `topPackOp`'s result (i.e. what
 /// `topPackOp` would have packed into `oldAlloc`) -- entirely outside any
@@ -152,6 +197,18 @@ SmallVector<AffineExpr> composeThroughPack(linalg::PackOp packOp,
 void buildDirectComputationNarrowed(RewriterBase &rewriter,
                                     linalg::PackOp topPackOp,
                                     Value finalDest) {
+  // transpose_b accumulators are zero-filled before the first pack, then
+  // copied through memtile and packed again into L1. Preserve the fill but
+  // make it directly at the final (two-stage) packed output instead. Besides
+  // removing those unnecessary buffers and DMA candidates, this avoids
+  // rebuilding a copy whose input has the undistributed shape while its
+  // output is per-core.
+  if (linalg::FillOp fillOp =
+          findConstantFillProducer(topPackOp.getSource())) {
+    rewriter.create<linalg::FillOp>(fillOp.getLoc(), fillOp.value(), finalDest);
+    return;
+  }
+
   auto finalType = cast<MemRefType>(finalDest.getType());
   MLIRContext *ctx = rewriter.getContext();
   int64_t finalRank = finalType.getRank();
