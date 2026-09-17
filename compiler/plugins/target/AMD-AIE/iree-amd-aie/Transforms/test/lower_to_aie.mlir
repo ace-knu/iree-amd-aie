@@ -1422,3 +1422,74 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
     return
   }
 }
+
+// -----
+
+// A memtile buffer gathered from two cores gets one BD per core, each acquiring
+// that core's own lock pair. This transfer is too large to be expressed as a
+// single BD dimension, so it arrives as 128 steps of stride 32 rather than one
+// step per party; the party's share is peeled off that dimension, leaving each
+// BD a <size = 64, stride = 32> walk over its own 2048-element slice.
+// The 4096-element memtile buffer appears in no other case here, so it anchors
+// this one's checks.
+// CHECK:       aie.buffer(%{{.*}}) {sym_name = "buff_0"} : memref<4096xi8, 1 : i32>
+// CHECK:       aie.memtile_dma
+// CHECK:         aie.dma_start(MM2S
+// CHECK:         aie.use_lock(%{{.*}}, AcquireGreaterEqual, 1)
+// CHECK:         aie.dma_bd(%{{.*}} : memref<4096xi8, 1 : i32>) {dimensions = #aie<bd_dim_layout_array[<size = 64, stride = 32>, <size = 32, stride = 1>]>, len = 2048 : i32}
+// CHECK:         aie.use_lock(%{{.*}}, Release, 1)
+// CHECK:         aie.use_lock(%{{.*}}, AcquireGreaterEqual, 1)
+// CHECK:         aie.dma_bd(%{{.*}} : memref<4096xi8, 1 : i32>) {dimensions = #aie<bd_dim_layout_array[<size = 64, stride = 32>, <size = 32, stride = 1>]>, len = 2048 : i32, offset = 2048 : i32}
+// CHECK:         aie.use_lock(%{{.*}}, Release, 1)
+// CHECK:       aiex.runtime_sequence @multi_step_party_split
+
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#translation = #iree_codegen.translation_info<pipeline = Custom>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @multi_step_party_split() attributes {translation_info = #translation} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    amdaie.workgroup {
+      %tile_0_0 = amdaie.tile(%c0, %c0)
+      %tile_0_1 = amdaie.tile(%c0, %c1)
+      %tile_0_2 = amdaie.tile(%c0, %c2)
+      %tile_0_3 = amdaie.tile(%c0, %c3)
+      %shim = amdaie.logicalobjectfifo.placeholder{%tile_0_0} : !amdaie.logicalobjectfifo<memref<4096xi8>>
+      %buffer = amdaie.buffer(%tile_0_1) : memref<4096xi8, 1 : i32>
+      %lock_a0 = amdaie.lock(%tile_0_1(0), 1)
+      %lock_r0 = amdaie.lock(%tile_0_1(1), 0)
+      %lock_a1 = amdaie.lock(%tile_0_1(2), 1)
+      %lock_r1 = amdaie.lock(%tile_0_1(3), 0)
+      %l2 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock_a0, %lock_a1}, {%lock_r0, %lock_r1}) : memref<4096xi8, 1 : i32> -> !amdaie.logicalobjectfifo<memref<4096xi8, 1 : i32>>
+      %buffer_2 = amdaie.buffer(%tile_0_2) : memref<2048xi8, 2 : i32>
+      %lock_2a = amdaie.lock(%tile_0_2(0), 1)
+      %lock_2r = amdaie.lock(%tile_0_2(1), 0)
+      %l1_2 = amdaie.logicalobjectfifo.from_buffers({%buffer_2}, {%lock_2a}, {%lock_2r}) : memref<2048xi8, 2 : i32> -> !amdaie.logicalobjectfifo<memref<2048xi8, 2 : i32>>
+      %buffer_3 = amdaie.buffer(%tile_0_3) : memref<2048xi8, 2 : i32>
+      %lock_3a = amdaie.lock(%tile_0_3(0), 1)
+      %lock_3r = amdaie.lock(%tile_0_3(1), 0)
+      %l1_3 = amdaie.logicalobjectfifo.from_buffers({%buffer_3}, {%lock_3a}, {%lock_3r}) : memref<2048xi8, 2 : i32> -> !amdaie.logicalobjectfifo<memref<2048xi8, 2 : i32>>
+      %ch_2 = amdaie.channel(%tile_0_2, 0, port_type = DMA, direction = MM2S)
+      %ch_3 = amdaie.channel(%tile_0_3, 0, port_type = DMA, direction = MM2S)
+      %ch_l2_in0 = amdaie.channel(%tile_0_1, 0, port_type = DMA, direction = S2MM)
+      %ch_l2_in1 = amdaie.channel(%tile_0_1, 1, port_type = DMA, direction = S2MM)
+      %ch_l2_out = amdaie.channel(%tile_0_1, 0, port_type = DMA, direction = MM2S)
+      %ch_shim = amdaie.channel(%tile_0_0, 0, port_type = DMA, direction = S2MM)
+      %flow_0 = amdaie.flow({%ch_2} -> {%ch_l2_in0}) {is_packet_flow = false}
+      %flow_1 = amdaie.flow({%ch_3} -> {%ch_l2_in1}) {is_packet_flow = false}
+      %flow_2 = amdaie.flow({%ch_l2_out} -> {%ch_shim}) {is_packet_flow = false}
+      %conn_0 = amdaie.connection(%l2 {%ch_l2_in0}, %l1_2 {%ch_2}, flow = %flow_0) {connection_type = #amdaie<connection_type Circuit>} : (!amdaie.logicalobjectfifo<memref<4096xi8, 1 : i32>>, !amdaie.logicalobjectfifo<memref<2048xi8, 2 : i32>>)
+      %conn_1 = amdaie.connection(%l2 {%ch_l2_in1}, %l1_3 {%ch_3}, flow = %flow_1) {connection_type = #amdaie<connection_type Circuit>} : (!amdaie.logicalobjectfifo<memref<4096xi8, 1 : i32>>, !amdaie.logicalobjectfifo<memref<2048xi8, 2 : i32>>)
+      %conn_2 = amdaie.connection(%shim {%ch_shim}, %l2 {%ch_l2_out}, flow = %flow_2) {connection_type = #amdaie<connection_type Circuit>} : (!amdaie.logicalobjectfifo<memref<4096xi8>>, !amdaie.logicalobjectfifo<memref<4096xi8, 1 : i32>>)
+      amdaie.controlcode {
+        %a = amdaie.npu.circular_dma_cpy_nd %conn_0([0] [2048] [1], [0] [2048] [1])
+        %b = amdaie.npu.circular_dma_cpy_nd %conn_1([2048] [2048] [1], [0] [2048] [1])
+        %c = amdaie.npu.circular_dma_cpy_nd %conn_2([] [] [], [0, 0] [128, 32] [32, 1])
+        amdaie.end
+      }
+    }
+    return
+  }
+}
