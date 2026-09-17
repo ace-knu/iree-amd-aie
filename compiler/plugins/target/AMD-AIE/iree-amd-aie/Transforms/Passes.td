@@ -1057,6 +1057,12 @@ def AMDAIETileAndFuse :
       "Use scf.forall by default for the corresponding tiling level">,
     Option<"tilingLevel", "tiling-level", "int64_t", /*default=*/"-1",
       "Use default tiling level used to retrieve the configuration from lowering_config">,
+    Option<"fuseConsumers", "fuse-consumers", "bool", /*default=*/"false",
+           "Also fuse the root's elementwise consumers into the loop this "
+           "pass creates. Without it a dispatch shaped elementwise -> root -> "
+           "elementwise leaves its trailing elementwise op outside the loop, "
+           "untiled, so nothing downstream can pair it with the loop's own "
+           "shape and element type.">,
     Option<"tileElementwise", "tile-elementwise", "bool", /*default=*/"true",
       "Option to whether tile and fuse the elementwise op">,
     Option<"hardwareMapping", "hardware-mapping",

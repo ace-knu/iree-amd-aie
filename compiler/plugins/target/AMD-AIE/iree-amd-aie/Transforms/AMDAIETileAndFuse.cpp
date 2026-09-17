@@ -21,6 +21,7 @@
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-amdaie-tile-and-fuse"
 
@@ -183,6 +184,198 @@ static bool consumerToSkip(TilingInterface op) {
       isa<linalg::UnPackOp>(op))
     return true;
   return false;
+}
+
+
+/// Greedily fuse the elementwise consumers of `loops`' results into the
+/// innermost loop, so that a dispatch shaped `elementwise -> root ->
+/// elementwise` ends up with all three inside one tile.
+///
+/// Tiling on its own only pulls producers in: the root's consumer stays
+/// outside at the original, untiled shape. Everything downstream then has to
+/// reconcile a loop carrying one shape and element type with an op carrying
+/// another -- which is how a quantized softmax (`dequantize -> softmax ->
+/// quantize`) breaks, and the same shape recurs in normalization and in
+/// activation-quantization graphs.
+///
+/// Only ops that are cheap to recompute per tile are taken: elementwise linalg
+/// ops with a single use. Copies, packs and unpacks are left alone, matching
+/// `consumerToSkip`.
+static void fuseConsumersIntoLoops(RewriterBase &rewriter,
+                                   MutableArrayRef<LoopLikeOpInterface> loops) {
+  if (loops.empty()) return;
+
+  // Bound the walk: each round fuses one consumer, and a dispatch has only a
+  // handful.
+  for (unsigned round = 0; round < 8; ++round) {
+    // Re-read the innermost loop every round: fusing a consumer rebuilds the
+    // loop with an extra result and replaces the old one.
+    LoopLikeOpInterface innermost = loops.back();
+    Operation *candidateSliceOp = nullptr;
+    innermost->walk([&](Operation *op) {
+      if (!isa<tensor::InsertSliceOp, tensor::ParallelInsertSliceOp>(op))
+        return WalkResult::advance();
+      // The value being written back is what a consumer would read.
+      Value source = isa<tensor::InsertSliceOp>(op)
+                         ? cast<tensor::InsertSliceOp>(op).getSource()
+                         : cast<tensor::ParallelInsertSliceOp>(op).getSource();
+      Operation *producer = source.getDefiningOp();
+      if (!producer) return WalkResult::advance();
+      candidateSliceOp = op;
+      return WalkResult::interrupt();
+    });
+    if (!candidateSliceOp) return;
+
+    // Check the loop result actually feeds a single fusable consumer before
+    // disturbing the IR.
+    bool fusable = false;
+    for (OpResult result : innermost->getResults()) {
+      if (!result.hasOneUse()) continue;
+      Operation *consumer = *result.getUsers().begin();
+      auto linalgOp = dyn_cast<linalg::LinalgOp>(consumer);
+      if (!linalgOp || !isElementwise(linalgOp)) continue;
+      if (auto tilingOp = dyn_cast<TilingInterface>(consumer))
+        if (consumerToSkip(tilingOp)) continue;
+      fusable = true;
+      break;
+    }
+    if (!fusable) return;
+
+    // Hand over the caller's own array, not a copy of the innermost loop:
+    // `tileAndFuseConsumerOfSlices` replaces the loops it is given and writes
+    // the new ones back through this reference. Passing a local copy would
+    // leave the caller holding erased operations.
+    std::optional<scf::SCFFuseConsumerOfSliceResult> fusedConsumer =
+        scf::tileAndFuseConsumerOfSlices(rewriter, candidateSliceOp, loops);
+    if (!fusedConsumer) return;
+    fusedConsumer->origConsumerOperands.front()->getOwner()->erase();
+  }
+}
+
+/// Whether nothing real reads `value`, treating slice ops that themselves go
+/// nowhere as not reading it. Collects the ops to erase, deepest first.
+static bool isDeadSliceChain(Value value,
+                             llvm::SetVector<Operation *> &toErase,
+                             unsigned depth = 0) {
+  if (value.use_empty()) return true;
+  // Tiling stacks at most a couple of slices on such an edge.
+  if (depth > 4) return false;
+  for (Operation *user : value.getUsers()) {
+    if (!isa<tensor::ExtractSliceOp, tensor::InsertSliceOp>(user)) return false;
+    if (!isDeadSliceChain(user->getResult(0), toErase, depth + 1)) return false;
+    toErase.insert(user);
+  }
+  return true;
+}
+
+/// Free `iterArg` of its remaining uses, if they are all ones a dead loop
+/// result can have, and report whether it worked.
+///
+/// After the write-back for a dead result is dropped, what is usually left is
+/// the plumbing tiling built around it: an `insert_slice` nothing reads, and an
+/// `extract_slice` serving as the root op's destination. A destination is
+/// written in full by the op it belongs to, so a fresh `tensor.empty` does the
+/// same job without tying the value to the loop. Any other use means the
+/// argument is really live, and nothing is changed.
+static bool detachDeadIterArg(RewriterBase &rewriter, BlockArgument iterArg) {
+  llvm::SetVector<Operation *> deadInserts;
+  SmallVector<tensor::ExtractSliceOp> destinations;
+  for (Operation *user : iterArg.getUsers()) {
+    if (auto insertOp = dyn_cast<tensor::InsertSliceOp>(user)) {
+      if (!isDeadSliceChain(insertOp.getResult(), deadInserts)) return false;
+      deadInserts.insert(insertOp);
+      continue;
+    }
+    auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(user);
+    if (!sliceOp) return false;
+    // Only a destination operand may be replaced: a read would see the
+    // initial value, which a fresh buffer does not have.
+    for (OpOperand &use : sliceOp.getResult().getUses()) {
+      auto dstStyleOp = dyn_cast<DestinationStyleOpInterface>(use.getOwner());
+      if (!dstStyleOp || !dstStyleOp.isDpsInit(&use)) return false;
+    }
+    destinations.push_back(sliceOp);
+  }
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  for (Operation *deadOp : deadInserts) rewriter.eraseOp(deadOp);
+  for (tensor::ExtractSliceOp sliceOp : destinations) {
+    auto sliceType = cast<RankedTensorType>(sliceOp.getResult().getType());
+    rewriter.setInsertionPoint(sliceOp);
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        sliceOp.getLoc(), sliceType.getShape(), sliceType.getElementType());
+    rewriter.replaceOp(sliceOp, empty);
+  }
+  return iterArg.use_empty();
+}
+
+/// Rebuild `forallOp` without the results nothing outside the loop reads.
+///
+/// Tiling gives the root its own loop result. Once a consumer is fused in, the
+/// root's value is read inside the loop and its escape becomes redundant: no
+/// one reads that result, and the only thing keeping it alive is the loop's own
+/// interface. Left in place it keeps a `shared_out`, a
+/// `tensor.parallel_insert_slice` and, once the copies and promotion go in, a
+/// whole buffer for an intermediate that never leaves the tile -- which the
+/// next tiling level then reads instead of re-tiling the chain, stranding the
+/// producer at the untiled shape.
+///
+/// This is the general cleanup after `producer -> root -> consumer` fusion, not
+/// specific to any one chain. `scf.forall`'s own canonicalization is
+/// deliberately not reused for it: those patterns would also fold away a
+/// single-iteration loop, and the block-level loop this pass creates for a
+/// full-size tile is exactly that.
+static void dropDeadForallResults(RewriterBase &rewriter,
+                                  scf::ForallOp forallOp) {
+  unsigned numOutputs = forallOp.getOutputs().size();
+  if (numOutputs == 0) return;
+
+  SmallVector<bool> isDead(numOutputs, false);
+  unsigned numDead = 0;
+  for (unsigned i = 0; i < numOutputs; ++i) {
+    if (!forallOp.getResult(i).use_empty()) continue;
+    if (!detachDeadIterArg(rewriter, forallOp.getRegionIterArgs()[i])) continue;
+    isDead[i] = true;
+    ++numDead;
+  }
+  if (numDead == 0) return;
+
+  SmallVector<Value> liveOutputs;
+  for (unsigned i = 0; i < numOutputs; ++i)
+    if (!isDead[i]) liveOutputs.push_back(forallOp.getOutputs()[i]);
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(forallOp);
+  auto newForallOp = rewriter.create<scf::ForallOp>(
+      forallOp.getLoc(), forallOp.getMixedLowerBound(),
+      forallOp.getMixedUpperBound(), forallOp.getMixedStep(), liveOutputs,
+      forallOp.getMapping());
+
+  // Move the old body across. The dead iteration arguments have no uses, so
+  // any dominating value of the right type stands in for them; their own
+  // initial values are the obvious choice.
+  // Bind the range first: `getInductionVars()` returns by value, so calling
+  // `begin()` and `end()` on it directly would iterate two different
+  // temporaries.
+  auto newInductionVars = newForallOp.getInductionVars();
+  SmallVector<Value> replacements(newInductionVars.begin(),
+                                  newInductionVars.end());
+  unsigned liveIdx = 0;
+  for (unsigned i = 0; i < numOutputs; ++i) {
+    replacements.push_back(isDead[i]
+                               ? forallOp.getOutputs()[i]
+                               : newForallOp.getRegionIterArgs()[liveIdx++]);
+  }
+  rewriter.eraseOp(newForallOp.getTerminator());
+  rewriter.mergeBlocks(forallOp.getBody(), newForallOp.getBody(), replacements);
+
+  liveIdx = 0;
+  for (unsigned i = 0; i < numOutputs; ++i) {
+    if (isDead[i]) continue;
+    rewriter.replaceAllUsesWith(forallOp.getResult(i),
+                                newForallOp.getResult(liveIdx++));
+  }
+  rewriter.eraseOp(forallOp);
 }
 
 FailureOr<scf::SCFTileAndFuseResult> applyTileAndFuse(
@@ -393,6 +586,13 @@ void AMDAIETileAndFusePass::runOnOperation() {
 
   if (failed(tileAndFuseResult)) return signalPassFailure();
 
+  // Kept across both steps below: consumer fusion replaces the tiled loops, so
+  // the mapping has to be set on what it leaves behind, not on the loops tiling
+  // originally produced.
+  SmallVector<LoopLikeOpInterface> loops(tileAndFuseResult->loops.begin(),
+                                         tileAndFuseResult->loops.end());
+  if (fuseConsumers) fuseConsumersIntoLoops(rewriter, loops);
+
   // When tiling using scf.for we do not need to set any mapping.
   if (!useSCFFor) {
     // Currently only thread groups are used in lowering, blocks get unrolled
@@ -407,7 +607,6 @@ void AMDAIETileAndFusePass::runOnOperation() {
     // So for now we're keeping the block group dimension here, but should
     // be able to compile without any block group dimensions TODO(newling)
 
-    SmallVector<LoopLikeOpInterface> loops = tileAndFuseResult.value().loops;
     if (loops.size() != 1) {
       consumerOp.emitOpError() << "expected exactly one scf.forall operation "
                                   "after tiling, but there are "
@@ -431,6 +630,40 @@ void AMDAIETileAndFusePass::runOnOperation() {
       }
     }
   }
+  // Clean up the loop interface that consumer fusion leaves behind: first drop
+  // the write-back for any result nothing uses, then rebuild the loop without
+  // that result at all. See `dropDeadForallResults`.
+  if (fuseConsumers) {
+    funcOp->walk([&](scf::ForallOp forallOp) {
+      SmallVector<Operation *> deadWriteBacks;
+      for (Operation &terminatorOp :
+           forallOp.getTerminator().getRegion().front()) {
+        auto insertOp = dyn_cast<tensor::ParallelInsertSliceOp>(&terminatorOp);
+        if (!insertOp) continue;
+        auto blockArg = dyn_cast<BlockArgument>(insertOp.getDest());
+        if (!blockArg) continue;
+        unsigned outputIdx =
+            blockArg.getArgNumber() - forallOp.getInductionVars().size();
+        if (outputIdx >= forallOp.getResults().size()) continue;
+        if (!forallOp.getResult(outputIdx).use_empty()) continue;
+        // The value has to stay live inside the loop, otherwise this is not a
+        // redundant escape but the loop's only writer.
+        Value source = insertOp.getSource();
+        bool usedInLoop = llvm::any_of(source.getUsers(), [&](Operation *user) {
+          return user != insertOp.getOperation();
+        });
+        if (!usedInLoop) continue;
+        deadWriteBacks.push_back(insertOp);
+      }
+      for (Operation *writeBack : deadWriteBacks) rewriter.eraseOp(writeBack);
+    });
+    // Collect first: the rebuild replaces the op being visited.
+    SmallVector<scf::ForallOp> foralls;
+    funcOp->walk([&](scf::ForallOp forallOp) { foralls.push_back(forallOp); });
+    for (scf::ForallOp forallOp : foralls)
+      dropDeadForallResults(rewriter, forallOp);
+  }
+
 }
 
 }  // namespace

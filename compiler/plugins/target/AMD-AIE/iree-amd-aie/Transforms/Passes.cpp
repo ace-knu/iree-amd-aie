@@ -642,6 +642,17 @@ void addGeneralCopyPassPipeline(OpPassManager &funcPassManager,
     tileFuseOptions.hardwareMapping = HardwareMapping::Block;
     tileFuseOptions.tilingLevel = 0;
     tileFuseOptions.useSCFFor = false;
+    // Keep a dispatch's trailing elementwise op in the same tile as its root.
+    // A lone softmax has none, but a quantized one is `dequantize -> softmax
+    // -> quantize`, and leaving the quantize outside the loop leaves it
+    // untiled against a loop of a different shape and element type.
+    tileFuseOptions.fuseConsumers = true;
+    // Keep the reduction at the head of the chain as the tile root. Picking
+    // the trailing elementwise op instead would tile only it and leave the
+    // reduction behind at the untiled shape -- the chain has to be tiled as a
+    // whole. A dispatch whose own root is elementwise has no such chain, so it
+    // still tiles that op directly.
+    tileFuseOptions.tileElementwise = isElementwiseOp;
     funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
   }
 
@@ -665,6 +676,17 @@ void addGeneralCopyPassPipeline(OpPassManager &funcPassManager,
     tileFuseOptions.hardwareMapping = HardwareMapping::Core;
     tileFuseOptions.tilingLevel = 1;
     tileFuseOptions.useSCFFor = false;
+    // Keep a dispatch's trailing elementwise op in the same tile as its root.
+    // A lone softmax has none, but a quantized one is `dequantize -> softmax
+    // -> quantize`, and leaving the quantize outside the loop leaves it
+    // untiled against a loop of a different shape and element type.
+    tileFuseOptions.fuseConsumers = true;
+    // Keep the reduction at the head of the chain as the tile root. Picking
+    // the trailing elementwise op instead would tile only it and leave the
+    // reduction behind at the untiled shape -- the chain has to be tiled as a
+    // whole. A dispatch whose own root is elementwise has no such chain, so it
+    // still tiles that op directly.
+    tileFuseOptions.tileElementwise = isElementwiseOp;
     funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
   }
 
