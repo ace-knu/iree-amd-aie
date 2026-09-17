@@ -126,3 +126,20 @@ iree_cc_test(
     gtest
     iree-amd-aie::aie_runtime::iree_aie_runtime_static
 )
+
+# Standalone dev tool, not a lit-checked test: needs real npu4 hardware
+# (/dev/accel/accel0), so it isn't wired into any test suite -- build and run
+# it by hand. See hw_trace_probe.cc for why (hardware-trace investigation for
+# the matmul+bias fusion hang, docs/2026-08-27_matmul_bias_fusion_hang_root_cause_refined.md).
+if("amdxdna" IN_LIST IREE_EXTERNAL_HAL_DRIVERS)
+  iree_cc_binary(
+    NAME
+      hw_trace_probe
+    SRCS
+      "hw_trace_probe.cc"
+    DEPS
+      iree-amd-aie::aie_runtime::iree_aie_runtime_static
+      iree-amd-aie::driver::amdxdna::shim::linux::kmq::shim-xdna
+    TESTONLY
+  )
+endif()
