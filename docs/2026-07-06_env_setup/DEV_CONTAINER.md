@@ -250,6 +250,19 @@ build/tools/iree-run-module --device=amdxdna --module=model.vmfb \
     실제 NPU 실행을 동시에 하면 경합해 실패/행 가능 — **NPU 실행은 한 번에 한 유저**로 조율한다
     (빌드만이면 무관). 두 유저의 동시 LLVM 빌드는 `-j` 캡이 유저별 독립이라 합산 RAM 초과 위험이
     있으니 공유 시 `JOBS`를 낮춘다.
+  - **위 두 조율은 이제 수동이 아니라 자동이다** (`scripts/lock/`): `/run/lock/iree-amd-aie/`
+    아래 `npu.lock`·`build.lock` 두 개를 `flock`으로 관리하고, 이 디렉토리를 모든 컨테이너에
+    같은 경로로 bind-mount해서 유저마다 컨테이너가 달라도 락을 공유한다. `build.sh`는 빌드를,
+    `run-deploy.sh`/`run-debug.sh`는 세션 전체를 자동으로 이 락으로 감싼다(둘 다 반드시 실제
+    NPU를 건드리는 흐름이라). `run-dev.sh` 안에서 `iree-run-module`을 손으로 돌릴 때는
+    `./scripts/lock/with-npu-lock.sh <명령...>`로 감싼다. tmpfs 기반이라 재부팅하면 자동
+    초기화되고, 락을 쥔 프로세스가 죽거나 Ctrl-C해도 OS가 즉시 풀어준다(수동 정리 불필요).
+    실행 전 사용 여부만 안 기다리고 확인하려면:
+    ```bash
+    ./scripts/lock/status.sh
+    # NPU: free            (또는 BUSY + user=... pid=... started=... cmd=...)
+    # build: free
+    ```
 
 ---
 
