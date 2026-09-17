@@ -50,6 +50,38 @@ would explain a 30x correlation-gap improvement, so there may have been a
 second, subtler numerical issue in the unpadded-M path beyond "just"
 placement -- not root-caused.
 
+## 2.1 Optional: fold an FC bias into a two-input MatMul
+
+`fold_bias_into_k.py` is a deliberately **opt-in ONNX preparation tool** for
+experiments that need a quantized `MatMul + bias` to remain a two-input NPU
+matmul. It is not part of the normal export path and it never rewrites all
+matmuls by default.
+
+For example, to rewrite only the FFN's first dense layer (FC1), first create
+the quantized ONNX input used by the int8 investigation. The converter needs
+the Python `onnx` package; keep it out of the source tree if it is not already
+installed:
+
+```bash
+python3 -m pip install --target=/tmp/bert_deps onnx
+```
+
+Then run:
+
+```bash
+PYTHONPATH=/tmp/bert_deps python3 models/bert_base/fold_bias_into_k.py \
+  /path/to/bert_base_int8.onnx /tmp/bert_base_fc1_kfold.onnx \
+  --include intermediate/dense
+```
+
+The transform appends constant-one activation columns and corresponding
+int8 weight rows, so `X @ W + bias` becomes one two-input matmul. It only
+accepts zero-point-zero QDQ operands and validates the resulting ONNX model.
+It uses a 64-column K alignment by default: FC1 becomes `K=832, N=3072`.
+Do not change this to a 32-column extension (`K=800`) for FC1: the npu4 DMA
+lowering has a known failure for `N=3072` when `K/32` is odd. This tool makes
+that backend path reproducible; it does not fix the backend limitation.
+
 ## 3. What this confirms beyond bert-tiny
 
 bert-tiny's attention batch dimension is 2 (2 heads); this checkpoint's is
