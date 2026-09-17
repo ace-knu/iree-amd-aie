@@ -6,6 +6,9 @@
 
 - 대상: Ubuntu 24.04 + AMD NPU(amdxdna) 호스트
 - 구조: 소스/빌드 산출물은 호스트, 컨테이너는 빌드/실행 환경만 제공(bind-mount)
+- **여러 유저가 한 호스트를 공유**: NPU(디바이스 1개)와 빌드(RAM)는 `scripts/lock/`이 자동으로
+  한 번에 한 유저만 쓰게 조율한다(빌드/실행 전 `./scripts/lock/status.sh`로 사용 중인지 먼저
+  확인 가능). 상세는 [`DEV_CONTAINER.md`](DEV_CONTAINER.md) §5 참고.
 
 ---
 
