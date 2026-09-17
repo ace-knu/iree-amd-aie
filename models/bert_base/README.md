@@ -93,8 +93,14 @@ build/tools/iree-compile /tmp/bert_mlm_trunk.mlir -o models/bert_base/bert_mlm_t
   --iree-dispatch-creation-no-fuse-into-contraction-conv-roots \
   --iree-flow-enable-executable-deduplication=false
 
-PYTHONPATH=/tmp/bert_deps python3 models/bert_base/demo_mlm.py "The capital of France is [MASK]."
+./scripts/lock/with-npu-lock.sh env PYTHONPATH=/tmp/bert_deps \
+  python3 models/bert_base/demo_mlm.py "The capital of France is [MASK]."
 ```
+
+`demo_mlm.py` runs the trunk on the shared host's one physical NPU, so it's
+wrapped in `scripts/lock/with-npu-lock.sh` — see
+`docs/2026-07-06_env_setup/DEV_CONTAINER.md` §5 for why. The `export`/`import_onnx`/
+`iree-compile` steps above don't touch the NPU and don't need this.
 
 ```
 Input:  The capital of France is [MASK].

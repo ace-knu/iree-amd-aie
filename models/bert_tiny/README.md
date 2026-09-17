@@ -56,10 +56,14 @@ build/tools/iree-compile /tmp/bert_tiny.mlir -o /tmp/bert_tiny.vmfb \
   --iree-dispatch-creation-no-fuse-into-contraction-conv-roots \
   --iree-flow-enable-executable-deduplication=false
 
-build/tools/iree-run-module --device=amdxdna --device=local-task \
+./scripts/lock/with-npu-lock.sh build/tools/iree-run-module --device=amdxdna --device=local-task \
   --module=/tmp/bert_tiny.vmfb --function=main_graph \
   --input=@models/bert_tiny/input_ids.npy --output=@models/bert_tiny/out.npy
 ```
+
+The run above touches the shared host's one physical NPU, so it's wrapped in
+`scripts/lock/with-npu-lock.sh` — see `docs/2026-07-06_env_setup/DEV_CONTAINER.md`
+§5 for why. `iree-compile` above it doesn't touch the NPU and doesn't need this.
 
 The entry function name comes from the traced `torch.onnx.export` graph and is
 always `main_graph` for this export (unlike vgg16, which keeps the ONNX
