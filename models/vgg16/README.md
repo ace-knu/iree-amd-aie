@@ -64,10 +64,14 @@ build/tools/iree-compile /tmp/vgg.mlir -o /tmp/vgg.vmfb \
   --iree-global-opt-detach-elementwise-through-reshape \
   --iree-flow-enable-executable-deduplication=false
 
-build/tools/iree-run-module --device=amdxdna --device=local-task \
+./scripts/lock/with-npu-lock.sh build/tools/iree-run-module --device=amdxdna --device=local-task \
   --module=/tmp/vgg.vmfb --function=mxnet_converted_model \
   --input=@input.npy --output=@out.npy
 ```
+
+The run above touches the shared host's one physical NPU, so it's wrapped in
+`scripts/lock/with-npu-lock.sh` — see `docs/2026-07-06_env_setup/DEV_CONTAINER.md`
+§5 for why. `iree-compile` above it doesn't touch the NPU and doesn't need this.
 
 The entry function name comes from the ONNX graph name; read it back with
 `grep -oE "func.func @[A-Za-z0-9_]+" /tmp/vgg.mlir | head -1`.
