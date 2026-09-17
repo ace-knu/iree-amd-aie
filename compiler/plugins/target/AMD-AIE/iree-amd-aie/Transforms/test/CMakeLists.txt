@@ -72,6 +72,7 @@ iree_lit_test_suite(
     "lowering_strategy_conv.mlir"
     "lowering_strategy_failures.mlir"
     "lowering_strategy_gemv.mlir"
+    "lowering_strategy_gemv_4level.mlir"
     "lowering_strategy_generic.mlir"
     "lowering_strategy_objectfifo_npu1.mlir"
     "lowering_strategy_objectfifo_npu4.mlir"

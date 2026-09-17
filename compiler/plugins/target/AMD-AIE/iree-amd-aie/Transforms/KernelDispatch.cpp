@@ -671,19 +671,30 @@ static LogicalResult setRootConfigForGemvPipeline(
       /*workgroupSize=*/{}, /*subgroupSize=*/{}, pipelineConfig);
 }
 
+/// Returns true if `linalgOp` takes the GEMV pipeline under `passPipeline`, i.e.
+/// the target has it enabled (`--iree-amdaie-enable-gemv-pipeline`), the shape
+/// qualifies (`isGemvLike`) and the global pipeline is one of the pack-peel
+/// variants that pad M otherwise. Checked before the pipeline switch so the
+/// per-dispatch override is emitted regardless of which pack-peel variant is
+/// selected globally -- the Flow pad/split passes skip M/N padding for these
+/// shapes based on the target attr alone, so codegen must agree with them under
+/// every global pipeline.
+static bool takesGemvPipeline(mlir::FunctionOpInterface entryPointFn,
+                              linalg::LinalgOp linalgOp,
+                              TilePassPipeline passPipeline) {
+  if (passPipeline != TilePassPipeline::PackPeelPipeline &&
+      passPipeline != TilePassPipeline::PackPeel4LevelTilingPipeline)
+    return false;
+  return getConfigEnableGemvPipeline(
+             IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn)) &&
+         isGemvLike(linalgOp);
+}
+
 static LogicalResult setRootConfigForPackPeelPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     LowerToAIEPassPipeline useLowerToAIEPipeline, AMDAIEDevice targetDevice,
     uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels) {
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
-  // Small-M shapes leave pack-peel here; see `isGemvLike`. The target config
-  // can switch this off (`--iree-amdaie-enable-gemv-pipeline=false`).
-  if (getConfigEnableGemvPipeline(
-          IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn)) &&
-      isGemvLike(linalgOp)) {
-    return setRootConfigForGemvPipeline(entryPointFn, linalgOp, deviceModel,
-                                        numRows, numCols);
-  }
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
   auto maybePackPeelTiling =
@@ -1080,6 +1091,12 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
 
   if (isMatmul(genericOp) || isMatmulTransposeA(genericOp) ||
       isMatmulTransposeB(genericOp)) {
+    // M == 1 shapes leave the pack-peel variants here; see `isGemvLike`.
+    if (takesGemvPipeline(entryPointFn, genericOp, passPipeline)) {
+      return setRootConfigForGemvPipeline(entryPointFn, genericOp,
+                                          getDeviceModel(targetDevice), numRows,
+                                          numCols);
+    }
     if (passPipeline == TilePassPipeline::PackPeelPipeline) {
       return setRootConfigForPackPeelPipeline(
           entryPointFn, genericOp, useLowerToAIEPipeline, targetDevice, numRows,
@@ -1125,6 +1142,12 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
          "expected lowering_config is not set");
   auto linalgOp = cast<linalg::LinalgOp>(contractionOp.getOperation());
 
+  // M == 1 shapes leave the pack-peel variants here; see `isGemvLike`.
+  if (takesGemvPipeline(entryPointFn, linalgOp, passPipeline)) {
+    return setRootConfigForGemvPipeline(entryPointFn, linalgOp,
+                                        getDeviceModel(targetDevice), numRows,
+                                        numCols);
+  }
   // TODO (nmeshram) : This needs to be moved in a separate more generalized
   // logic. Also, need a flag to experiment between pad based and pack based
   // approach which will have different tile sizes and pass pipelines
