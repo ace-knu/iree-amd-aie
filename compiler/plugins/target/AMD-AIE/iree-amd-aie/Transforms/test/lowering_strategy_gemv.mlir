@@ -45,7 +45,8 @@ module {
 // N=1000 (fc3, unpadded): no divisor of 1000 spreads it over 32 (or 24) cores
 // in whole columns, so the tile reaching the most cores is picked, largest
 // first: 50 outputs per core x 20 cores (5 columns) in one L0 block of 1000.
-// No padding is required by this pipeline.
+// No padding is required by this pipeline, and N has no vector-width
+// constraint (the matvec kernel vectorizes along K).
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
 // CHECK-SAME:      [0, 1000, 0], [0, 0, 256], [0, 50, 0]
 // CHECK-SAME:  ]>

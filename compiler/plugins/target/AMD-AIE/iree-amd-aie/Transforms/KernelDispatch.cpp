@@ -544,10 +544,6 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 // Configuration for the GEMV Pipeline
 //===----------------------------------------------------------------------===//
 
-/// Preferred multiple of the per-core N tile: the N width of the bf16 vector
-/// MAC (`mac_8x8_8x8T`), so a later matvec ukernel can block along N without a
-/// remainder. The scalar path has no constraint; this only breaks ties.
-constexpr int64_t kGemvNVectorMultiple = 8;
 /// K elements streamed through L1 per step. 8x pack-peel's 32: 1/8 the DMA
 /// programmings and, for bf16, 512 B contiguous DRAM runs instead of 64 B.
 constexpr int64_t kGemvKTile = 256;
@@ -624,8 +620,10 @@ static LogicalResult setRootConfigForGemvPipeline(
   // Per-core N tile and L0 N block. The core code is compute bound, so the
   // time scales with the number of cores a block puts to work: over the
   // divisors of N that fit in core memory, take the tile whose block covers
-  // the most cores; break ties toward a vector-width multiple, then toward the
-  // largest tile (fewest blocks). A block must fill whole columns (or stay in
+  // the most cores; break ties toward the largest tile (fewest blocks). There
+  // is no vector-width constraint on N: the planned matvec kernel vectorizes
+  // along K (`mac_elem_32`), so N stays a scalar loop of any length. A block
+  // must fill whole columns (or stay in
   // one): SplitLogicalObjFifos splits the L2 weight block gcd(cores, columns
   // used) ways, so only then does every memtile feed exactly one column (with
   // 25 cores over 7 columns the block is not split at all and overflows a
@@ -644,13 +642,7 @@ static LogicalResult setRootConfigForGemvPipeline(
       break;
     }
     int64_t n0 = cores * n1;
-    bool isVectorMultiple = n1 % kGemvNVectorMultiple == 0;
-    bool bestIsVectorMultiple =
-        n1Tile != 0 && n1Tile % kGemvNVectorMultiple == 0;
-    if (cores > bestCores ||
-        (cores == bestCores && isVectorMultiple > bestIsVectorMultiple) ||
-        (cores == bestCores && isVectorMultiple == bestIsVectorMultiple &&
-         n1 > n1Tile)) {
+    if (cores > bestCores || (cores == bestCores && n1 > n1Tile)) {
       n1Tile = n1;
       n0Tile = n0;
       bestCores = cores;
