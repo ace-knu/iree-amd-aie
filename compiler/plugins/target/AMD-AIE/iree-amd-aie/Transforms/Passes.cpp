@@ -29,6 +29,7 @@
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -1015,7 +1016,22 @@ void addMLIRAIELoweringPasses(OpPassManager &pm,
   pm.addPass(createConvertVectorToLLVMPass());
   pm.addPass(memref::createExpandStridedMetadataPass());
   pm.addPass(createLowerAffinePass());
+  // Peano's aie2p backend has no float rounding instructions at all, so
+  // math.roundeven has to be rebuilt out of ops it can select before math is
+  // handed to LLVM.
+  // Do this before anything tries to lower the float form: on aie2p every
+  // scalar float op is a soft-float libcall, so a fused int8 requantization
+  // tail costs several KB of a core's 16KB program memory.
+  pm.addPass(createAMDAIEIntegerRequantizationPass());
+  pm.addPass(createAMDAIEExpandRoundEvenPass());
   pm.addPass(createConvertMathToLLVMPass());
+  // Peano's aie2p backend cannot legalize the scalar float min/max intrinsics
+  // (G_FMINIMUM / G_FMAXIMUM / G_FMINNUM / G_FMAXNUM) that arith.minimumf /
+  // arith.maximumf lower to. It does legalize fcmp + select, which is exactly
+  // what this pass rewrites them into. Without it any dispatch carrying a
+  // fused int8 requantization clamp (matmul -> scale -> round -> clamp ->
+  // fptosi) crashes llc during instruction selection.
+  pm.addPass(arith::createArithExpandOpsPass());
   pm.addPass(createArithToLLVMConversionPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());

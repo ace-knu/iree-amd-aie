@@ -604,6 +604,31 @@ def AMDAIELinkExecutables :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIELinkExecutablesPass()";
 }
 
+def AMDAIEIntegerRequantization :
+    Pass<"iree-amdaie-integer-requantization", ""> {
+    let summary = "Rewrite constant-scale float requantization tails as integer arithmetic.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEIntegerRequantizationPass()";
+    let description = [{
+      Turn `sitofp -> scale -> roundeven -> clamp -> fptosi` int8 requantization
+      tails into an integer multiply, a round-half-to-even shift and an integer
+      clamp. aie2p has no scalar float arithmetic, so the float form becomes
+      several KB of soft-float libcalls in each core's 16KB program memory.
+    }];
+}
+
+def AMDAIEExpandRoundEven :
+    Pass<"iree-amdaie-expand-roundeven", ""> {
+    let summary = "Expand math.roundeven into ops peano can select.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEExpandRoundEvenPass()";
+    let description = [{
+      Rewrite `math.roundeven` on f32 into fptosi/sitofp, fabs, fcmp and select.
+      Peano's aie2p backend legalizes none of the float rounding intrinsics, nor
+      `copysign`, which is what upstream's `math-expand-ops` lowers roundeven
+      through. Without this, any dispatch carrying a fused int8 requantization
+      (matmul -> scale -> round -> clamp -> fptosi) crashes llc.
+    }];
+}
+
 def AMDAIELoadStoreAlignmentReset :
     Pass<"iree-amdaie-load-store-alignment-reset", ""> {
     let summary = "Reset the alignment of the LLVM load operations.";

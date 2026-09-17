@@ -38,6 +38,7 @@ iree_lit_test_suite(
     "create_aie_workgroup.mlir"
     "create_reference_to_allocation.mlir"
     "disable_linalg_function_outlining.mlir"
+    "expand_roundeven.mlir"
     "disable_vectorization.mlir"
     "distribute_cores_and_objectfifos.mlir"
     "distribute_l1_allocations.mlir"
@@ -56,6 +57,7 @@ iree_lit_test_suite(
     "hoist_for_affine_apply.mlir"
     "hoist_logical_obj_fifo.mlir"
     "insert_copy_ops.mlir"
+    "integer_requantization.mlir"
     "insert_cores.mlir"
     "insert_dma_bd_chain.mlir"
     "insert_dma_out_of_order_block.mlir"
@@ -123,6 +125,16 @@ iree_cc_test(
     iree::target::amd-aie::Transforms
 )
 
+
+iree_cc_test(
+  NAME
+    AMDAIERequantUtilsTest
+  SRCS
+    "AMDAIERequantUtilsTest.cpp"
+  DEPS
+    gtest
+    iree::target::amd-aie::Transforms
+)
 
 iree_cc_test(
   NAME

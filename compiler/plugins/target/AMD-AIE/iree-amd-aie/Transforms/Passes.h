@@ -382,6 +382,12 @@ std::unique_ptr<Pass> createAMDAIEAddNoAliasFunctionArgumentsPass();
 /// Create pass to propagate pack/unpack ops using upstream patterns.
 std::unique_ptr<Pass> createAMDAIEPropagateDataLayoutPass();
 
+/// Create pass to rewrite float requantization tails as integer arithmetic.
+std::unique_ptr<Pass> createAMDAIEIntegerRequantizationPass();
+
+/// Create pass to expand math.roundeven into peano-selectable ops.
+std::unique_ptr<Pass> createAMDAIEExpandRoundEvenPass();
+
 /// Create pass to reset the alignment of LLVM load operations.
 std::unique_ptr<Pass> createAMDAIELoadStoreAlignmentResetPass();
 

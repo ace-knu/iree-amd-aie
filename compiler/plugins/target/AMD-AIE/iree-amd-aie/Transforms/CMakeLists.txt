@@ -94,6 +94,8 @@ iree_cc_library(
     "AMDAIEInsertLoopsForVectorization.cpp"
     "AMDAIELinkExecutables.cpp"
     "AMDAIELocalizeLogicalObjectFifo.cpp"
+    "AMDAIEExpandRoundEven.cpp"
+    "AMDAIEIntegerRequantization.cpp"
     "AMDAIELoadStoreAlignmentReset.cpp"
     "AMDAIELowerExecutableTarget.cpp"
     "AMDAIELowerFuncArgs.cpp"
@@ -151,6 +153,8 @@ iree_cc_library(
     iree::target::amd-aie::air::AIRTransformPasses
     iree::target::amd-aie::Transforms::Utils
     IREELinalgTransformDialectPasses
+    MLIRArithTransforms
+    MLIRMathDialect
     MLIRFuncAllExtensions
     MLIRFuncDialect
     MLIRFunctionInterfaces
