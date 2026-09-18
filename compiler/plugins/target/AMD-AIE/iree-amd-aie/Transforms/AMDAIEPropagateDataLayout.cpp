@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -53,6 +54,27 @@ struct RemoveOutsDependency : public OpRewritePattern<linalg::GenericOp> {
   }
 };
 
+/// A `tensor.expand_shape` that only inserts unit dimensions is a view, not a
+/// layout change. Bubbling a `linalg.pack` up through one buys nothing and
+/// costs the consumer its direct producer: with the reshape left sitting
+/// between the pack and the contraction that reads it, the later K-loop
+/// tiling can no longer fuse the pack, and the whole operand ends up staged
+/// at once instead of a K-slice at a time. Such a reshape is how a shared
+/// contraction operand's batch broadcast is spelled once tiling has made the
+/// batch extent 1.
+static bool isUnitDimExpandShape(Value value) {
+  auto expandOp = value.getDefiningOp<tensor::ExpandShapeOp>();
+  if (!expandOp) return false;
+  auto nonUnitDims = [](ShapedType type) {
+    SmallVector<int64_t> dims;
+    for (int64_t dim : type.getShape())
+      if (dim != 1) dims.push_back(dim);
+    return dims;
+  };
+  return nonUnitDims(expandOp.getSrcType()) ==
+         nonUnitDims(expandOp.getResultType());
+}
+
 class AMDAIEPropagateDataLayoutPass
     : public impl::AMDAIEPropagateDataLayoutBase<
           AMDAIEPropagateDataLayoutPass> {
@@ -71,7 +93,9 @@ void AMDAIEPropagateDataLayoutPass::runOnOperation() {
   RewritePatternSet patterns(context);
 
   linalg::populateDataLayoutPropagationPatterns(
-      patterns, [](OpOperand *opOperand) { return true; });
+      patterns, [](OpOperand *opOperand) {
+        return !isUnitDimExpandShape(opOperand->get());
+      });
   patterns.add<RemoveOutsDependency>(context);
 
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))

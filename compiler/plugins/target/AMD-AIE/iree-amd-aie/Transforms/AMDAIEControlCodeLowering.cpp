@@ -11,6 +11,7 @@
 #include "iree-amd-aie/Transforms/Transforms.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDmaUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -18,6 +19,18 @@
 #define DEBUG_TYPE "iree-amdaie-controlcode-lowering"
 
 namespace mlir::iree_compiler::AMDAIE {
+
+/// Returns true if the two types differ only in unit dimensions, i.e. the
+/// reshape between them is a pure view and does not move any element.
+static bool isUnitDimReshape(ShapedType a, ShapedType b) {
+  auto nonUnitDims = [](ShapedType type) {
+    SmallVector<int64_t> dims;
+    for (int64_t dim : type.getShape())
+      if (dim != 1) dims.push_back(dim);
+    return dims;
+  };
+  return nonUnitDims(a) == nonUnitDims(b);
+}
 
 // Returns the static base offset carried on the `memref.reinterpret_cast` that
 // AMDAIEConvertToDma inserts under a DMA `input` (kept out of the access pattern
@@ -97,6 +110,30 @@ struct HalfDmaCpyNdToNpuConverter final
           reinterpretElemOffset = *off;
         }
         lofiMemref = reinterpretOp.getSource();
+      }
+      // Step through a `memref.expand_shape`/`memref.collapse_shape` that only
+      // adds or drops unit dimensions. Such a reshape leaves the buffer's
+      // linear layout untouched -- the access pattern below is already
+      // expressed against the flat buffer -- so it only stands between the
+      // operand and the binding it comes from. This is how a contraction
+      // operand shared across the batch dimension (an activation read by
+      // every head) reaches its binding.
+      while (true) {
+        Operation *defOp = lofiMemref.getDefiningOp();
+        if (auto expandOp = dyn_cast_if_present<memref::ExpandShapeOp>(defOp)) {
+          if (!isUnitDimReshape(expandOp.getSrcType(), expandOp.getType()))
+            break;
+          lofiMemref = expandOp.getSrc();
+          continue;
+        }
+        if (auto collapseOp =
+                dyn_cast_if_present<memref::CollapseShapeOp>(defOp)) {
+          if (!isUnitDimReshape(collapseOp.getSrcType(), collapseOp.getType()))
+            break;
+          lofiMemref = collapseOp.getSrc();
+          continue;
+        }
+        break;
       }
       auto assumeAlignmentOp =
           dyn_cast_if_present<memref::AssumeAlignmentOp>(lofiMemref.getDefiningOp());

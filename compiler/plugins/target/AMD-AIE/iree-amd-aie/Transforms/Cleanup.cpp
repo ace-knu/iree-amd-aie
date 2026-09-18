@@ -13,6 +13,7 @@
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
@@ -22,6 +23,91 @@
 namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
+
+/// A `linalg.generic` that only copies its single input into a bigger result,
+/// broadcasting along dimensions that are all unit-extent, computes nothing:
+/// it is a rank-expanding reshape written as a compute op.
+///
+/// This is what a shared matmul operand's batch broadcast turns into once the
+/// contraction has been tiled, because the batch tile size is 1. Left as a
+/// compute op it forces the whole operand to be packed and staged in L1 before
+/// the K loop, instead of being streamed a K-slice at a time. As a
+/// `tensor.expand_shape` it folds into the operand's access pattern and the
+/// schedule is the same as if the broadcast had never been there.
+struct FoldUnitExtentBroadcastToExpandShape
+    : public OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern<linalg::GenericOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    if (!genericOp.hasPureTensorSemantics() ||
+        genericOp.getNumDpsInputs() != 1 || genericOp.getNumDpsInits() != 1) {
+      return rewriter.notifyMatchFailure(genericOp, "not a one-operand copy");
+    }
+    if (genericOp.getNumParallelLoops() != genericOp.getNumLoops()) {
+      return rewriter.notifyMatchFailure(genericOp, "has a reduction loop");
+    }
+
+    // The body must be exactly `linalg.yield <input element>`.
+    Block &body = genericOp.getRegion().front();
+    auto yieldOp = dyn_cast<linalg::YieldOp>(body.getTerminator());
+    if (!yieldOp || yieldOp.getNumOperands() != 1 ||
+        yieldOp.getOperand(0) != body.getArgument(0) ||
+        !body.without_terminator().empty()) {
+      return rewriter.notifyMatchFailure(genericOp, "body is not a copy");
+    }
+
+    // The result must be written in iteration order, and the input read in the
+    // same order with some dimensions simply missing (a broadcast, not a
+    // transpose).
+    if (!genericOp.getMatchingIndexingMap(genericOp.getDpsInitOperand(0))
+             .isIdentity()) {
+      return rewriter.notifyMatchFailure(genericOp, "result is not identity");
+    }
+    AffineMap inputMap =
+        genericOp.getMatchingIndexingMap(genericOp.getDpsInputOperand(0));
+    if (!inputMap.isProjectedPermutation(/*allowZeroInResults=*/false)) {
+      return rewriter.notifyMatchFailure(genericOp, "input is not a broadcast");
+    }
+    SmallVector<int64_t> keptDims;
+    for (AffineExpr expr : inputMap.getResults()) {
+      keptDims.push_back(cast<AffineDimExpr>(expr).getPosition());
+    }
+    if (keptDims.empty() || !llvm::is_sorted(keptDims)) {
+      return rewriter.notifyMatchFailure(genericOp, "input dims are permuted");
+    }
+
+    auto resultType = cast<RankedTensorType>(genericOp.getResultTypes()[0]);
+    int64_t resultRank = resultType.getRank();
+    if (resultRank == static_cast<int64_t>(keptDims.size())) {
+      return rewriter.notifyMatchFailure(genericOp, "nothing is broadcast");
+    }
+    // Only a unit-extent broadcast is free. Anything else really does
+    // replicate data and has to stay a copy.
+    llvm::SmallDenseSet<int64_t> kept(keptDims.begin(), keptDims.end());
+    for (int64_t dim = 0; dim < resultRank; ++dim) {
+      if (!kept.contains(dim) && resultType.getDimSize(dim) != 1) {
+        return rewriter.notifyMatchFailure(genericOp,
+                                           "broadcast is not unit-extent");
+      }
+    }
+
+    // Attach each broadcast (unit) dimension to the neighbouring source
+    // dimension's group, so the expansion is 1 x <source dim>.
+    SmallVector<ReassociationIndices> reassociation(keptDims.size());
+    int64_t seen = 0;
+    for (int64_t dim = 0; dim < resultRank; ++dim) {
+      int64_t group = std::min<int64_t>(seen, keptDims.size() - 1);
+      reassociation[group].push_back(dim);
+      if (kept.contains(dim)) ++seen;
+    }
+
+    rewriter.replaceOpWithNewOp<tensor::ExpandShapeOp>(
+        genericOp, resultType, genericOp.getDpsInputOperand(0)->get(),
+        reassociation);
+    return success();
+  }
+};
 
 static void loopIndependentCodeMotion(Operation *funcOp, IRRewriter &rewriter) {
   // This assumes LICM never removes operations so we don't need tracking.
@@ -55,6 +141,7 @@ static void populateCleanupPatterns(RewritePatternSet &patterns) {
   // They work on tiled (but not distributed) loops.
   scf::populateSCFForLoopCanonicalizationPatterns(patterns);
   tensor::populateFoldTensorEmptyPatterns(patterns);
+  patterns.add<FoldUnitExtentBroadcastToExpandShape>(context);
 }
 
 class AMDAIECleanupPass : public impl::AMDAIECleanupBase<AMDAIECleanupPass> {
