@@ -67,6 +67,46 @@ struct AMDAIEOptions {
   // too. Harmless while every contraction is placed on the accelerator; revisit
   // if the placement rules change.
   bool demoteContractionInputsToBf16{false};
+
+  // Fold conv2d + bias here, before im2col, by augmenting the *activation*
+  // with a constant-one input channel (K+1 on the convolution). Off by
+  // default: `AMDAIEPadContractionDispatches` folds the same bias into a
+  // single K column of the post-im2col matmul instead, which is strictly
+  // cheaper on a convolution whose weight and bias are compile-time
+  // constants. K = C*kh*kw, so one extra input channel buys nine extra K
+  // positions of which eight are structurally zero, and it costs a full copy
+  // of the activation into a (C+1)-channel buffer plus a fill for the ones
+  // plane -- two host dispatches per convolution. On VGG16 that is 26 of
+  // 105 dispatches; folding at the K column instead brings the model to 79
+  // with the ones written by the K-padding dispatch that has to run anyway
+  // (verified on npu4: corr 0.999994, argmax match; see
+  // docs/2026-09-10_cpu-dispatch-reduction-plan.md).
+  //
+  // Turn it back on for a convolution whose weight or bias is *not* a
+  // compile-time constant: the K-column fold has to materialize the bias row
+  // as a constant, so it does not apply there, and without either fold the
+  // bias stays a third dispatch operand -- which the NPU cannot bind
+  // ("'amdaie.connection' op no producer DMA channel available", every conv).
+  // Matmul + bias is folded here regardless of this flag; it is the
+  // convolution path alone that this gates.
+  bool foldConvBiasIntoContraction{false};
+
+  // Debug-only escape hatches for bisecting the 2026-09-04 fold-bias change
+  // (see AMDAIEFoldBiasIntoContraction.cpp). Defaults reproduce today's
+  // verified-working behavior; false / 1 reproduce the pre-2026-09-04
+  // behavior.
+  bool foldRhsTransposeIntoContraction{true};
+  int64_t foldBiasKAlign{128};
+
+  // Max N per AMDAIESplitLargeContractionDispatchesPass split chunk (see its
+  // own comment in AMDAIEPadContractionDispatches.cpp). 1024 is the largest
+  // value validated on real hardware; 2048 fails reproducibly (`ert state 8`,
+  // 2/2). A wrong value does not miscompute, it hangs the NPU run, so any
+  // other value needs its own real-hardware verification before being
+  // trusted. See docs/2026-09-09c_nchunk1024-measured-benefit-data-movement-
+  // and-time.md for the 512-vs-1024 measurement this default is based on.
+  int64_t splitLargeContractionNChunkMax{1024};
+
   bool enableCoalescingLoops{false};
   bool enableCollapsingUnitDims{false};
   OutliningStrategy enableFunctionOutlining{OutliningStrategy::Balanced};
@@ -180,6 +220,48 @@ struct AMDAIEOptions {
             "Demote the inputs of contraction ops (matmul + convolution) from "
             "f32 to bf16 during preprocessing (accumulation stays f32). Needed "
             "to run f32 models on npu4, which has no f32 vector path."));
+
+    binder.opt<bool>(
+        "iree-amdaie-fold-conv-bias-into-contraction",
+        foldConvBiasIntoContraction, llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Fold conv2d + bias before im2col by augmenting the activation "
+            "with a constant-one input channel. Off by default because "
+            "AMDAIEPadContractionDispatches folds the same bias into one K "
+            "column of the post-im2col matmul at no dispatch cost (VGG16: "
+            "105 -> 79 dispatches). Enable for a convolution whose weight or "
+            "bias is not a compile-time constant, which the K-column fold "
+            "cannot handle. Matmul + bias is folded regardless."));
+
+    binder.opt<bool>(
+        "iree-amdaie-fold-rhs-transpose-into-contraction",
+        foldRhsTransposeIntoContraction, llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Debug-only: fold a materialized linalg.transpose feeding the "
+            "matmul RHS into the matmul's own indexing maps (transpose_b "
+            "form) before the K+1 bias fold. false reproduces the "
+            "pre-2026-09-04 behavior. For bisecting the fold-bias change; "
+            "not meant for general use."));
+
+    binder.opt<int64_t>(
+        "iree-amdaie-fold-bias-k-align", foldBiasKAlign,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Debug-only: grow the K+1 bias-fold augmentation up to the next "
+            "multiple of this value instead of stopping at exactly K+1. 1 "
+            "reproduces the pre-2026-09-04 behavior. For bisecting the "
+            "fold-bias change; not meant for general use."));
+
+    binder.opt<int64_t>(
+        "iree-amdaie-split-n-chunk-max", splitLargeContractionNChunkMax,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Max N per AMDAIESplitLargeContractionDispatchesPass split chunk. "
+            "The built-in 1024 is the largest value validated on real "
+            "hardware (VGG-16, bf16, npu4: 7/7 runs correct); 2048 fails "
+            "reproducibly with an NPU timeout. Any other value needs its own "
+            "real-hardware re-verification -- a wrong value hangs the NPU run "
+            "rather than miscomputing."));
 
     binder.opt<bool>(
         "iree-amd-aie-enable-chess-for-ukernel", useChessForUKernel,

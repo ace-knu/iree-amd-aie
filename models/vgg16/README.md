@@ -60,8 +60,6 @@ build/tools/iree-compile /tmp/vgg.mlir -o /tmp/vgg.vmfb \
   --iree-amdaie-demote-contraction-inputs-to-bf16 \
   --iree-amdaie-enable-vectorization-passes=false \
   --iree-preprocessing-pass-pipeline='builtin.module(iree-preprocessing-convert-conv-to-channels-last)' \
-  --iree-dispatch-creation-no-fuse-into-contraction-conv-roots \
-  --iree-global-opt-detach-elementwise-through-reshape \
   --iree-flow-enable-executable-deduplication=false
 
 build/tools/iree-run-module --device=amdxdna --device=local-task \
@@ -72,8 +70,13 @@ build/tools/iree-run-module --device=amdxdna --device=local-task \
 The entry function name comes from the ONNX graph name; read it back with
 `grep -oE "func.func @[A-Za-z0-9_]+" /tmp/vgg.mlir | head -1`.
 
-Measured on npu4: compile ~130 s, run ~75 s, output `[1,1000]` correlates
-1.00000 with a torch reference and the argmax matches.
+Measured on npu4: compile ~125 s, run ~71 s, 66 dispatches, output `[1,1000]`
+correlates 0.999994 with a torch reference and the argmax matches (bf16
+demotion, see below, is why this isn't 1.00000 — see 3b). The dispatch count
+and compile time depend on defaults that have moved since this was first
+written (`--iree-amdaie-split-n-chunk-max` 512 -> 1024, and conv bias folded at
+the post-im2col matmul's K column instead of an extra input channel); see
+`docs/2026-09-10_cpu-dispatch-reduction-plan.md` for what each change bought.
 
 ## 3b. Check the result
 
@@ -115,10 +118,10 @@ print("corr %.5f  argmax gold=%d got=%d  top-1 match=%s" % (
 PY
 ```
 
-Expected: `corr 1.00000` and a top-1 match. Correlation well below 1.0, or a
-mismatched argmax, means a dispatch is reading the wrong data — not a rounding
-difference. Note bf16 demotion (see below) makes exact equality the wrong thing
-to check; correlation and top-1 are the meaningful signals.
+Expected: `corr` close to `1.00000` (bf16 demotion, see below, means it won't be
+exact — `0.99999` is the observed value, not `1.00000`) and a top-1 match.
+Correlation well below that, or a mismatched argmax, means a dispatch is
+reading the wrong data — not a rounding difference.
 
 This is also the check to run after changing anything in the DMA, placement or
 codegen paths: the compiler's own test suite is IR-level and cannot observe a
@@ -135,22 +138,33 @@ DMA that reads from the wrong address.
 | `--iree-amdaie-demote-contraction-inputs-to-bf16` | npu4 has no f32 vector path. f32 conv aborts and f32 matmul only runs scalar; demoting inputs (accumulation stays f32) makes them run as bf16. This is also the precondition for turning vectorization on later — npu4's matmul intrinsics are bf16 — so it stays even though today, paired with vectorization off, it only costs precision. |
 | `--iree-amdaie-enable-vectorization-passes=false` | aievec currently only handles i8 `vector.contract`; bf16 fails to vectorize, so the vectorization passes must be off. |
 | `--iree-preprocessing-pass-pipeline=...convert-conv-to-channels-last` | ONNX convs are NCHW; the im2col path expects NHWC. |
-| `--iree-dispatch-creation-no-fuse-into-contraction-conv-roots` | Works around a codegen gap: amd-aie cannot tile a contraction dispatch that has elementwise ops fused into it, so fusion across contraction/conv group boundaries is switched off. The real fix is on the codegen side, not here. |
-| `--iree-global-opt-detach-elementwise-through-reshape` | Detaches the bias add from the conv init through the im2col reshape, so the contraction dispatch has a plain `linalg.fill` init. |
 | `--iree-flow-enable-executable-deduplication=false` | Deduplicating two convs that differ only in constant-weight offset turns that offset into a runtime push constant, which `amdaie.npu.address_patch` cannot carry (it is static-only). The N-split pass also relies on its clones not being merged. |
 
-The last three are flags of the `ace-knu/iree` fork (see `.gitmodules`); they do
-not exist in upstream IREE.
+`--iree-flow-enable-executable-deduplication` is a flag of the `ace-knu/iree`
+fork (see `.gitmodules`); it does not exist in upstream IREE.
+
+Two more flags used to be required here —
+`--iree-dispatch-creation-no-fuse-into-contraction-conv-roots` (worked around
+amd-aie's inability to tile a contraction dispatch with elementwise ops fused
+into it) and `--iree-global-opt-detach-elementwise-through-reshape` (detached
+the bias add from the conv init through the im2col reshape). Both are gone as
+of 2026-09-04: `AMDAIEFoldBiasIntoContraction` folds bias into the contraction
+itself (no separate bias operand to detach), and two codegen bugs that made
+fused-elementwise contraction dispatches fail were fixed —
+`isMatmulInDefChain` not recognizing a packed transpose_b matmul (channel
+exhaustion at compile time), and `AMDAIESplitLargeContractionDispatches` not
+handling a fused consumer (unsplit FC weight DMA hangs at runtime). See
+`docs/2026-09-04e_workaround-free-vgg16-full-success-isMatmulInDefChain-and-split-consumer-fix.md`.
 
 ## 5. Known limitations
 
 - Batch size is fixed at 1 by the ONNX file; other batch sizes are untested.
 - The flag list is not a stable interface, and passing it by hand is a stopgap.
-  Three of the flags exist only in the `ace-knu/iree` fork, so nothing in
-  `--help` or in upstream documentation leads a reader to this combination —
-  this file is the only place it is written down. Two more work around current
-  gaps (aievec has no bf16 path; `no-fuse` above) and should disappear as those
-  are fixed.
+  `--iree-flow-enable-executable-deduplication` exists only in the
+  `ace-knu/iree` fork, so nothing in `--help` or in upstream documentation
+  leads a reader to it — this file is the only place it is written down.
+  `--iree-amdaie-enable-vectorization-passes=false` works around aievec having
+  no bf16 path and should disappear once that's fixed.
 - Omitting a flag does not produce a diagnostic naming it; the failure is a
   compile crash deep in the pipeline or an `ert state 6` at runtime. Follow the
   recipe exactly rather than bisecting it.

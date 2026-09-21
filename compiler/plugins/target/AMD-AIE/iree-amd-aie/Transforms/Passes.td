@@ -87,6 +87,36 @@ def AMDAIEAssignDeviceAffinities :
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
 }
 
+def AMDAIEFoldBiasIntoContraction :
+    Pass<"iree-amdaie-fold-bias-into-contraction", "ModuleOp"> {
+  let summary = "Fold a matmul's broadcast-bias accumulator into one extra "
+                "K reduction row/column, so bias never becomes a separate "
+                "contraction operand.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBiasIntoContractionPass()";
+  let options = [
+    Option<"foldConvBias", "fold-conv-bias", "bool", /*default=*/"true",
+      "Also apply the K+1 fold to conv2d + bias (not just matmul). Disable "
+      "to keep conv's bias as a separate dispatch input (relying on the "
+      "usual detach/no-fuse workaround flags for conv), while matmul bias "
+      "is still folded into the same dispatch.">,
+    Option<"foldRhsTranspose", "fold-rhs-transpose", "bool", /*default=*/"true",
+      "Fold an explicit linalg.transpose feeding the matmul RHS into the "
+      "matmul's own indexing maps (keeping transpose_b form) before "
+      "augmenting K, instead of letting the K+1 augmentation carry the "
+      "materialized transpose through unchanged. false disables the fold "
+      "unconditionally, reproducing the pre-2026-09-04 behavior. "
+      "Debug-only escape hatch for bisecting the 2026-09-04 fold-bias "
+      "change.">,
+    Option<"kAlign", "k-align", "int64_t", /*default=*/"128",
+      "Grow the bias-augmented reduction dim (K+1) up to the next multiple "
+      "of this value instead of stopping at exactly K+1 (extra rows/cols "
+      "are zero). 1 means 'exactly K+1', the pre-2026-09-04 behavior. "
+      "Debug-only escape hatch for bisecting the 2026-09-04 fold-bias "
+      "change.">
+  ];
+}
+
 def AMDAIEPadContractionDispatches :
     Pass<"iree-amdaie-pad-contraction-dispatches", "ModuleOp"> {
   let summary = "Pad NPU contraction dispatch operands up to the target pack-peel tile multiples at the Flow dispatch boundary (target-known, via each dispatch's device affinity).";
@@ -99,6 +129,18 @@ def AMDAIESplitLargeContractionDispatches :
   let summary = "Split a large-(K,N) transpose_b NPU matmul dispatch into N-chunk sub-dispatches (weight sliced along N) concatenated on the host, keeping each weight L3->L2 shim DMA within the shim's addressing limits.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIESplitLargeContractionDispatchesPass()";
+  let options = [
+    Option<"nChunkMax", "n-chunk-max", "int64_t", /*default=*/"1024",
+      "Max N per split chunk (kNChunkMax). The built-in 1024 is the largest "
+      "value validated on real hardware (VGG-16, bf16, npu4: 7/7 runs "
+      "correct); 2048 hangs reproducibly (2/2) -- see the pass's own comment "
+      "for why this is an empirical, not derived, number. Also usable as an "
+      "escape hatch for other (K,N) shapes: set >= N to disable splitting "
+      "for a dispatch entirely (still gated by kKThreshold). A wrong value "
+      "does not miscompute -- it hangs the NPU run (ert state 8), so any "
+      "non-default value needs its own real-hardware verification before "
+      "being trusted.">
+  ];
 }
 
 def AMDAIEAssignLogicalObjectFifoDepth :

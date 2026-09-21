@@ -167,12 +167,18 @@ class ParameterSetting {
     return {m1Pack, n1Pack, k1Pack};
   }
 
-  static FailureOr<ParameterSetting> create(linalg::LinalgOp linalgOp,
-                                            bool isObjectFifo,
-                                            AMDAIEDeviceModel deviceModel,
-                                            uint32_t numRows, uint32_t numCols,
-                                            std::string enableAMDAIEUkernels,
-                                            uint32_t kPackScaleL1 = 1);
+  // `numRows`/`numCols` are the (possibly M/N-swapped, see
+  // `getRowColMultipliers`) grid multipliers used for the M0/N0 tile-size
+  // search. `physicalNumCols`, if provided, overrides what's used for the
+  // *unrelated* L2/MemTile memory-budget calculation (`kPackScaleL1 == 2`
+  // path only), which needs the true physical MemTile column count
+  // regardless of any M/N swap applied to `numCols`; defaults to `numCols`
+  // when not given, i.e. assumes no swap was applied.
+  static FailureOr<ParameterSetting> create(
+      linalg::LinalgOp linalgOp, bool isObjectFifo,
+      AMDAIEDeviceModel deviceModel, uint32_t numRows, uint32_t numCols,
+      std::string enableAMDAIEUkernels, uint32_t kPackScaleL1 = 1,
+      std::optional<uint32_t> physicalNumCols = std::nullopt);
 
  private:
   ParameterSetting(uint32_t M0, uint32_t N0, uint32_t K0, uint32_t m0Pack,
@@ -196,7 +202,7 @@ class ParameterSetting {
 FailureOr<ParameterSetting> ParameterSetting::create(
     linalg::LinalgOp linalgOp, bool isObjectFifo, AMDAIEDeviceModel deviceModel,
     uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels,
-    uint32_t kPackScaleL1) {
+    uint32_t kPackScaleL1, std::optional<uint32_t> physicalNumCols) {
   auto initType =
       llvm::cast<ShapedType>(linalgOp.getDpsInitOperand(0)->get().getType());
   uint32_t nBytesInit = initType.getElementTypeBitWidth() / 8;
@@ -263,6 +269,24 @@ FailureOr<ParameterSetting> ParameterSetting::create(
         bufferDepthAcc = linalgUser.getNumDpsInputs() == 1 ? 1 : 2;
       }
     }
+    // Give back to C (the consumer's own output buffer) the L1 headroom Acc
+    // just took: C's double buffering (bufferDepthC = 2) only pipelines the
+    // final write-out DMA against the *next* tile's compute, a throughput
+    // optimization, not a correctness requirement (bufferDepthAcc = 0 for
+    // the no-consumer case above is already this same single-buffered
+    // pattern applied elsewhere in this function). Without giving the space
+    // back, every dispatch with a fused consumer silently gets a smaller L1
+    // tile than an equivalent bare matmul, which multiplies out to
+    // dramatically more unrolled M/N/K-tile iterations once the core control
+    // program is generated -- large enough to overflow the AIE core's
+    // program memory for e.g. VGG16's conv4 (M=12544), a failure mode with
+    // no connection to tile *correctness* at all. When nBytesC == nBytesAcc
+    // (true for a same-dtype consumer like ReLU on an f32 accumulator) this
+    // exactly cancels bufferDepthAcc's addition, restoring the tile size an
+    // equivalent bare matmul would get; a wider-output consumer still
+    // benefits partially, bounded at single-buffering (never below 1, since
+    // C needs at least one buffer to exist at all).
+    bufferDepthC = std::max(1u, bufferDepthC - bufferDepthAcc);
   } else {
     // For pure matmul, set the buffer depth as 0 for accumulation.
     bufferDepthAcc = 0;
@@ -287,8 +311,14 @@ FailureOr<ParameterSetting> ParameterSetting::create(
       /*vectorK=*/k1Pack};
   TileSize maxL1Size = selectL1TileSizes(tileParams);
 
-  // For pack-peel pipeline, the first level tile size has to be numRows/numCols
-  // times of the L1 tile size.
+  // For pack-peel pipeline, the first level tile size has to be
+  // numRows/numCols times of the L1 tile size. Callers that want the M/N
+  // grid-multiplier swap (see `getRowColMultipliers`) apply it before
+  // calling here, i.e. by this point `numRows`/`numCols` already mean
+  // "whichever multiplier this dispatch's M/N got", not literally
+  // rows-then-M/cols-then-N. `physicalNumCols` (below) is what keeps the
+  // *unrelated* L2/MemTile memory-budget calculation seeing the true
+  // physical column count regardless of any such swap.
   uint32_t maxL0SizeM = numRows * maxL1Size.M;
   uint32_t maxL0SizeN = numCols * maxL1Size.N;
   uint32_t M0 = findLargestFactor(M, maxL0SizeM, maxL1Size.M);
@@ -299,7 +329,8 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // For pack-peel-4-level-tiling pipeline, we use the largest tile sizes that
   // can fit in the MemTile memory.
   if (kPackScaleL1 == 2 && isObjectFifo) {
-    tileParams.memoryLimit = deviceModel.getMemTileSizeInBytes() * numCols;
+    tileParams.memoryLimit =
+        deviceModel.getMemTileSizeInBytes() * physicalNumCols.value_or(numCols);
     TileSize maxL0Size = selectL2TileSizes(tileParams, m0Pack, n0Pack);
     M0 = maxL0Size.M;
     N0 = maxL0Size.N;
@@ -394,11 +425,6 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
-  auto maybePackPeelTiling = ParameterSetting::create(
-      linalgOp, isObjectFifo, deviceModel, numRows, numCols,
-      enableAMDAIEUkernels, /*kPackScaleL1=*/2);
-  if (failed(maybePackPeelTiling)) return failure();
-  auto packPeelTiling = maybePackPeelTiling.value();
 
   // Get M, N, K dimension indices from the input indexing map.
   FailureOr<InputDimsAndSizes> maybeInputDimsAndSizes =
@@ -411,6 +437,44 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   if (mDims.empty() || nDims.empty() || kDims.empty()) {
     return linalgOp.emitOpError("failed to fetch m/n/k dims.");
   }
+
+  // Give the larger physical grid multiplier (`numRows` vs `numCols`, e.g.
+  // 4x8 on npu4/Strix) to whichever of M/N is larger. Always assigning
+  // `numRows` to M regardless of shape under-uses the larger grid axis for an
+  // M>>N (or N>>M) dispatch, which caps M0 (or N0) far below what the grid
+  // could otherwise support and forces many more unrolled tile iterations in
+  // the generated core control program -- large enough to overflow AIE
+  // program memory for shapes like VGG16 conv4 (M=12544, N=128).
+  //
+  // `gridM`/`gridN` are passed to `ParameterSetting::create` *as* its
+  // `numRows`/`numCols` arguments (so its M0/N0 grid-multiplier math sees the
+  // swap) and reused as-is for `tileSizeLevel1`'s M/N entries below -- those
+  // two must agree on which multiplier went to which dimension, since
+  // together they encode the packed data layout's `(numRows, numCols,
+  // M0/numRows, N0/numCols)` invariant. The original, unswapped `numCols` is
+  // passed separately as `physicalNumCols`, since `ParameterSetting::create`
+  // also uses that argument, unrelated to M/N tiling, as the physical count
+  // of MemTile columns for the L2 memory-size budget -- that usage must keep
+  // seeing the real physical value regardless of this M/N swap.
+  // `getGPUMappingAttributes` (`AMDAIETileAndFuse.cpp`) is what then places
+  // the resulting tiled loop onto the matching physical row/column axis --
+  // it does so by comparing trip counts, not by a fixed M->row/N->col
+  // assumption, so it stays consistent with whichever swap is made here.
+  int64_t mForGrid =
+      std::accumulate(maybeInputDimsAndSizes->mSizes.begin(),
+                       maybeInputDimsAndSizes->mSizes.end(), int64_t{1},
+                       std::multiplies<int64_t>());
+  int64_t nForGrid =
+      std::accumulate(maybeInputDimsAndSizes->nSizes.begin(),
+                       maybeInputDimsAndSizes->nSizes.end(), int64_t{1},
+                       std::multiplies<int64_t>());
+  auto [gridM, gridN] = getRowColMultipliers(mForGrid, nForGrid, numRows, numCols);
+
+  auto maybePackPeelTiling = ParameterSetting::create(
+      linalgOp, isObjectFifo, deviceModel, gridM, gridN, enableAMDAIEUkernels,
+      /*kPackScaleL1=*/2, /*physicalNumCols=*/numCols);
+  if (failed(maybePackPeelTiling)) return failure();
+  auto packPeelTiling = maybePackPeelTiling.value();
 
   // ------------------------------------------------------
   // --------------- Set packing config -------------------
@@ -520,8 +584,8 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   tileSizeLevel0[nDims[0]] = n0Tile;
 
   SmallVector<int64_t> tileSizeLevel1(numLoops, 0);
-  tileSizeLevel1[mDims[0]] = numRows;
-  tileSizeLevel1[nDims[0]] = numCols;
+  tileSizeLevel1[mDims[0]] = gridM;
+  tileSizeLevel1[nDims[0]] = gridN;
 
   SmallVector<int64_t> tileSizeLevel2(numLoops, 0);
   tileSizeLevel2[kDims[0]] = 1;
@@ -707,6 +771,22 @@ static LogicalResult setRootConfigForPackPeelPipeline(
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
+  // NOTE: unlike `setRootConfigForPackPeel4LevelTilingPipeline`, this
+  // (2-level) pipeline does *not* get the M/N grid-multiplier swap (see
+  // `getRowColMultipliers`). It was tried here (swap unconditionally on
+  // M>N, and separately, compute both orientations and pick whichever
+  // minimizes the outer-tile trip count `(M/M0)*(N/N0)`) and both variants
+  // broke VGG16 conv layers -- including some that were already working,
+  // e.g. conv1 (M=50176 >> N=64) -- with `'amdaie.connection' op no
+  // producer/consumer DMA channel available` from
+  // `AMDAIEAssignChannels.cpp`. That is a *physical DMA-channel exhaustion*,
+  // not a tiling-size problem: unlike the 4-level pipeline, whatever
+  // generates connections/channel assignments for this pipeline's shim/
+  // MemTile DMA transfers appears to assume the historical M->row/N->col
+  // grid orientation, and doesn't have enough channels to serve the
+  // opposite one. Fixing this would need that mechanism (not just
+  // `ParameterSetting`'s M0/N0 search) made swap-aware -- out of scope for
+  // this investigation. See docs/2026-09-02_grid-orientation-2level-blocked.md.
   auto maybePackPeelTiling =
       ParameterSetting::create(linalgOp, isObjectFifo, deviceModel, numRows,
                                numCols, enableAMDAIEUkernels);
