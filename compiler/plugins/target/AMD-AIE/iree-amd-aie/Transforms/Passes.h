@@ -71,6 +71,11 @@ void addGeneralCopyPassPipeline(OpPassManager &passManager,
 /// lowering strategy (see `kTilePipelineOverrideName`).
 void addGemvPassPipeline(OpPassManager &passManager);
 
+/// Populates passes needed to lower a 2-D max pooling with copies: block and
+/// core forall levels over the output dims, the window kept inside the core
+/// op. Selected per dispatch by the lowering strategy (`"pool"` override).
+void addPoolPassPipeline(OpPassManager &passManager);
+
 /// Populates passes needed to link HAL executables across AIE targets.
 void buildAMDAIELinkingPassPipeline(OpPassManager &passManager);
 

@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -135,6 +136,9 @@ LogicalResult promoteInputs(IRRewriter &rewriter, Operation *op) {
 
   // Promote the input operands.
   for (auto [i, operand] : llvm::enumerate(dstStyleOp.getDpsInputs())) {
+    // An input with no defined contents (a pooling window `tensor.empty` that
+    // only sizes the reduction loops) has nothing to move.
+    if (isUndefinedTensor(operand)) continue;
     rewriter.setInsertionPoint(op);
     FailureOr<Value> maybeReplacement = promoteValue(rewriter, loc, operand);
     if (failed(maybeReplacement))

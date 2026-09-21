@@ -187,6 +187,8 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // Set the GEMV pipeline routing flag (read per dispatch by the Flow pad /
     // split passes and by KernelDispatch).
     addConfig("gemv_pipeline", BoolAttr::get(context, options.enableGemvPipeline));
+    // Set the pooling placement flag (read by AMDAIEAssignDeviceAffinities).
+    addConfig("pooling", BoolAttr::get(context, options.enablePooling));
     // Set number of rows/cols used in an AIE array.
     addConfig("num_rows",
               IntegerAttr::get(IntegerType::get(context, 32), nRows));

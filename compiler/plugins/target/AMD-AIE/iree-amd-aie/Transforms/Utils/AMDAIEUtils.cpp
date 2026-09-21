@@ -14,6 +14,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #define DEBUG_TYPE "iree-amdaie-utils"
@@ -100,6 +101,11 @@ bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<BoolAttr> attr =
       getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");
   return !attr || attr->getValue();
+}
+
+bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr = getConfigAttr<BoolAttr>(targetAttr, "pooling");
+  return attr && attr->getValue();
 }
 
 /// Utility to retrieve a constant index from an OpFoldResult.
@@ -648,6 +654,128 @@ std::optional<int64_t> getNumColumnsUsedByCores(ModuleOp moduleOp) {
 
   if (res.wasInterrupted() || !foundCoreOp) return std::nullopt;
   return (maxColumn - minColumn + 1);
+}
+
+
+/// Matches `d_o * stride + d_k` (or `d_o + d_k`) where `d_o` is a parallel
+/// loop and `d_k` a reduction loop.
+static bool matchStridedDimExpr(AffineExpr e,
+                                ArrayRef<utils::IteratorType> iters,
+                                unsigned &outDim, unsigned &winDim,
+                                int64_t &stride) {
+  auto add = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!add || add.getKind() != AffineExprKind::Add) return false;
+  auto parse = [&](AffineExpr a, AffineExpr b) -> bool {
+    auto bDim = dyn_cast<AffineDimExpr>(b);
+    if (!bDim) return false;
+    unsigned aPos;
+    int64_t s = 1;
+    if (auto aDim = dyn_cast<AffineDimExpr>(a)) {
+      aPos = aDim.getPosition();
+    } else {
+      auto mul = dyn_cast<AffineBinaryOpExpr>(a);
+      if (!mul || mul.getKind() != AffineExprKind::Mul) return false;
+      auto d = dyn_cast<AffineDimExpr>(mul.getLHS());
+      auto c = dyn_cast<AffineConstantExpr>(mul.getRHS());
+      if (!d || !c) return false;
+      aPos = d.getPosition();
+      s = c.getValue();
+    }
+    unsigned bPos = bDim.getPosition();
+    bool aPar = iters[aPos] == utils::IteratorType::parallel;
+    bool bPar = iters[bPos] == utils::IteratorType::parallel;
+    if (aPar && !bPar) {
+      outDim = aPos;
+      winDim = bPos;
+      stride = s;
+      return true;
+    }
+    if (!aPar && bPar && s == 1) {
+      outDim = bPos;
+      winDim = aPos;
+      stride = 1;
+      return true;
+    }
+    return false;
+  };
+  return parse(add.getLHS(), add.getRHS()) || parse(add.getRHS(), add.getLHS());
+}
+
+FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp) {
+  if (!isa<linalg::GenericOp>(linalgOp.getOperation())) return failure();
+  if (linalgOp.getNumDpsInputs() != 2 || linalgOp.getNumDpsInits() != 1)
+    return failure();
+  if (linalgOp.getNumReductionLoops() != 2) return failure();
+  Block *body = linalgOp.getBlock();
+  if (!body || body->getNumArguments() != 3) return failure();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(body->getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1) return failure();
+  auto maxOp = yieldOp.getOperand(0).getDefiningOp<arith::MaximumFOp>();
+  if (!maxOp) return failure();
+  Value in = body->getArgument(0), out = body->getArgument(2);
+  if (!((maxOp.getLhs() == out && maxOp.getRhs() == in) ||
+        (maxOp.getLhs() == in && maxOp.getRhs() == out)))
+    return failure();
+
+  SmallVector<utils::IteratorType> iters = linalgOp.getIteratorTypesArray();
+  AffineMap inMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(0));
+  AffineMap winMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(1));
+  AffineMap outMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInitOperand(0));
+
+  // Output: identity over the parallel loops, which come first.
+  unsigned numPar = linalgOp.getNumParallelLoops();
+  if (outMap.getNumResults() != numPar) return failure();
+  for (auto [i, e] : llvm::enumerate(outMap.getResults())) {
+    auto d = dyn_cast<AffineDimExpr>(e);
+    if (!d || d.getPosition() != i || iters[i] != utils::IteratorType::parallel)
+      return failure();
+  }
+  // Window: the two reduction loops.
+  if (winMap.getNumResults() != 2) return failure();
+  SmallVector<unsigned> winDims;
+  for (AffineExpr e : winMap.getResults()) {
+    auto d = dyn_cast<AffineDimExpr>(e);
+    if (!d || iters[d.getPosition()] != utils::IteratorType::reduction)
+      return failure();
+    winDims.push_back(d.getPosition());
+  }
+  // Data input: one result per output dim, in the output's order, either the
+  // dim itself or `dim * stride + window`.
+  if (inMap.getNumResults() != numPar) return failure();
+  MaxPoolingDims dims;
+  for (auto [i, e] : llvm::enumerate(inMap.getResults())) {
+    if (auto d = dyn_cast<AffineDimExpr>(e)) {
+      if (d.getPosition() != i) return failure();
+      dims.plainDims.push_back(i);
+      continue;
+    }
+    unsigned o, k;
+    int64_t s;
+    if (!matchStridedDimExpr(e, iters, o, k, s) || o != i) return failure();
+    dims.spatialDims.push_back(o);
+    dims.windowDims.push_back(k);
+    dims.strides.push_back(s);
+  }
+  if (dims.spatialDims.size() != 2 || dims.windowDims != winDims)
+    return failure();
+  return dims;
+}
+
+bool isMaxPoolingOp(linalg::LinalgOp linalgOp) {
+  return succeeded(getMaxPoolingDims(linalgOp));
+}
+
+bool isUndefinedTensor(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (isa<tensor::EmptyOp>(def)) return true;
+    auto slice = dyn_cast<tensor::ExtractSliceOp>(def);
+    if (!slice) return false;
+    v = slice.getSource();
+  }
+  return false;
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

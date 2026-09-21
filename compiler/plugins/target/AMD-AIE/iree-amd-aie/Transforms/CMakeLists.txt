@@ -150,6 +150,7 @@ iree_cc_library(
     iree::target::amd-aie::air::AIRTransformPasses
     iree::target::amd-aie::Transforms::Utils
     IREELinalgTransformDialectPasses
+    MLIRArithTransforms
     MLIRFuncAllExtensions
     MLIRFuncDialect
     MLIRFunctionInterfaces

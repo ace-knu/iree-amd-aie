@@ -91,12 +91,15 @@ void AMDAIELowerExecutableTargetPass::runOnOperation() {
             config.getAs<StringAttr>(kTilePipelineOverrideName);
       }
       if (pipelineOverride) {
-        if (pipelineOverride.getValue() != kGemvPipelineName) {
+        if (pipelineOverride.getValue() == kGemvPipelineName) {
+          addGemvPassPipeline(executableLoweringPipeline);
+        } else if (pipelineOverride.getValue() == kPoolPipelineName) {
+          addPoolPassPipeline(executableLoweringPipeline);
+        } else {
           funcOp.emitOpError("unknown tile pipeline override '")
               << pipelineOverride.getValue() << "'";
           return signalPassFailure();
         }
-        addGemvPassPipeline(executableLoweringPipeline);
       } else if (useTilePipeline == TilePassPipeline::PackPeelPipeline) {
         addPackPeelBasedPassPipeline(executableLoweringPipeline,
                                      TilePassPipeline::PackPeelPipeline);

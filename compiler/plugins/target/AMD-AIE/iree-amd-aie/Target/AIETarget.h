@@ -112,6 +112,9 @@ struct AMDAIEOptions {
   // wrapped in transposes, so pooling matches the NHWC convs and the transposes
   // around each pool cancel. Stage 0 of the NPU pooling work; default off.
   bool poolingChannelsLast{false};
+  // Place 2-D max pooling dispatches on the NPU (pool tile pipeline) instead
+  // of the host. Stage 1 of the NPU pooling work; default off.
+  bool enablePooling{false};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
   bool enableCtrlPkt{false};
 
@@ -203,6 +206,12 @@ struct AMDAIEOptions {
         llvm::cl::desc("Lower small-M (GEMV-like) matmuls with the GEMV tile "
                        "pipeline instead of pack-peel (and skip their M/N "
                        "padding and N-splitting). Default true."));
+
+    binder.opt<bool>(
+        "iree-amdaie-enable-pooling", enablePooling, llvm::cl::cat(category),
+        llvm::cl::desc("Place 2-D max pooling dispatches on the NPU and lower "
+                       "them with the copy-based pool tile pipeline. Default "
+                       "false (pooling stays on the host)."));
 
     binder.opt<bool>(
         "iree-amdaie-pooling-channels-last", poolingChannelsLast,

@@ -121,6 +121,32 @@ bool isConv2DNhwcHwcfOp(Operation *linalgOp);
 bool isDepthwiseConv2DNhwcHwcOp(Operation *linalgOp);
 bool isConvOp(linalg::GenericOp linalgOp);
 
+/// Loop-dimension structure of a 2-D max pooling `linalg.generic` in a
+/// channels-last-like layout: the output indexing map is the identity over the
+/// parallel loops, the data input indexes each output dim either directly
+/// (`plainDims`: batch, channel) or as `d * stride + k` (`spatialDims`, with
+/// the window loop `k` in `windowDims` and the stride in `strides`), and the
+/// second input is the window (`windowDims` only). Body: `maximumf(out, in)`.
+struct MaxPoolingDims {
+  SmallVector<unsigned> plainDims;
+  SmallVector<unsigned> spatialDims;
+  SmallVector<unsigned> windowDims;
+  SmallVector<int64_t> strides;
+};
+FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp);
+
+/// Utility to identify a 2-D max pooling generic (see `getMaxPoolingDims`).
+bool isMaxPoolingOp(linalg::LinalgOp linalgOp);
+
+/// Returns true if `v` has no defined contents: it is a `tensor.empty`, or a
+/// slice of one. Such an operand (e.g. a pooling window that only sizes the
+/// reduction loops) never needs to be copied between memory levels.
+bool isUndefinedTensor(Value v);
+
+/// Whether pooling dispatches may be placed on the NPU (`pooling` in the
+/// executable target config; absent means disabled).
+bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr);
+
 /// Utility to convert a `uint32_t` value into a hex string.
 std::string utohexstr(uint32_t value, size_t width, bool header = true,
                       bool lowercase = false);

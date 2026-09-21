@@ -16,6 +16,8 @@
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <functional>
+
 #define DEBUG_TYPE "kernel-dispatch"
 
 namespace mlir::iree_compiler::AMDAIE {
@@ -1089,6 +1091,11 @@ static LogicalResult setRootConfigForElementwiseCopyPipeline(
 
 /// Sets the lowering configuration for dispatch region with root op that
 /// is a generic op.
+static LogicalResult setRootConfigForPoolPipeline(
+    mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
+    const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
+    uint32_t numRows, uint32_t numCols);
+
 static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    linalg::GenericOp genericOp,
                                    TilePassPipeline passPipeline,
@@ -1098,6 +1105,16 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    std::string enableAMDAIEUkernels) {
   assert(!getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(genericOp) &&
          "expected lowering_config is not set");
+
+  // Max pooling only reaches the backend when the Flow placement admitted it
+  // (`pooling` target config); it always takes the pool pipeline, whatever the
+  // global tile pipeline is (a module mixes it with conv matmuls).
+  if (FailureOr<MaxPoolingDims> pool = getMaxPoolingDims(genericOp);
+      succeeded(pool)) {
+    return setRootConfigForPoolPipeline(entryPointFn, genericOp, *pool,
+                                        getDeviceModel(targetDevice), numRows,
+                                        numCols);
+  }
 
   if (isMatmul(genericOp) || isMatmulTransposeA(genericOp) ||
       isMatmulTransposeB(genericOp)) {
@@ -1137,6 +1154,170 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
     }
   }
   return genericOp.emitError("Unhandled pass pipeline in setRootConfig.");
+}
+
+/// Tile choice for a 2-D max pooling generic (channels-last: `d*stride + k`
+/// input maps over the spatial dims, channel indexed directly; `maximumf`
+/// body) lowered with the copy-based pool pipeline.
+///
+/// Two forall levels over the output (parallel) dims only -- L0 is the block a
+/// memtile stages, L1 the tile one core computes; the window (reduction) dims
+/// are never tiled and stay inside the core op, so the input slice a level
+/// moves is the bounding box `(t - 1) * stride + window` (unit stride, which is
+/// what the DMA lowering supports). Search, over all divisor tiles:
+///   * L1: input slice + output tile, double-buffered, within core memory.
+///   * Cores: one output dim `d` is distributed over `n` cores (1-D forall,
+///     filled column first like GEMV): `n <= numRows` (one column) or a
+///     multiple of numRows filling whole columns. When several columns are
+///     used the L2 blocks are split across them along their first non-unit
+///     dim, so that dim must be `d`, split evenly, and (for a spatial dim) have
+///     non-overlapping windows (window == stride).
+///   * Block forall: at most two dims with more than one block (mapping limit).
+///   * L2: block input + output, double-buffered, per used column, within a
+///     memtile.
+/// Ranking: more cores, then a larger tile along the innermost (channel) dim
+/// (longer contiguous DMA bursts), then a larger L1 tile, then larger block
+/// extents from the innermost dim outwards.
+static LogicalResult setRootConfigForPoolPipeline(
+    mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
+    const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
+    uint32_t numRows, uint32_t numCols) {
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  if (llvm::any_of(bounds, ShapedType::isDynamic))
+    return linalgOp.emitOpError("pool pipeline expects static shapes");
+  unsigned numLoops = bounds.size();
+  unsigned numOut = linalgOp.getNumParallelLoops();
+  int64_t bytesIn =
+      getElementTypeOrSelf(linalgOp.getDpsInputOperand(0)->get().getType())
+          .getIntOrFloatBitWidth() /
+      8;
+  int64_t bytesOut =
+      getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get().getType())
+          .getIntOrFloatBitWidth() /
+      8;
+  SmallVector<int64_t> window(numOut, 1), stride(numOut, 1);
+  for (auto [i, o] : llvm::enumerate(pool.spatialDims)) {
+    window[o] = bounds[pool.windowDims[i]];
+    stride[o] = pool.strides[i];
+  }
+  auto inExtent = [&](unsigned d, int64_t t) {
+    return (t - 1) * stride[d] + window[d];
+  };
+  auto divisorsOf = [](int64_t n) {
+    SmallVector<int64_t> r;
+    for (int64_t i = 1; i <= n; ++i)
+      if (n % i == 0) r.push_back(i);
+    return r;
+  };
+  auto prodIn = [&](ArrayRef<int64_t> t) {
+    int64_t p = 1;
+    for (unsigned d = 0; d < numOut; ++d) p *= inExtent(d, t[d]);
+    return p;
+  };
+  auto prodOut = [&](ArrayRef<int64_t> t) {
+    int64_t p = 1;
+    for (unsigned d = 0; d < numOut; ++d) p *= t[d];
+    return p;
+  };
+  auto l1Bytes = [&](ArrayRef<int64_t> t) {
+    return 2 * (prodIn(t) * bytesIn + prodOut(t) * bytesOut);
+  };
+  int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
+  int64_t l2Limit = deviceModel.getMemTileSizeInBytes();
+  int64_t numCores = static_cast<int64_t>(numRows) * numCols;
+
+  SmallVector<int64_t> bestKey, bestTile, bestBlock;
+  int bestDim = -1;
+  auto consider = [&](ArrayRef<int64_t> t) {
+    int64_t l1 = l1Bytes(t);
+    if (l1 > l1Limit) return;
+    for (unsigned d = 0; d < numOut; ++d) {
+      for (int64_t n : divisorsOf(bounds[d] / t[d])) {
+        int64_t cores = n;
+        if (cores > numCores) continue;
+        int64_t cols = 1;
+        if (cores > numRows) {
+          if (cores % numRows != 0) continue;
+          cols = cores / numRows;
+          if (cols > numCols) continue;
+        }
+        SmallVector<int64_t> block(t.begin(), t.end());
+        block[d] = t[d] * n;
+        if (cols > 1) {
+          int fin = -1, fout = -1;
+          for (unsigned i = 0; i < numOut && fin < 0; ++i)
+            if (inExtent(i, block[i]) > 1) fin = i;
+          for (unsigned i = 0; i < numOut && fout < 0; ++i)
+            if (block[i] > 1) fout = i;
+          if (fin != static_cast<int>(d) || fout != static_cast<int>(d))
+            continue;
+          if (inExtent(d, block[d]) % cols != 0 || block[d] % cols != 0)
+            continue;
+          if (window[d] != stride[d]) continue;
+        }
+        int nonUnitBlocks = 0;
+        for (unsigned i = 0; i < numOut; ++i)
+          if (bounds[i] / block[i] > 1) ++nonUnitBlocks;
+        if (nonUnitBlocks > 2) continue;
+        int64_t l2 =
+            2 * (prodIn(block) * bytesIn + prodOut(block) * bytesOut) / cols;
+        if (l2 > l2Limit) continue;
+        SmallVector<int64_t> key = {cores, t[numOut - 1], l1};
+        for (int i = numOut - 1; i >= 0; --i) key.push_back(block[i]);
+        if (bestKey.empty() ||
+            std::lexicographical_compare(bestKey.begin(), bestKey.end(),
+                                         key.begin(), key.end())) {
+          bestKey = key;
+          bestTile.assign(t.begin(), t.end());
+          bestBlock = block;
+          bestDim = d;
+        }
+      }
+    }
+  };
+  SmallVector<SmallVector<int64_t>> divs;
+  for (unsigned d = 0; d < numOut; ++d) divs.push_back(divisorsOf(bounds[d]));
+  SmallVector<int64_t> tile(numOut, 1);
+  std::function<void(unsigned)> enumerateTiles = [&](unsigned d) {
+    if (d == numOut) {
+      consider(tile);
+      return;
+    }
+    for (int64_t t : divs[d]) {
+      tile[d] = t;
+      enumerateTiles(d + 1);
+    }
+  };
+  enumerateTiles(0);
+  if (bestKey.empty()) {
+    return linalgOp.emitOpError("pool tiles do not fit in core memory (")
+           << l1Limit << " bytes).";
+  }
+
+  // A dim whose tile equals its extent at a level is left untiled there (0),
+  // so each forall only carries the dims that actually iterate: the core
+  // forall is then 1-D over the distributed dim, which is what
+  // `distributeCoresToMultiColumns` (row = iv % numRows, col = iv / numRows)
+  // recognises; a forall with extra unit dims would keep every core in column
+  // 0 and run past the last row. The distributed dim is always tiled so a
+  // forall exists at both levels even when it has a single iteration.
+  SmallVector<int64_t> tileSizeLevel0(numLoops, 0);
+  SmallVector<int64_t> tileSizeLevel1(numLoops, 0);
+  for (unsigned d = 0; d < numOut; ++d) {
+    bool distributed = static_cast<int>(d) == bestDim;
+    tileSizeLevel0[d] =
+        (distributed || bestBlock[d] != bounds[d]) ? bestBlock[d] : 0;
+    tileSizeLevel1[d] =
+        (distributed || bestTile[d] != bestBlock[d]) ? bestTile[d] : 0;
+  }
+  MLIRContext *context = entryPointFn.getContext();
+  auto pipelineConfig = DictionaryAttr::get(
+      context, {NamedAttribute(StringAttr::get(context, kTilePipelineOverrideName),
+                               StringAttr::get(context, kPoolPipelineName))});
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPointFn, linalgOp, TileSizesListType{tileSizeLevel0, tileSizeLevel1},
+      IREE::Codegen::DispatchLoweringPassPipeline::Custom,
+      /*workgroupSize=*/{}, /*subgroupSize=*/{}, pipelineConfig);
 }
 
 /// Sets the lowering configuration for dispatch region with root op that

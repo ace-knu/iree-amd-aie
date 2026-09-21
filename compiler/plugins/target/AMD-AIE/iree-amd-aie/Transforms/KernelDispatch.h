@@ -76,6 +76,7 @@ enum class AllocScheme { Sequential, BankAware, None };
 /// cannot pick per dispatch); read by `AMDAIELowerExecutableTarget`.
 constexpr llvm::StringLiteral kTilePipelineOverrideName = "amdaie.tile_pipeline";
 constexpr llvm::StringLiteral kGemvPipelineName = "gemv";
+constexpr llvm::StringLiteral kPoolPipelineName = "pool";
 
 LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
                                   TilePassPipeline useTilePipeline,

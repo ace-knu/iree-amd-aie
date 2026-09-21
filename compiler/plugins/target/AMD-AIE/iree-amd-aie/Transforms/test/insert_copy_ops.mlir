@@ -130,3 +130,27 @@ func.func @matmul_second_copy_level(%arg0: tensor<1x64xbf16>, %arg1: tensor<32x6
        ins(%arg0, %arg1 : tensor<1x64xbf16>, tensor<32x64xbf16>) outs(%1 : tensor<1x32xf32>) -> tensor<1x32xf32>
   return %2 : tensor<1x32xf32>
 }
+
+// -----
+
+// An input with no defined contents (a pooling window `tensor.empty`, present
+// only to size the reduction loops) is not copied; the data input and the
+// result are.
+// CHECK-LABEL: func.func @pool_window_not_copied
+// CHECK:       %[[WIN:.+]] = tensor.empty() : tensor<2x2xf32>
+// CHECK:       %[[IN_ALLOC:.+]] = bufferization.alloc_tensor() : tensor<4x4x8xf32>
+// CHECK:       %[[IN:.+]] = linalg.copy ins(%{{.+}} : tensor<4x4x8xf32>) outs(%[[IN_ALLOC]]
+// CHECK-NOT:   linalg.copy ins(%[[WIN]]
+// CHECK:       %[[OUT_ALLOC:.+]] = bufferization.alloc_tensor() : tensor<2x2x8xf32>
+// CHECK:       linalg.generic
+// CHECK-SAME:    ins(%[[IN]], %[[WIN]] :
+// CHECK:       linalg.copy
+func.func @pool_window_not_copied(%in: tensor<4x4x8xf32>, %init: tensor<2x2x8xf32>) -> tensor<2x2x8xf32> {
+  %win = tensor.empty() : tensor<2x2xf32>
+  %r = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0 * 2 + d3, d1 * 2 + d4, d2)>, affine_map<(d0, d1, d2, d3, d4) -> (d3, d4)>, affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%in, %win : tensor<4x4x8xf32>, tensor<2x2xf32>) outs(%init : tensor<2x2x8xf32>) {
+  ^bb0(%a: f32, %w: f32, %o: f32):
+    %m = arith.maximumf %o, %a : f32
+    linalg.yield %m : f32
+  } -> tensor<2x2x8xf32>
+  return %r : tensor<2x2x8xf32>
+}
