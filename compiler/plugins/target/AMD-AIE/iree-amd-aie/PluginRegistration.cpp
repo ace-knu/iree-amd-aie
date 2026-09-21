@@ -62,6 +62,13 @@ struct AMDAIESession
           GlobalOptimization::DemoteType::BF16,
           GlobalOptimization::DemoteOperation::All));
     }
+    // Move NCHW max pooling to NHWC so it matches the channels-last convs
+    // (the upstream channels-last pass skips pooling); the transposes this
+    // inserts cancel against the conv-side ones downstream.
+    if (options.poolingChannelsLast) {
+      passManager.addPass(
+          AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass());
+    }
     // Inject the device topology now, while both device globals still exist
     // (an unused CPU device global would otherwise be DCE'd before the Flow
     // phase). The topology's symbol references keep the CPU device global

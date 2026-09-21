@@ -86,6 +86,7 @@ iree_lit_test_suite(
     "pack_and_transpose_level1.mlir"
     "pack_and_transpose_level2.mlir"
     "pack_to_air.mlir"
+    "convert_pooling_to_channels_last.mlir"
     "convert_to_dma.mlir"
     "convert_to_dma_failures.mlir"
     "pad.mlir"

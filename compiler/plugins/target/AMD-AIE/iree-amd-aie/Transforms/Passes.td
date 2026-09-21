@@ -94,6 +94,13 @@ def AMDAIEPadContractionDispatches :
       "mlir::iree_compiler::AMDAIE::createAMDAIEPadContractionDispatchesPass()";
 }
 
+def AMDAIEConvertPoolingToChannelsLast :
+    Pass<"iree-amdaie-convert-pooling-to-channels-last", ""> {
+  let summary = "Rewrite NCHW max pooling (`linalg.pooling_nchw_max`) as NHWC max pooling wrapped in `linalg.transpose` ops, so pooling follows the channels-last layout of the surrounding convolutions.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass()";
+}
+
 def AMDAIESplitLargeContractionDispatches :
     Pass<"iree-amdaie-split-large-contraction-dispatches", "ModuleOp"> {
   let summary = "Split a large-(K,N) transpose_b NPU matmul dispatch into N-chunk sub-dispatches (weight sliced along N) concatenated on the host, keeping each weight L3->L2 shim DMA within the shim's addressing limits.";

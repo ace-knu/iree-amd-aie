@@ -58,6 +58,7 @@ iree_cc_library(
     "AMDAIECanonicalizeDoublyStridedOp.cpp"
     "AMDAIECombineStridedOps.cpp"
     "AMDAIEConnectionToFlow.cpp"
+    "AMDAIEConvertPoolingToChannelsLast.cpp"
     "AMDAIEConvertToDma.cpp"
     "AMDAIEControlCodeForallToFor.cpp"
     "AMDAIEControlCodeLowering.cpp"

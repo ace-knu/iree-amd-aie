@@ -108,6 +108,10 @@ struct AMDAIEOptions {
   // M/N padding and N-splitting (KernelDispatch, AMDAIEPadContractionDispatches).
   // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
   bool enableGemvPipeline{true};
+  // Preprocessing: rewrite NCHW max pooling as NHWC (channels-last) pooling
+  // wrapped in transposes, so pooling matches the NHWC convs and the transposes
+  // around each pool cancel. Stage 0 of the NPU pooling work; default off.
+  bool poolingChannelsLast{false};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
   bool enableCtrlPkt{false};
 
@@ -199,6 +203,14 @@ struct AMDAIEOptions {
         llvm::cl::desc("Lower small-M (GEMV-like) matmuls with the GEMV tile "
                        "pipeline instead of pack-peel (and skip their M/N "
                        "padding and N-splitting). Default true."));
+
+    binder.opt<bool>(
+        "iree-amdaie-pooling-channels-last", poolingChannelsLast,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Rewrite NCHW max pooling as NHWC (channels-last) "
+                       "pooling in preprocessing, matching the channels-last "
+                       "convs so the transposes around each pool cancel. "
+                       "Default false."));
 
     /// Command line option for selecting the lowering pipeline to use to
     /// generate AIE DMA configurations, core code and control code.
