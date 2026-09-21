@@ -75,8 +75,10 @@ iree_cc_library(
     "AMDAIEDmaComposition.cpp"
     "AMDAIEDmaLoopSubsumption.cpp"
     "AMDAIEDmaToCircularDma.cpp"
+    "AMDAIEEraseDeadAllocAndStores.cpp"
     "AMDAIEFlattenLogicalObjectFifo.cpp"
     "AMDAIELinalgFunctionOutlining.cpp"
+    "AMDAIEFoldBroadcastAddIntoDest.cpp"
     "AMDAIEFoldDmaWaits.cpp"
     "AMDAIEFuseConsumerIntoLoop.cpp"
     "AMDAIEFuseFillIntoForall.cpp"
@@ -92,6 +94,8 @@ iree_cc_library(
     "AMDAIEInsertLoopsForVectorization.cpp"
     "AMDAIELinkExecutables.cpp"
     "AMDAIELocalizeLogicalObjectFifo.cpp"
+    "AMDAIEExpandRoundEven.cpp"
+    "AMDAIEIntegerRequantization.cpp"
     "AMDAIELoadStoreAlignmentReset.cpp"
     "AMDAIELowerExecutableTarget.cpp"
     "AMDAIELowerFuncArgs.cpp"
@@ -149,6 +153,8 @@ iree_cc_library(
     iree::target::amd-aie::air::AIRTransformPasses
     iree::target::amd-aie::Transforms::Utils
     IREELinalgTransformDialectPasses
+    MLIRArithTransforms
+    MLIRMathDialect
     MLIRFuncAllExtensions
     MLIRFuncDialect
     MLIRFunctionInterfaces
@@ -157,6 +163,7 @@ iree_cc_library(
     MLIRLinalgDialect
     MLIRLinalgTransforms
     MLIRMemRefDialect
+    MLIRMemRefUtils
     MLIRPDLDialect
     MLIRPDLInterpDialect
     MLIRPass

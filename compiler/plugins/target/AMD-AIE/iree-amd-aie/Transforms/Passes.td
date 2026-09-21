@@ -85,6 +85,13 @@ def AMDAIEAssignDeviceAffinities :
   let summary = "Pin each flow.dispatch to a device (contraction/conv -> NPU, else -> CPU) for heterogeneous CPU+NPU execution.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
+    let options = [
+      Option<"enableSoftmaxUkernel", "enable-softmax-ukernel", "bool",
+             /*default=*/"false",
+             "Also place a dispatch that is nothing but a quantized softmax on "
+             "the accelerator. Only correct when the softmax microkernel is "
+             "enabled, since that is what gives amd-aie a softmax at all.">,
+    ];
 }
 
 def AMDAIEPadContractionDispatches :
@@ -179,6 +186,28 @@ def AMDAIECanonicalizeDoublyStridedOp :
     Option<"hardwareAware", "hardware-aware", "bool", /*default=*/"true",
       "Whether the canonicalization should be hardware-aware.">
   ];
+}
+
+def AMDAIEEraseDeadAllocAndStores :
+  Pass<"iree-amdaie-erase-dead-alloc-and-stores", "ModuleOp"> {
+  let summary = "Erase memref allocations whose only uses are stores/dealloc.";
+  let description = [{
+  Tile-and-fuse can leave behind the original (now un-fused, whole-tensor)
+  producer of a fused op. After bufferization, its destination buffer is
+  never read by anything, only written and deallocated, but generic DCE
+  does not remove allocations even when unused. This pass calls the
+  upstream `memref::eraseDeadAllocAndStores` utility on the whole module to
+  clean these up. It must run after linalg ops have been converted to
+  loops with explicit memref.load/memref.store (e.g. after
+  ConvertLinalgToLoopsPass), since the utility only recognizes region-free
+  store ops, not linalg op writes. Left uncleaned, such an alloc can end up
+  a direct, unwrapped child of an `aie.device` region (when the dead
+  producer was never assigned to any core), and converting its surrounding
+  scf.for loops to a CFG later violates aie.device's single-block region
+  invariant.
+  }];
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEEraseDeadAllocAndStoresPass()";
 }
 
 def AMDAIECanonicalizeNpuDmaCpyNd :
@@ -399,6 +428,35 @@ def AMDAIEFoldDmaWaits :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldDmaWaitsPass()";
 }
 
+def AMDAIEFoldBroadcastAddIntoDest :
+  Pass<"iree-amdaie-fold-broadcast-add-into-dest", ""> {
+  let summary = "Fold a broadcast-then-add (e.g. bias-add) into a preceding "
+                "contraction's zero-initialized destination.";
+  let description = [{
+    Rewrites the pattern
+
+      %zeroed = linalg.fill ins(%cst_zero) outs(%init : !acc_type)
+      %mm = linalg.matmul/batch_matmul ins(...) outs(%zeroed) -> !acc_type
+      %out = linalg.generic { broadcast %bias, add to %mm } -> !acc_type
+
+    (a contraction's result added, via a broadcasting elementwise op, to a
+    smaller operand such as a bias vector) into
+
+      %bias_bcast = linalg.broadcast ins(%bias) outs(%init2 : !acc_type)
+      %out = linalg.matmul/batch_matmul ins(...) outs(%bias_bcast) -> !acc_type
+
+    i.e. it initializes the contraction's own accumulator with the
+    (broadcast) bias instead of zero, since a contraction op accumulates
+    additively on its destination operand -- eliminating the separate
+    elementwise op entirely. This mirrors upstream MLIR's
+    `linalg::populateFoldAddIntoDestPatterns` (`FoldAddIntoDest.cpp`), which
+    only matches a same-shape `linalg.add`; this pass handles the broadcasting
+    `linalg.generic` case instead, which is what a mismatched-shape bias-add
+    (e.g. matmul + [N]-shaped bias) actually lowers to.
+  }];
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBroadcastAddIntoDestPass()";
+}
+
 def AMDAIEFuseConsumerIntoLoop :
     InterfacePass<"iree-amdaie-fuse-consumer-into-loop", "mlir::FunctionOpInterface"> {
   let summary = "Fuse the consumer operation into the innermost last scf loop.";
@@ -551,6 +609,31 @@ def AMDAIELinkExecutables :
     Pass<"iree-amdaie-link-executables", "mlir::ModuleOp"> {
   let summary = "Links AMDAIE HAL executables within the top-level program module.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIELinkExecutablesPass()";
+}
+
+def AMDAIEIntegerRequantization :
+    Pass<"iree-amdaie-integer-requantization", ""> {
+    let summary = "Rewrite constant-scale float requantization tails as integer arithmetic.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEIntegerRequantizationPass()";
+    let description = [{
+      Turn `sitofp -> scale -> roundeven -> clamp -> fptosi` int8 requantization
+      tails into an integer multiply, a round-half-to-even shift and an integer
+      clamp. aie2p has no scalar float arithmetic, so the float form becomes
+      several KB of soft-float libcalls in each core's 16KB program memory.
+    }];
+}
+
+def AMDAIEExpandRoundEven :
+    Pass<"iree-amdaie-expand-roundeven", ""> {
+    let summary = "Expand math.roundeven into ops peano can select.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEExpandRoundEvenPass()";
+    let description = [{
+      Rewrite `math.roundeven` on f32 into fptosi/sitofp, fabs, fcmp and select.
+      Peano's aie2p backend legalizes none of the float rounding intrinsics, nor
+      `copysign`, which is what upstream's `math-expand-ops` lowers roundeven
+      through. Without this, any dispatch carrying a fused int8 requantization
+      (matmul -> scale -> round -> clamp -> fptosi) crashes llc.
+    }];
 }
 
 def AMDAIELoadStoreAlignmentReset :
@@ -981,6 +1064,12 @@ def AMDAIETileAndFuse :
       "Use scf.forall by default for the corresponding tiling level">,
     Option<"tilingLevel", "tiling-level", "int64_t", /*default=*/"-1",
       "Use default tiling level used to retrieve the configuration from lowering_config">,
+    Option<"fuseConsumers", "fuse-consumers", "bool", /*default=*/"false",
+           "Also fuse the root's elementwise consumers into the loop this "
+           "pass creates. Without it a dispatch shaped elementwise -> root -> "
+           "elementwise leaves its trailing elementwise op outside the loop, "
+           "untiled, so nothing downstream can pair it with the loop's own "
+           "shape and element type.">,
     Option<"tileElementwise", "tile-elementwise", "bool", /*default=*/"true",
       "Option to whether tile and fuse the elementwise op">,
     Option<"hardwareMapping", "hardware-mapping",

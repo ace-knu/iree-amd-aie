@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <cstdlib>
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
@@ -90,6 +91,12 @@ LogicalResult bufferize(AMDAIE::WorkgroupOp workgroupOp) {
         size_t numProducers = copyLikeProducers.size();
         size_t numConsumers = copyLikeConsumers.size();
         bool lockPairPerProducer = numProducers > 1 && numConsumers == 1;
+        // Debug-only escape hatch (not part of the fix): restores the pre-fix
+        // single shared lock pair, so experiments can measure when the old
+        // scheme's latent unsoundness actually becomes observable.
+        static const bool legacySharedLock =
+            std::getenv("AMDAIE_LEGACY_SHARED_LOCK") != nullptr;
+        if (legacySharedLock) lockPairPerProducer = false;
         size_t numLockPairs = lockPairPerProducer ? numProducers : 1;
         int8_t consumerLockInitValue{0};
         int8_t producerLockInitValue =

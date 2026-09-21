@@ -193,32 +193,43 @@ LogicalResult AIEDeviceBuilder::createDMABlocks(
     if (dimValues.empty()) {
       // Plain contiguous transfer: slice `i` is just [i * sliceLength, +len).
       sliceStride = sliceLength;
-    } else if (static_cast<int64_t>(dimValues.front().getSize()) == numParties &&
-               static_cast<int64_t>(dimValues.front().getStride()) ==
-                   sliceLength) {
-      // The outermost dimension *is* the party dimension (one iteration of it
-      // per party, stepping exactly one slice). Peel it off: every party's BD
-      // keeps the inner access pattern, based at its own slice.
+    } else {
+      // The outermost dimension is the one that walks across the parties, so
+      // each party owns a whole number of its steps and its own steps have to
+      // span exactly its own slice. Usually that is a single step per party,
+      // but an access pattern that never got coalesced spends several -- a
+      // [12, 32, 32] output split four ways arrives as one 384-step dimension
+      // of stride 32, i.e. 96 steps per party. Either way, peel the party's
+      // share off the front: every party's BD keeps the rest of the access
+      // pattern, based at its own slice.
+      int64_t outerSize = static_cast<int64_t>(dimValues.front().getSize());
+      int64_t outerStride = static_cast<int64_t>(dimValues.front().getStride());
+      int64_t stepsPerParty = outerSize / numParties;
+      if (outerSize % numParties != 0 ||
+          stepsPerParty * outerStride != sliceLength) {
+        return memOp->emitOpError()
+               << "cannot split this DMA access pattern into per-party BDs: "
+                  "its outermost dimension (size "
+               << outerSize << ", stride " << outerStride
+               << ") does not divide into " << numParties
+               << " groups of steps spanning one " << sliceLength
+               << "-element slice each, needed to synchronize against "
+               << numParties << " parties";
+      }
       sliceStride = sliceLength;
+      SmallVector<AIE::BDDimLayoutAttr> partyDims;
+      if (stepsPerParty > 1) {
+        partyDims.push_back(AIE::BDDimLayoutAttr::get(
+            rewriter.getContext(), stepsPerParty, outerStride));
+      }
       ArrayRef<AIE::BDDimLayoutAttr> innerDims = dimValues.drop_front();
+      partyDims.append(innerDims.begin(), innerDims.end());
       // A single innermost contiguous dimension is expressed as *empty* dims,
       // matching `convertSizeStrideToBDDimLayoutArrayAttr`.
-      if (innerDims.size() == 1 && innerDims.front().getStride() == 1) {
-        sliceDims = AIE::BDDimLayoutArrayAttr::get(
-            rewriter.getContext(), ArrayRef<AIE::BDDimLayoutAttr>{});
-      } else {
-        sliceDims =
-            AIE::BDDimLayoutArrayAttr::get(rewriter.getContext(), innerDims);
-      }
-    } else {
-      return memOp->emitOpError()
-             << "cannot split this DMA access pattern into per-party BDs: its "
-                "outermost dimension (size "
-             << dimValues.front().getSize() << ", stride "
-             << dimValues.front().getStride() << ") is not "
-             << numParties << " steps of one " << sliceLength
-             << "-element slice, needed to synchronize against " << numParties
-             << " parties";
+      if (partyDims.size() == 1 && partyDims.front().getStride() == 1)
+        partyDims.clear();
+      sliceDims =
+          AIE::BDDimLayoutArrayAttr::get(rewriter.getContext(), partyDims);
     }
     assert(acqNum == 1 && relNum == 1 &&
            "each per-party BD acquires and releases its own lock pair once");
@@ -1146,11 +1157,19 @@ LogicalResult AIEDeviceBuilder::workgroupToAIE(AMDAIE::WorkgroupOp workgroupOp,
           rewriter.setInsertionPoint(deviceBlock->getTerminator());
           if (!isa_and_present<AMDAIEDialect>(op->getDialect())) {
             rewriter.clone(*op, mapper);
-          } else {
-            op->emitOpError() << "is unsupported in lowering to AIE dialect";
-            return WalkResult::interrupt();
+            // `clone` already deep-copies `op`'s nested regions (including
+            // any terminator, e.g. a `linalg.yield`). This walk is
+            // PreOrder, so returning `advance` here would additionally
+            // descend into `op`'s own (original) nested ops and clone each
+            // of them a second time, inserted as stray top-level siblings
+            // at the current insertion point -- e.g. a duplicate,
+            // out-of-scope `linalg.yield` referencing a block argument that
+            // is no longer in scope. `skip` avoids re-visiting what `clone`
+            // already handled.
+            return WalkResult::skip();
           }
-          return WalkResult::advance();
+          op->emitOpError() << "is unsupported in lowering to AIE dialect";
+          return WalkResult::interrupt();
         });
   });
   if (res.wasInterrupted()) return failure();
@@ -1209,6 +1228,12 @@ LogicalResult AIEDeviceBuilder::lowerToAIE(ModuleOp moduleOp) {
       } else {
         if (!isa_and_present<AMDAIEDialect>(op->getDialect())) {
           rewriter.clone(*op, mapper);
+          // See the identical comment in the `.Default` case of the
+          // `workgroupToAIE` walk above: `clone` already deep-copies `op`'s
+          // nested regions, so descending further (via `advance`) would
+          // re-visit and re-clone its already-copied nested ops as stray
+          // top-level siblings.
+          return WalkResult::skip();
         }
       }
       return WalkResult::advance();

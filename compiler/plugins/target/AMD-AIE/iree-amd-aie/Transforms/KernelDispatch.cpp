@@ -849,9 +849,19 @@ static LogicalResult setRootConfigForSoftmaxCopyPipeline(
   // - the size of each element in bytes, and
   // - the use of double buffering
   ArrayRef<int64_t> inputShape = inputType.getShape();
-  assert(inputShape.size() == 2 && "expected the input as 2D");
+  int64_t rank = inputShape.size();
+  assert(rank >= 2 && "expected the input to have rank >= 2");
+  assert(softmaxOp.getDimension() == rank - 1 &&
+         "expected softmax to reduce over the last dimension");
+  // Dimensions between the outer parallel dimension and the reduction
+  // dimension remain whole in each tile. Account for them in the L1 budget.
+  int64_t innerUntiledSize = 1;
+  for (int64_t i = 1; i < rank - 1; ++i)
+    innerUntiledSize *= inputShape[i];
+  int64_t reductionSize = inputShape[rank - 1];
   int64_t maxM1Tile = (deviceModel.getCoreTileLocalMemorySize() - stackSize) /
-                      (inputShape[1] * (nBytesIn + nBytesOut) * 2);
+                      (reductionSize * innerUntiledSize *
+                       (nBytesIn + nBytesOut) * 2);
   if (maxM1Tile <= 0) {
     return softmaxOp.emitError(
         "failed to set the tile size, the reduction dimension is too large to "
@@ -866,9 +876,11 @@ static LogicalResult setRootConfigForSoftmaxCopyPipeline(
       std::min<int64_t>(findLargestFactor(inputShape[0], maxM1Tile), 32);
   int64_t m0Tile = std::min<int64_t>(inputShape[0], numRows * numCols * m1Tile);
 
-  SmallVector<int64_t> tileSizeLevel0 = {m0Tile, 0};
-  SmallVector<int64_t> tileSizeLevel1 = {m1Tile, 0};
-  SmallVector<int64_t> tileSizeLevel2 = {0, 0};
+  SmallVector<int64_t> tileSizeLevel0(rank, 0);
+  SmallVector<int64_t> tileSizeLevel1(rank, 0);
+  SmallVector<int64_t> tileSizeLevel2(rank, 0);
+  tileSizeLevel0[0] = m0Tile;
+  tileSizeLevel1[0] = m1Tile;
   if (failed(setOpConfigAndEntryPointFnTranslation(
           entryPointFn, softmaxOp,
           TileSizesListType{tileSizeLevel0, tileSizeLevel1, tileSizeLevel2},
@@ -1013,11 +1025,9 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    std::string enableAMDAIEUkernels) {
   assert(!getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(softmaxOp) &&
          "expected lowering_config is not set");
-  if (passPipeline == TilePassPipeline::GeneralCopyPipeline)
-    return setRootConfigForSoftmaxCopyPipeline(entryPointFn, softmaxOp,
-                                               targetDevice, numRows, numCols,
-                                               stackSize, enableAMDAIEUkernels);
-  return softmaxOp.emitError("Unhandled pass pipeline in setRootConfig.");
+  return setRootConfigForSoftmaxCopyPipeline(entryPointFn, softmaxOp,
+                                             targetDevice, numRows, numCols,
+                                             stackSize, enableAMDAIEUkernels);
 }
 
 /// Sets the lowering configuration for dispatch region with root op that

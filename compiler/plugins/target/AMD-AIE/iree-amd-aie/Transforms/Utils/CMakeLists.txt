@@ -14,6 +14,8 @@ iree_cc_library(
   HDRS
     "AMDAIEDevicePlacementUtils.h"
     "AMDAIEDmaUtils.h"
+    "AMDAIERequantUtils.h"
+    "AMDAIESoftmaxUtils.h"
     "AMDAIELogicalObjFifoSplittingUtils.h"
     "AMDAIEOpUtils.h"
     "AMDAIETileSizeSelectionUtils.h"
@@ -22,6 +24,8 @@ iree_cc_library(
   SRCS
     "AMDAIEDevicePlacementUtils.cpp"
     "AMDAIEDmaUtils.cpp"
+    "AMDAIERequantUtils.cpp"
+    "AMDAIESoftmaxUtils.cpp"
     "AMDAIELogicalObjFifoSplittingUtils.cpp"
     "AMDAIETileSizeSelectionUtils.cpp"
     "AMDAIETransactionBuilder.cpp"

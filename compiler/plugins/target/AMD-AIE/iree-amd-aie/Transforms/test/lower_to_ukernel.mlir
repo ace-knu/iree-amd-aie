@@ -384,3 +384,63 @@ func.func @trunci(%arg0 : tensor<16x16x4x4xi16>) -> tensor<16x16x4x4xi8> attribu
 // CHECK-SAME:       fn_def_attrs {link_with = "trunci.o"}
 // CHECK-SAME:       -> tensor<16x16x4x4xi8>
 // CHECK:        return %[[MICRO_KERNEL]]
+
+// -----
+
+// An int8 model's attention emits softmax wrapped in a dequantize/quantize
+// pair. All three ops become one microkernel call: the kernel already
+// multiplies by log2(e) on the way into exp2 and by 1/sum on the way out, so
+// the two scales ride along for free, and the dequantize/quantize stay off the
+// core, where aie2p's missing scalar float arithmetic would have made them
+// soft-float libcalls.
+// CHECK-LABEL:  func @quantized_softmax
+//   CHECK-NOT:    linalg.softmax
+//   CHECK-NOT:    math.roundeven
+//   CHECK-NOT:    arith.sitofp
+//       CHECK:    %[[MICRO_KERNEL:.*]] = iree_codegen.ukernel.generic "softmax_i8_96x32"
+//  CHECK-SAME:      tensor<3x32x32xi8>
+//  CHECK-SAME:      (%{{.*}}, %{{.*}} : f32, f32)
+//       CHECK:    return %[[MICRO_KERNEL]]
+func.func @quantized_softmax(%arg0 : tensor<3x32x32xi8>) -> tensor<3x32x32xi8> attributes {
+  hal.executable.target = #hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4", ukernels = "softmax"}>
+} {
+  %cs0 = arith.constant 0.592755735 : f32
+  %cs1 = arith.constant 1.250000e-01 : f32
+  %czp = arith.constant 0.000000e+00 : f32
+  %cq = arith.constant 0.00747933611 : f32
+  %clo = arith.constant -1.280000e+02 : f32
+  %chi = arith.constant 1.270000e+02 : f32
+  %ef = tensor.empty() : tensor<3x32x32xf32>
+  %ei = tensor.empty() : tensor<3x32x32xi8>
+  %dq = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+                       affine_map<(d0, d1, d2) -> (d0, d1, d2)>],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%arg0 : tensor<3x32x32xi8>) outs(%ef : tensor<3x32x32xf32>) {
+  ^bb0(%in: i8, %out: f32):
+    %0 = arith.sitofp %in : i8 to f32
+    %1 = arith.mulf %0, %cs0 : f32
+    %2 = arith.mulf %1, %cs1 : f32
+    // A folded-away all-zero attention mask leaves this behind; softmax is
+    // invariant to it.
+    %3 = arith.addf %2, %czp : f32
+    linalg.yield %3 : f32
+  } -> tensor<3x32x32xf32>
+  %sm = linalg.softmax dimension(2) ins(%dq : tensor<3x32x32xf32>)
+      outs(%ef : tensor<3x32x32xf32>) -> tensor<3x32x32xf32>
+  %q = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+                       affine_map<(d0, d1, d2) -> (d0, d1, d2)>],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%sm : tensor<3x32x32xf32>) outs(%ei : tensor<3x32x32xi8>) {
+  ^bb0(%in: f32, %out: i8):
+    %0 = arith.divf %in, %cq : f32
+    %1 = math.roundeven %0 : f32
+    %2 = arith.addf %1, %czp : f32
+    %3 = arith.maximumf %2, %clo : f32
+    %4 = arith.minimumf %3, %chi : f32
+    %5 = arith.fptosi %4 : f32 to i8
+    linalg.yield %5 : i8
+  } -> tensor<3x32x32xi8>
+  return %q : tensor<3x32x32xi8>
+}

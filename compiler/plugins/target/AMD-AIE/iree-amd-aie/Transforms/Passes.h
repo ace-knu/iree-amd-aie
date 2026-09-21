@@ -20,19 +20,22 @@ void addAMDAIEObjectFifoLoweringPasses(
     bool enableCoalescingLoops, bool enableCollapsingUnitDims,
     OutliningStrategy enableFunctionOutlining, int outliningLoopInCallCount,
     bool insertLoopAroundCoreBlock, uint32_t numCols, bool emitCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas);
+    uint32_t coreStackSize, bool reprogramDmas,
+    bool detectArbiterDeadlock = true);
 
 /// Add passes to lower from MLIR-AIR through AIE. This is
 /// currently the default passes used for lowering after IREEs tiling.
 void addMLIRAIRLoweringPasses(OpPassManager &passManager, AMDAIEDevice device,
                               TilePassPipeline useTilePipeline,
                               bool matmulElementwiseFusion,
-                              bool enableVectorizationPasses);
+                              bool enableVectorizationPasses,
+                              bool detectArbiterDeadlock = true);
 
 /// Add lowering passes from MLIR-AIE. This is
 /// currently the default passes used for lowering from AIE dialect.
 void addMLIRAIELoweringPasses(OpPassManager &passManager,
-                              TilePassPipeline useTilePipeline);
+                              TilePassPipeline useTilePipeline,
+                              bool detectArbiterDeadlock = true);
 
 /// Populates passes needed to lower linalg/arith/math ops to LLVM dialect via
 /// the structured ops path. The pass manager `pm` here operate on the module
@@ -45,7 +48,8 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int outliningLoopInCallCount, bool insertLoopAroundCoreBlock,
-    bool emitCtrlPkt, uint32_t coreStackSize, bool reprogramDmas);
+    bool emitCtrlPkt, uint32_t coreStackSize, bool reprogramDmas,
+    bool detectArbiterDeadlock = true);
 
 /// Populates passes needed to lower the IR via a Pack-Peel based approach.
 void addPackPeelBasedPassPipeline(OpPassManager &passManager,
@@ -82,7 +86,8 @@ std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 
 /// Create a pass to assign per-dispatch device affinities (contraction/conv ->
 /// NPU, everything else -> CPU) for heterogeneous CPU+NPU execution.
-std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass();
+std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass(
+    bool enableSoftmaxUkernel = false);
 
 /// Create a pass to pad the operands of NPU contraction dispatches up to the
 /// target's pack-peel tile multiples (so divisibility holds inside the
@@ -216,6 +221,10 @@ std::unique_ptr<Pass> createAMDAIEDmaLoopSubsumptionPass(
 /// Create a pass to convert dma operations to circular dma operations.
 std::unique_ptr<Pass> createAMDAIEDmaToCircularDmaPass();
 
+/// Create a pass to erase memref allocations whose only uses are
+/// stores/dealloc (dead allocations left behind by tile-and-fuse).
+std::unique_ptr<Pass> createAMDAIEEraseDeadAllocAndStoresPass();
+
 /// Create a pass to flatten the logical objectFifos.
 std::unique_ptr<Pass> createAMDAIEFlattenLogicalObjectFifoPass();
 
@@ -255,6 +264,11 @@ std::unique_ptr<Pass> createAMDAIEInsertLoopsForVectorizationPass(
 
 /// Create a pass to remove redundant DMA wait operations.
 std::unique_ptr<Pass> createAMDAIEFoldDmaWaitsPass();
+
+/// Create a pass to fold a broadcast-then-add (e.g. bias-add) into the
+/// zero-initialized destination of a preceding contraction (e.g. matmul),
+/// eliminating the separate elementwise op.
+std::unique_ptr<Pass> createAMDAIEFoldBroadcastAddIntoDestPass();
 
 /// Create a pass to fuse the producer operations into the scf loops.
 std::unique_ptr<Pass> createAMDAIEFuseProducerIntoLoopPass(
@@ -368,6 +382,12 @@ std::unique_ptr<Pass> createAMDAIEAddNoAliasFunctionArgumentsPass();
 
 /// Create pass to propagate pack/unpack ops using upstream patterns.
 std::unique_ptr<Pass> createAMDAIEPropagateDataLayoutPass();
+
+/// Create pass to rewrite float requantization tails as integer arithmetic.
+std::unique_ptr<Pass> createAMDAIEIntegerRequantizationPass();
+
+/// Create pass to expand math.roundeven into peano-selectable ops.
+std::unique_ptr<Pass> createAMDAIEExpandRoundEvenPass();
 
 /// Create pass to reset the alignment of LLVM load operations.
 std::unique_ptr<Pass> createAMDAIELoadStoreAlignmentResetPass();

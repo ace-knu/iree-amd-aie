@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIESoftmaxUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
@@ -254,6 +255,69 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchTruncIDAGForUKernel(
       genericMicroKernelOp.getOperation());
 }
 
+/// Replace a whole `dequantize -> softmax -> quantize` chain with one int8
+/// microkernel call, passing the two scales the surrounding ops would have
+/// applied element by element.
+///
+/// The kernel folds them where it was already multiplying: the input scale
+/// rides along with the `log2(e)` factor on the way into `exp2` (int8 values
+/// are whole numbers that bf16 holds exactly, so subtracting the row maximum
+/// stays exact), and the output scale rides along with `1 / sum` on the way
+/// out. Neither costs an extra operation, and it keeps the dequantize and
+/// quantize off the core, where aie2p's missing scalar float arithmetic would
+/// have turned them into soft-float libcalls.
+///
+/// This is rooted on the *quantize* op, the last of the three, so the rewrite
+/// replaces it and the other two become dead.
+static FailureOr<IREE::Codegen::UKernelOpInterface>
+matchQuantizedSoftmaxDAGForUKernel(RewriterBase &rewriter, Operation *op,
+                                   const std::string &ukernelName,
+                                   const std::string &ukernelObjectName) {
+  auto quantizeOp = dyn_cast<linalg::GenericOp>(op);
+  if (!quantizeOp)
+    return rewriter.notifyMatchFailure(op, "is not a linalg.generic");
+  FailureOr<QuantizedSoftmaxDAG> dag = matchQuantizedSoftmax(quantizeOp);
+  if (failed(dag))
+    return rewriter.notifyMatchFailure(
+        op, "is not the tail of a quantized softmax");
+
+  auto outType = llvm::cast<ShapedType>(quantizeOp.getDpsInits()[0].getType());
+  ArrayRef<int64_t> shape = outType.getShape();
+  // The kernel walks rows of the reduction dimension, so every dimension
+  // outside it collapses into the row count.
+  int64_t n = shape.back();
+  int64_t m = 1;
+  for (int64_t d : shape.drop_back()) m *= d;
+  if (n % 32 != 0)
+    return rewriter.notifyMatchFailure(
+        op, "row length is not a multiple of the kernel's vector width");
+
+  Location loc = quantizeOp.getLoc();
+  Type f32Ty = rewriter.getF32Type();
+  // exp2 is what the kernel evaluates, so the input scale is folded into the
+  // change of base rather than applied to the data.
+  auto log2eScaled = rewriter.create<arith::ConstantOp>(
+      loc, f32Ty,
+      rewriter.getF32FloatAttr(dag->inputScale * M_LOG2E));
+  auto outScale = rewriter.create<arith::ConstantOp>(
+      loc, f32Ty, rewriter.getF32FloatAttr(1.0 / dag->outputScale));
+
+  std::string elemTypeAndSize = "i8_" + std::to_string(m) + "x" +
+                                std::to_string(n);
+  FnNameAndDefAttrs fn = getFnNameAndDefAttrs(
+      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName);
+
+  auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
+      loc, outType, fn.name, ValueRange{dag->input},
+      quantizeOp.getDpsInits()[0],
+      ValueRange{log2eScaled.getResult(), outScale.getResult()},
+      /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
+      /*strided_outer_dims=*/0);
+
+  return cast<IREE::Codegen::UKernelOpInterface>(
+      genericMicroKernelOp.getOperation());
+}
+
 static FailureOr<IREE::Codegen::UKernelOpInterface> matchSoftmaxDAGForUKernel(
     RewriterBase &rewriter, Operation *op, const std::string &ukernelName,
     const std::string &ukernelObjectName) {
@@ -361,6 +425,12 @@ void AMDAIELowerToUKernelsPass::runOnOperation() {
       context, allTargets, matchFillDAGForUKernel, kFillUKernelName);
   patterns.insert<LowerToUKernelPattern<linalg::GenericOp>>(
       context, allTargets, matchTruncIDAGForUKernel, kTruncIUKernelName);
+  // Rooted on the quantize op, so it has to be tried before the plain softmax
+  // pattern gets a chance to rewrite the softmax on its own and break the
+  // chain this one needs to see.
+  patterns.insert<LowerToUKernelPattern<linalg::GenericOp>>(
+      context, allTargets, matchQuantizedSoftmaxDAGForUKernel,
+      kSoftmaxUKernelName);
   patterns.insert<LowerToUKernelPattern<linalg::SoftmaxOp>>(
       context, allTargets, matchSoftmaxDAGForUKernel, kSoftmaxUKernelName);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {

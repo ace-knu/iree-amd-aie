@@ -10,6 +10,7 @@
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -244,7 +245,14 @@ LogicalResult setDmaInputs(IRRewriter &rewriter, Operation *&operandOp,
                            SmallVector<OpFoldResult> &strides) {
   MLIRContext *ctx = operandOp->getContext();
   if (isa<memref::AllocOp>(operandOp) ||
-      isa<memref::AssumeAlignmentOp>(operandOp)) {
+      isa<memref::AssumeAlignmentOp>(operandOp) ||
+      isa<bufferization::ToBufferOp>(operandOp)) {
+    // A `bufferization.to_buffer` shows up here for a plain constant/argument
+    // tensor (e.g. a small fused elementwise op's bias) that our own passes
+    // never wrapped in an alloc/subview -- unlike a matmul's operands, which
+    // always arrive via `hal.interface.binding.subspan`. Its result memref
+    // covers the whole (statically-shaped) value with no special offset, same
+    // as `memref.alloc`, so it's handled identically below.
     MemRefType memRefType = cast<MemRefType>(operandOp->getResult(0).getType());
     auto [stridesI64, baseOffset] = memRefType.getStridesAndOffset();
     strides = getAsIndexOpFoldResult(ctx, stridesI64);

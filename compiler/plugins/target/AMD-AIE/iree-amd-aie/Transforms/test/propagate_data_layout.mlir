@@ -93,3 +93,23 @@ func.func @matmul_elementwise_1024x1024x512_i8xi8xi32(%arg0: tensor<1024x512xi8>
 //       CHECK: %[[PACK_2:.*]] = linalg.pack {{.*}} : tensor<64x64xi32> -> tensor<1x1x64x64xi32>
 //       CHECK: %[[ELEMENT:.*]] = linalg.generic {{.*}} ins(%[[MATMUL]], %[[PACK_2]] : tensor<1x1x64x64xi32>, tensor<1x1x64x64xi32>) outs(%[[EMPTY]] : tensor<1x1x64x64xi32>)
 //       CHECK: %[[UNPACK:.*]] = linalg.unpack %[[ELEMENT:.*]] {{.*}} :  tensor<1x1x64x64xi32> -> tensor<64x64xi32>
+
+// -----
+
+// A `tensor.expand_shape` that only inserts unit dimensions is a view, so
+// bubbling the pack up through it changes no layout -- it only puts the
+// reshape between the pack and the op that reads it, which costs that op the
+// producer fusion its later tiling depends on. The pack must stay put.
+
+func.func @pack_not_bubbled_through_unit_expand(%arg0: tensor<32x832xi8>) -> tensor<1x4x26x8x32xi8> {
+  %expanded = tensor.expand_shape %arg0 [[0, 1], [2]] output_shape [1, 32, 832]
+      : tensor<32x832xi8> into tensor<1x32x832xi8>
+  %0 = tensor.empty() : tensor<1x4x26x8x32xi8>
+  %pack = linalg.pack %expanded outer_dims_perm = [0, 1, 2] inner_dims_pos = [1, 2]
+      inner_tiles = [8, 32] into %0 : tensor<1x32x832xi8> -> tensor<1x4x26x8x32xi8>
+  return %pack : tensor<1x4x26x8x32xi8>
+}
+
+// CHECK-LABEL: pack_not_bubbled_through_unit_expand
+//       CHECK:   %[[EXPANDED:.*]] = tensor.expand_shape
+//       CHECK:   linalg.pack %[[EXPANDED]]

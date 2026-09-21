@@ -54,6 +54,15 @@ struct AMDAIESession
   }
 
   void extendPreprocessingPassPipeline(OpPassManager &passManager) override {
+    // Fold a broadcasting bias-add (matmul + an [N]-shaped bias, the common
+    // nn.Linear/torch.aten.linear shape) into the matmul's own
+    // zero-initialized accumulator, eliminating the separate elementwise op
+    // entirely. Must run before dispatch region formation (this is the Flow
+    // phase, not yet Dispatch Creation) so the fused result forms a single,
+    // ordinary-looking matmul dispatch -- avoiding the multi-op dispatch
+    // fusion machinery (separate elementwise consumer, its own DMA/tile
+    // placement) that a detached bias-add would otherwise require.
+    passManager.addPass(AMDAIE::createAMDAIEFoldBroadcastAddIntoDestPass());
     // Demote contraction (matmul + conv) inputs f32 -> bf16 before the named
     // ops are generalized (the upstream demote pass only matches named ops).
     // npu4 has no f32 vector path, so this is required to run f32 models.
@@ -67,14 +76,27 @@ struct AMDAIESession
     // phase). The topology's symbol references keep the CPU device global
     // alive through SymbolDCE. No dispatches exist yet, so no affinity is set
     // here. No-op unless both an amd-aie and an llvm-cpu device are declared.
-    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
+    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(
+        softmaxUkernelEnabled()));
+  }
+
+
+  /// Whether the softmax microkernel is enabled. `--iree-amdaie-enable-ukernels`
+  /// takes `none`, `all`, or a comma-separated list.
+  bool softmaxUkernelEnabled() const {
+    StringRef list(options.enableAMDAIEUkernels);
+    if (list == "all") return true;
+    SmallVector<StringRef> names;
+    list.split(names, ',');
+    return llvm::is_contained(names, "softmax");
   }
 
   void extendFlowTransformPassPipeline(OpPassManager &passManager) override {
     // Heterogeneous placement: pin contraction/conv dispatches to the amd-aie
     // (NPU) device and everything else (transposes, casts) to the CPU device.
     // No-op unless both an amd-aie and an llvm-cpu device are declared.
-    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
+    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(
+        softmaxUkernelEnabled()));
     // With affinity known per-dispatch, pad NPU contraction operands up to the
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.

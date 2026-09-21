@@ -115,3 +115,59 @@ func.func @distribute_l1_memory_for_1x1_case() {
   memref.dealloc %alloc : memref<2x2x32x32xi32, 2>
   return
 }
+
+// -----
+
+// A pack-peel accumulator whose zero-fill sits *outside* the per-thread forall:
+// the pack writes the whole undistributed L1 buffer once and each thread reads
+// a subview of it. This is what an int8 `batch_matmul_transpose_b` produces,
+// because there the fill lands one pack level short and so cannot be fused into
+// the forall.
+//
+// Every element of the packed buffer holds the same value, so the layout
+// changes on the way are irrelevant: the fill is re-emitted directly on the
+// per-thread allocation, and the pack that fed the shared one is dropped.
+// CHECK-LABEL: @distribute_l1_constant_fill_through_pack
+// CHECK: %[[PRIV:.+]] = memref.alloc() : memref<1x1x1x4x1x8x8xi32, 2 : i32>
+// CHECK-NOT: linalg.pack
+// CHECK: scf.forall
+// CHECK: linalg.fill
+// CHECK-SAME: outs(%[[PRIV]] : memref<1x1x1x4x1x8x8xi32, 2 : i32>)
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%[[PRIV]] : memref<1x1x1x4x1x8x8xi32, 2 : i32>)
+func.func @distribute_l1_constant_fill_through_pack(%out : memref<1x1x1x4x1x8x8xi32, 2 : i32>) {
+  %c0_i32 = arith.constant 0 : i32
+  %acc_l2 = memref.alloc() : memref<1x1x4x8x32xi32, 1 : i32>
+  %acc_copy = memref.alloc() : memref<1x1x4x8x32xi32, 1 : i32>
+  %acc_l1 = memref.alloc() : memref<1x1x4x4x1x8x8xi32, 2 : i32>
+  linalg.fill ins(%c0_i32 : i32) outs(%acc_l2 : memref<1x1x4x8x32xi32, 1 : i32>)
+  linalg.generic {
+    indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>,
+                     affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>],
+    iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+    ins(%acc_l2 : memref<1x1x4x8x32xi32, 1 : i32>)
+    outs(%acc_copy : memref<1x1x4x8x32xi32, 1 : i32>) {
+  ^bb0(%in: i32, %out_0: i32):
+    linalg.yield %in : i32
+  }
+  linalg.pack %acc_copy outer_dims_perm = [0, 1, 2, 4, 3] inner_dims_pos = [3, 4]
+    inner_tiles = [8, 8] into %acc_l1
+    : memref<1x1x4x8x32xi32, 1 : i32> -> memref<1x1x4x4x1x8x8xi32, 2 : i32>
+  scf.forall (%arg0, %arg1) in (4, 1) {
+    %subview = memref.subview %acc_l1[0, 0, %arg0, 0, 0, 0, 0] [1, 1, 1, 4, 1, 8, 8] [1, 1, 1, 1, 1, 1, 1]
+      : memref<1x1x4x4x1x8x8xi32, 2 : i32> to memref<1x1x1x4x1x8x8xi32, strided<[1024, 1024, 256, 64, 64, 8, 1], offset: ?>, 2 : i32>
+    linalg.generic {
+      indexing_maps = [affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1, d2, d3, d4, d5, d6)>,
+                       affine_map<(d0, d1, d2, d3, d4, d5, d6) -> (d0, d1, d2, d3, d4, d5, d6)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%subview : memref<1x1x1x4x1x8x8xi32, strided<[1024, 1024, 256, 64, 64, 8, 1], offset: ?>, 2 : i32>)
+      outs(%out : memref<1x1x1x4x1x8x8xi32, 2 : i32>) {
+    ^bb0(%in: i32, %o: i32):
+      linalg.yield %in : i32
+    }
+  } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
+  memref.dealloc %acc_l1 : memref<1x1x4x4x1x8x8xi32, 2 : i32>
+  memref.dealloc %acc_copy : memref<1x1x4x8x32xi32, 1 : i32>
+  memref.dealloc %acc_l2 : memref<1x1x4x8x32xi32, 1 : i32>
+  return
+}

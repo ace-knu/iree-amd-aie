@@ -741,27 +741,42 @@ class ShuffleOpConversion
   LogicalResult matchAndRewrite(
       aievec::ShuffleOp shuffleOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    assert(AMDAIE::isAie2(device) && "ShuffleOp currently only supports AIE2.");
+    bool isAie2 = AMDAIE::isAie2(device);
+    bool isAie2P = AMDAIE::isAie2P(device);
+    if (!isAie2 && !isAie2P) {
+      return rewriter.notifyMatchFailure(
+          shuffleOp, "aievec.shuffle is only lowered for AIE2 and AIE2P");
+    }
     auto loc = shuffleOp.getLoc();
     auto lhs = adaptor.getLhs();
     auto rhs = adaptor.getRhs();
     auto i32ty = rewriter.getI32Type();
     auto v16xi32ty = VectorType::get({16}, i32ty);
     if (!rhs) {
-      rhs = xllvm::AIEVec2UndefV16I32IntrOp::create(rewriter, loc, v16xi32ty);
+      // Single-operand modes ignore the second operand. AIE2 has a dedicated
+      // undef intrinsic for it; AIE2P has none, so use a plain LLVM undef.
+      rhs = isAie2
+                ? xllvm::AIEVec2UndefV16I32IntrOp::create(rewriter, loc,
+                                                          v16xi32ty)
+                      .getResult()
+                : LLVM::UndefOp::create(rewriter, loc, v16xi32ty).getResult();
     }
 
     auto modeAttrVal =
         LLVM::ConstantOp::create(rewriter, loc, i32ty,
                                  static_cast<int32_t>(shuffleOp.getMode()))
             .getResult();
-    auto vShuffleVal = xllvm::AIEVec2VectorShuffleIntrOp::create(
-                           rewriter, loc, v16xi32ty,
-                           forceCastOperandsToSignature(
-                               rewriter, loc,
-                               /*operands=*/{lhs, rhs, modeAttrVal},
-                               /*signature=*/{v16xi32ty, v16xi32ty, i32ty}))
-                           .getResult();
+    SmallVector<Value> operands = forceCastOperandsToSignature(
+        rewriter, loc,
+        /*operands=*/{lhs, rhs, modeAttrVal},
+        /*signature=*/{v16xi32ty, v16xi32ty, i32ty});
+    Value vShuffleVal =
+        isAie2 ? xllvm::AIEVec2VectorShuffleIntrOp::create(rewriter, loc,
+                                                          v16xi32ty, operands)
+                     .getResult()
+               : xllvm::AIEVec2PVectorShuffleIntrOp::create(
+                     rewriter, loc, v16xi32ty, operands)
+                     .getResult();
 
     vShuffleVal = forceCastValueToType(rewriter, loc, vShuffleVal,
                                        shuffleOp.getResult().getType());

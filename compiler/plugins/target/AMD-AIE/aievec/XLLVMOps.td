@@ -68,6 +68,18 @@ let extraClassDeclaration = [{
 }];
 }
 
+// ----- SHUFFLE -----
+
+// AIE2P's `vshuffle` takes the same (lhs, rhs, mode) shape as AIE2's. The mode
+// is an ordinary register operand of the instruction rather than part of its
+// encoding, so the intrinsic signature carries it as a plain i32.
+def AIEVec2PVectorShuffleIntrOp :
+    AIEVec2P_IntrOp<"vshuffle",
+        [TypeIs<"res", VectorOfLengthAndType<[16], [I32]>>]>,
+    Arguments<(ins VectorOfLengthAndType<[16], [I32]>:$lhs,
+                   VectorOfLengthAndType<[16], [I32]>:$rhs,
+                   I32:$mode)>;
+
 /////////////////////////////////////
 // Intrinsics for AIE2 ('phoenix') //
 /////////////////////////////////////

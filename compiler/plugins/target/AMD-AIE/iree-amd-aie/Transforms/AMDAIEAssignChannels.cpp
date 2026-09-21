@@ -4,17 +4,219 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <numeric>
+
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree-amd-aie/aie_runtime/Utils/ChannelGenerator.h"
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
+#include "mlir/IR/IRMapping.h"
 
 #define DEBUG_TYPE "iree-amdaie-assign-channels"
 
 namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
+
+/// EXPERIMENTAL. A packet connection whose source or target logical
+/// objectFifo spans more than one physical tile needs a hardware
+/// packet-flow-style distribution (one source routed to N destination
+/// channels, or vice versa) to reach every tile from a single connection.
+/// This has been found -- both in this project's own compiled output and
+/// independently reproduced with AMD's own mlir-aie/IRON toolchain -- to
+/// hang real npu4 hardware, regardless of `repeat_count`. (See
+/// docs/2026-08-27_matmul_bias_fusion_hang_root_cause_refined.md.) This is
+/// distinct from the case where a *circuit* connection spans multiple tiles,
+/// which is common (e.g. a real tiled operand shared identically by every
+/// row of one column) and does not hang -- so only `Packet` connections are
+/// split here, not every multi-tile connection.
+///
+/// Splits such a connection into fully independent single-tile connections
+/// (and single-tile objectFifos on the multi-tile side), each still fed from
+/// the same shared source/target on the other side. Verified on real
+/// hardware to avoid the hang (same source doc, mlir-aie repro).
+LogicalResult splitPacketConnectionAcrossTiles(
+    IRRewriter &rewriter, AMDAIE::ConnectionOp connectionOp,
+    AMDAIE::LogicalObjFifoOpInterface multiTileObjFifo) {
+  Operation *objFifoOp = multiTileObjFifo.getOperation();
+  Value objFifoResult = objFifoOp->getResult(0);
+  SmallVector<Value> tiles = multiTileObjFifo.getTiles();
+
+  // Find the `amdaie.core` a use belongs to, whether the use's owner is the
+  // core op itself directly (e.g. as an `in`/`out` dependency operand on the
+  // core op) or an op nested inside the core's body (e.g. a
+  // `logicalobjectfifo.acquire`/`release`/`access`). Declared once here so
+  // it's usable both for the transitive non-core chain below and inside the
+  // per-tile loop.
+  auto findEnclosingCore = [](Operation *user) -> AMDAIE::CoreOp {
+    if (auto coreOp = dyn_cast<AMDAIE::CoreOp>(user)) return coreOp;
+    return user->getParentOfType<AMDAIE::CoreOp>();
+  };
+
+  // Collect the full transitive chain of ops, starting from `connectionOp`,
+  // that live *outside* any `amdaie.core` -- e.g. a control-code-level
+  // `amdaie.npu.circular_dma_cpy_nd` that kicks off the DMA transfer this
+  // connection describes, which isn't scoped to any one tile at all.  These
+  // need to be cloned once per new per-tile connection too (not just
+  // redirected), and the whole chain has to be followed since such an op's
+  // own result can itself be consumed by further control-code-level ops.
+  SmallVector<Operation *> nonCoreChain;
+  {
+    SmallVector<Operation *> worklist = {connectionOp.getOperation()};
+    llvm::SmallPtrSet<Operation *, 8> seen;
+    while (!worklist.empty()) {
+      Operation *op = worklist.pop_back_val();
+      for (Value result : op->getResults()) {
+        for (Operation *user : result.getUsers()) {
+          if (findEnclosingCore(user)) continue;  // handled per-tile below
+          if (!seen.insert(user).second) continue;
+          nonCoreChain.push_back(user);
+          worklist.push_back(user);
+        }
+      }
+    }
+  }
+
+  for (Value tileVal : tiles) {
+    auto tileOp = dyn_cast_if_present<AMDAIE::TileOp>(tileVal.getDefiningOp());
+    if (!tileOp) return connectionOp.emitOpError() << "expected a tile op";
+    std::optional<int64_t> column = getConstantIntValue(tileOp.getCol());
+    std::optional<int64_t> row = getConstantIntValue(tileOp.getRow());
+    if (!column || !row) {
+      return connectionOp.emitOpError() << "tile has non-constant location";
+    }
+
+    // Clone the objectFifo with just this one tile. `replaceWithNewTiles`
+    // erases the op it's called on and returns a *new* op -- the new
+    // objectFifo must come from its return value, never from the
+    // pre-replace clone (which becomes dangling the moment it runs).
+    rewriter.setInsertionPoint(objFifoOp);
+    IRMapping objFifoMapper;
+    Operation *clonedObjFifoOp = rewriter.clone(*objFifoOp, objFifoMapper);
+    auto clonedObjFifo =
+        cast<AMDAIE::LogicalObjFifoOpInterface>(clonedObjFifoOp);
+    FailureOr<AMDAIE::LogicalObjFifoOpInterface> maybeNewObjFifo =
+        clonedObjFifo.replaceWithNewTiles(rewriter, {tileVal});
+    if (failed(maybeNewObjFifo)) {
+      return objFifoOp->emitOpError()
+            << "could not assign a single split-off tile";
+    }
+    Value newObjFifoResult = maybeNewObjFifo->getOperation()->getResult(0);
+
+    // Clone the connection, redirecting the multi-tile side to this tile's
+    // new independent objectFifo. The shared side (source or target,
+    // whichever wasn't the multi-tile one) is left as-is -- multiple
+    // independent connections reading/writing the same shared logical
+    // objectFifo is fine.
+    rewriter.setInsertionPoint(connectionOp);
+    IRMapping connMapper;
+    connMapper.map(objFifoResult, newObjFifoResult);
+    Operation *newConnOp =
+        rewriter.clone(*connectionOp.getOperation(), connMapper);
+
+    auto tileMatches = [&](AMDAIE::CoreOp coreOp) {
+      AMDAIE::TileOp userTileOp = coreOp.getTileOp();
+      return getConstantIntValue(userTileOp.getCol()) == column &&
+             getConstantIntValue(userTileOp.getRow()) == row;
+    };
+
+    // The connection's own result (an async completion token) can be
+    // consumed either directly by the `amdaie.core` op(s) it feeds (as an
+    // `in`/`out` dependency operand on the core op itself) or by an
+    // `acquire`/`release` op nested inside a core's body -- redirect exactly
+    // this tile's core from the shared token to this new per-tile
+    // connection's own token.
+    for (auto [oldResult, newResult] :
+         llvm::zip(connectionOp->getResults(), newConnOp->getResults())) {
+      for (OpOperand &use : llvm::make_early_inc_range(oldResult.getUses())) {
+        AMDAIE::CoreOp coreOp = findEnclosingCore(use.getOwner());
+        if (coreOp && tileMatches(coreOp)) use.set(newResult);
+      }
+    }
+
+    // Redirect any remaining direct uses of the shared objectFifo that live
+    // inside this specific tile's `amdaie.core` (e.g. a
+    // `logicalobjectfifo.access`) to the new per-tile copy.
+    for (OpOperand &use :
+         llvm::make_early_inc_range(objFifoResult.getUses())) {
+      Operation *user = use.getOwner();
+      if (user == connectionOp.getOperation()) continue;  // erased below
+      AMDAIE::CoreOp coreOp = findEnclosingCore(user);
+      if (coreOp && tileMatches(coreOp)) use.set(newObjFifoResult);
+    }
+
+    // Clone the transitive non-core chain (e.g. the control-code-level
+    // `amdaie.npu.circular_dma_cpy_nd` that kicks off this connection's DMA
+    // transfer, and anything further downstream of it) for this tile too,
+    // redirecting it to reference this tile's new connection instead of the
+    // shared one. `rewriter.clone` extends `chainMapper` itself as it goes,
+    // so cloning in dependency order (the order `nonCoreChain` was
+    // discovered in) correctly chains new-op-to-new-op references.
+    IRMapping chainMapper;
+    for (auto [oldRes, newRes] :
+         llvm::zip(connectionOp->getResults(), newConnOp->getResults())) {
+      chainMapper.map(oldRes, newRes);
+    }
+    chainMapper.map(objFifoResult, newObjFifoResult);
+    for (Operation *chainOp : nonCoreChain) {
+      rewriter.setInsertionPoint(chainOp);
+      rewriter.clone(*chainOp, chainMapper);
+    }
+  }
+
+  // The original shared connection, objectFifo, and non-core chain are now
+  // dead -- every use was redirected/cloned to a per-tile copy above. Erase
+  // the chain in reverse (a consumer before whatever it depends on).
+  for (Operation *chainOp : llvm::reverse(nonCoreChain)) {
+    rewriter.eraseOp(chainOp);
+  }
+  rewriter.eraseOp(connectionOp);
+  if (!objFifoResult.use_empty()) {
+    return objFifoOp->emitOpError()
+          << "still has uses after splitting across tiles that were not "
+             "inside an `amdaie.core` on one of its tiles, nor part of the "
+             "connection's own non-core use chain";
+  }
+  rewriter.eraseOp(objFifoOp);
+  return success();
+}
+
+/// EXPERIMENTAL. Finds every `Packet`-type connection whose source or target
+/// spans more than one tile and splits it via
+/// `splitPacketConnectionAcrossTiles`. Run before channel assignment, since
+/// it changes which (and how many) connections exist.
+LogicalResult splitMultiTilePacketConnections(AMDAIE::WorkgroupOp workgroupOp,
+                                              IRRewriter &rewriter) {
+  SmallVector<AMDAIE::ConnectionOp> packetConnections;
+  workgroupOp->walk([&](AMDAIE::ConnectionOp op) {
+    if (op.getConnectionType() == AMDAIE::ConnectionType::Packet) {
+      packetConnections.push_back(op);
+    }
+  });
+  for (AMDAIE::ConnectionOp connectionOp : packetConnections) {
+    auto sourceObjFifo =
+        dyn_cast_if_present<AMDAIE::LogicalObjFifoOpInterface>(
+            connectionOp.getSource().getDefiningOp());
+    auto targetObjFifo =
+        dyn_cast_if_present<AMDAIE::LogicalObjFifoOpInterface>(
+            connectionOp.getTarget().getDefiningOp());
+    if (targetObjFifo && targetObjFifo.getTiles().size() > 1) {
+      if (failed(splitPacketConnectionAcrossTiles(rewriter, connectionOp,
+                                                  targetObjFifo))) {
+        return failure();
+      }
+      continue;
+    }
+    if (sourceObjFifo && sourceObjFifo.getTiles().size() > 1) {
+      if (failed(splitPacketConnectionAcrossTiles(rewriter, connectionOp,
+                                                  sourceObjFifo))) {
+        return failure();
+      }
+    }
+  }
+  return success();
+}
 
 /// Initializes channel generators for tiles by detecting DMA channels
 /// previously assigned by other passes (e.g., for control packets) and
@@ -79,6 +281,70 @@ LogicalResult initializeChannelsGenerators(
 }
 
 /// Assign channels to `amdaie.connection` ops.
+/// Groups DMA channel indices of the given tile type by the buffer-
+/// descriptor-id pool they draw from (e.g. `MEMTILE` channels split into an
+/// even and an odd pool of 24 ids each; `SHIMNOC` channels share one pool).
+/// Each group is sorted ascending; groups are returned in ascending order of
+/// their first (smallest) member.
+SmallVector<SmallVector<uint8_t>> computeBdIdPools(
+    const AMDAIEDeviceModel &deviceModel, AMDAIETileType tileType) {
+  DenseMap<uint32_t, SmallVector<uint32_t>> channelToValidBdIds =
+      deviceModel.getChannelToValidBdIds(tileType);
+  SmallVector<uint32_t> channels;
+  for (auto &[channel, _] : channelToValidBdIds) channels.push_back(channel);
+  llvm::sort(channels);
+  SmallVector<SmallVector<uint8_t>> pools;
+  for (uint32_t channel : channels) {
+    const SmallVector<uint32_t> &validBdIds = channelToValidBdIds[channel];
+    bool merged = false;
+    for (SmallVector<uint8_t> &pool : pools) {
+      if (channelToValidBdIds[pool.front()] == validBdIds) {
+        pool.push_back(static_cast<uint8_t>(channel));
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) pools.push_back({static_cast<uint8_t>(channel)});
+  }
+  return pools;
+}
+
+/// Orders all channels across `pools` so channels in the least-contended
+/// pool (lowest summed `channelUseCounts` among its channels) come first.
+/// Used to steer packet-flow channel assignment away from a
+/// buffer-descriptor-id pool that's already heavily used -- e.g. when
+/// `splitMultiTilePacketConnections` turns one multi-tile connection into N
+/// independent single-tile ones, naively assigning channels index-first can
+/// pile most of that new demand onto a single BD-id pool (observed: one pool
+/// fully exhausted while a sibling pool still had headroom) even though a
+/// pool-balanced choice would fit. `channelUseCounts` counts *connections*
+/// routed to each channel so far (not just distinct channels touched) --
+/// distinct-channel counting saturates as soon as every channel in a pool
+/// has been touched once, at which point it can no longer tell a
+/// lightly-reused pool from a heavily-reused one. Channels within a pool
+/// keep ascending order relative to each other.
+SmallVector<uint8_t> buildBdIdAwareChannelOrder(
+    ArrayRef<SmallVector<uint8_t>> pools,
+    const DenseMap<uint8_t, int> &channelUseCounts) {
+  SmallVector<size_t> poolIndices(pools.size());
+  std::iota(poolIndices.begin(), poolIndices.end(), 0);
+  auto usageInPool = [&](size_t poolIdx) {
+    int total = 0;
+    for (uint8_t channel : pools[poolIdx]) {
+      auto it = channelUseCounts.find(channel);
+      if (it != channelUseCounts.end()) total += it->second;
+    }
+    return total;
+  };
+  llvm::stable_sort(poolIndices, [&](size_t a, size_t b) {
+    return usageInPool(a) < usageInPool(b);
+  });
+  SmallVector<uint8_t> order;
+  for (size_t poolIdx : poolIndices)
+    order.append(pools[poolIdx].begin(), pools[poolIdx].end());
+  return order;
+}
+
 LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
   IRRewriter rewriter(workgroupOp->getContext());
 
@@ -89,12 +355,53 @@ LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
            << "could not find an AMDAIEDevice attribute";
   }
   AMDAIEDeviceModel deviceModel = AMDAIE::getDeviceModel(device.value());
+  // EXPERIMENTAL: split multi-tile packet connections before anything below
+  // looks at connections/tiles, since this changes which connections exist.
+  if (failed(splitMultiTilePacketConnections(workgroupOp, rewriter))) {
+    return failure();
+  }
   // Initialize channel generators for tiles.
   DenseMap<Value, ChannelGenerator> tileToGeneratorMap;
   if (failed(initializeChannelsGenerators(workgroupOp, deviceModel,
                                           tileToGeneratorMap))) {
     return failure();
   }
+  // For packet-flow channel assignment, order candidate channels to prefer
+  // whichever buffer-descriptor-id pool is least contended so far on this
+  // tile, rather than always trying low indices first. See
+  // `buildBdIdAwareChannelOrder` for why this matters. Contention is tracked
+  // as a per-(tile, channel) connection count -- not just which channels
+  // have been touched -- since a pool's channels can all be touched once
+  // each while still differing a lot in how many connections (and thus BD
+  // ids) actually ended up on each of them. Producer (MM2S) and consumer
+  // (S2MM) channels are numbered independently, but on a `MEMTILE`/`SHIMNOC`
+  // both directions' `dma_bd`s are assigned from the *same* per-tile,
+  // per-parity buffer-descriptor-id pool (`AMDAIEAssignBufferDescriptorIDs`
+  // uses one generator per tile covering all of its blocks, regardless of
+  // direction) -- so a single combined counter is used here for both, not
+  // separate producer/consumer ones, or each direction would balance
+  // against a pool that looks emptier than it really is.
+  DenseMap<Value, DenseMap<uint8_t, int>> tileToChannelUseCounts;
+  auto computeBdIdAwareOrder = [&](Value tile,
+                                   const DenseMap<uint8_t, int> &useCounts)
+      -> SmallVector<uint8_t> {
+    auto tileOp = dyn_cast_if_present<AMDAIE::TileOp>(tile.getDefiningOp());
+    if (!tileOp) return {};
+    uint32_t col = getConstantIndexOrAssert(tileOp.getCol());
+    uint32_t row = getConstantIndexOrAssert(tileOp.getRow());
+    AMDAIETileType tileType = deviceModel.getTileType(col, row);
+    // `getChannelToValidBdIds` only has cases for `MEMTILE`/`SHIMNOC`; other
+    // tile types (e.g. compute cores) don't have a BD-id pool to be aware
+    // of here, so leave their channel order unchanged.
+    if (tileType != AMDAIETileType::MEMTILE &&
+        tileType != AMDAIETileType::SHIMNOC) {
+      return {};
+    }
+    SmallVector<SmallVector<uint8_t>> pools =
+        computeBdIdPools(deviceModel, tileType);
+    if (pools.size() <= 1) return {};
+    return buildBdIdAwareChannelOrder(pools, useCounts);
+  };
   // Get all `amdaie.connection` ops.
   SmallVector<AMDAIE::ConnectionOp> circuitConnections, packetConnections;
   workgroupOp->walk([&](AMDAIE::ConnectionOp op) {
@@ -136,12 +443,22 @@ LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
       for (Value tile : sourceLogicalObjFifo.getTiles()) {
         assert(tileToGeneratorMap.contains(tile) &&
                "no channel generator found for tile");
+        SmallVector<uint8_t> preferredOrder;
+        if (mode == ChannelAssignmentMode::RoundRobinPacketFlow) {
+          preferredOrder =
+              computeBdIdAwareOrder(tile, tileToChannelUseCounts[tile]);
+        }
         std::optional<uint8_t> maybeChannel =
-            tileToGeneratorMap[tile].getAndAssignProducerDMAChannel(mode);
+            tileToGeneratorMap[tile].getAndAssignProducerDMAChannel(
+                mode, preferredOrder);
         if (!maybeChannel) {
           return connectionOp.emitOpError()
                  << "no producer DMA channel available";
         }
+        // Count circuit assignments too: they draw from the same per-tile
+        // buffer-descriptor-id pool, so packet-flow balancing needs to see
+        // their load even though only packet flows get reordered.
+        ++tileToChannelUseCounts[tile][maybeChannel.value()];
         auto channelOp = rewriter.create<AMDAIE::ChannelOp>(
             rewriter.getUnknownLoc(), tile, maybeChannel.value(),
             StrmSwPortType::DMA, AMDAIE::DMAChannelDir::MM2S);
@@ -154,12 +471,22 @@ LogicalResult assignChannels(AMDAIE::WorkgroupOp workgroupOp) {
       for (Value tile : targetLogicalObjFifo.getTiles()) {
         assert(tileToGeneratorMap.contains(tile) &&
                "no channel generator found for tile");
+        SmallVector<uint8_t> preferredOrder;
+        if (mode == ChannelAssignmentMode::RoundRobinPacketFlow) {
+          preferredOrder =
+              computeBdIdAwareOrder(tile, tileToChannelUseCounts[tile]);
+        }
         std::optional<uint8_t> maybeChannel =
-            tileToGeneratorMap[tile].getAndAssignConsumerDMAChannel(mode);
+            tileToGeneratorMap[tile].getAndAssignConsumerDMAChannel(
+                mode, preferredOrder);
         if (!maybeChannel) {
           return connectionOp.emitOpError()
                  << "no consumer DMA channel available";
         }
+        // Count circuit assignments too: they draw from the same per-tile
+        // buffer-descriptor-id pool, so packet-flow balancing needs to see
+        // their load even though only packet flows get reordered.
+        ++tileToChannelUseCounts[tile][maybeChannel.value()];
         auto channelOp = rewriter.create<AMDAIE::ChannelOp>(
             rewriter.getUnknownLoc(), tile, maybeChannel.value(),
             StrmSwPortType::DMA, AMDAIE::DMAChannelDir::S2MM);

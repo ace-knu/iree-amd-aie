@@ -271,6 +271,45 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
                  return a.second > b.second;
                });
 
+    // Pre-compute a priority column per underlying memref, shared across
+    // every `LogicalObjectFifoFromMemrefOp` clone of that memref.
+    // `duplicateGlobalObjFifos` (run earlier in this pass) clones a
+    // memory-space-0 objectFifo once per copy-like use, so a genuine on-chip
+    // relay buffer used on both ends of a two-hop transfer (e.g. a shim-tile
+    // buffer that first receives data, then forwards it onward) ends up
+    // split into two independent clones, each visible to `getPriorityColumn`
+    // through only ONE of its two roles. The forwarding-role clone can
+    // resolve a column (from its already-tile-assigned downstream consumer);
+    // the receiving-role clone generally cannot, since its only information
+    // source is a sibling memory-space-0 buffer that hasn't been assigned a
+    // tile yet in this same pass, so it falls back to plain usage-based
+    // load-balancing -- which can and does pick a *different* column than
+    // its sibling. Since both clones back the same physical memref and must
+    // end up on the same physical tile (it's one real on-chip allocation,
+    // not independently re-bindable DRAM), propagate a resolved column to
+    // every clone sharing that memref -- but only to fill in an
+    // otherwise-unresolved (-1) clone, never to override one that
+    // independently resolved its own column, which is the normal, correct
+    // case for e.g. a matmul operand duplicated once per consuming column,
+    // where each clone legitimately wants its own (different) column.
+    DenseMap<Operation *, int64_t> memrefToPriorityCol;
+    DenseSet<Operation *> memrefHasConflict;
+    for (AMDAIE::LogicalObjFifoOpInterface objFifo : objFifos) {
+      auto fromMemrefOp = dyn_cast<AMDAIE::LogicalObjectFifoFromMemrefOp>(
+          objFifo.getOperation());
+      if (!fromMemrefOp) continue;
+      Operation *memrefDefOp = fromMemrefOp.getMemref().getDefiningOp();
+      if (!memrefDefOp) continue;
+      FailureOr<int64_t> maybeCol = getPriorityColumn(objFifo);
+      if (failed(maybeCol) || *maybeCol == -1) continue;
+      auto it = memrefToPriorityCol.find(memrefDefOp);
+      if (it == memrefToPriorityCol.end()) {
+        memrefToPriorityCol[memrefDefOp] = *maybeCol;
+      } else if (it->second != *maybeCol) {
+        memrefHasConflict.insert(memrefDefOp);
+      }
+    }
+
     for (auto [objFifo, allocationSizeInBytes] : objFifosAndSizes) {
       LLVM_DEBUG(llvm::dbgs()
                  << "Assign tile for objFifo: " << objFifo << "\n");
@@ -300,6 +339,17 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
       FailureOr<int64_t> maybePriorityCol = getPriorityColumn(objFifo);
       if (failed(maybePriorityCol)) return failure();
       int64_t priorityCol = maybePriorityCol.value();
+      if (priorityCol == -1) {
+        if (auto fromMemrefOp =
+                dyn_cast<AMDAIE::LogicalObjectFifoFromMemrefOp>(
+                    objFifo.getOperation())) {
+          Operation *memrefDefOp = fromMemrefOp.getMemref().getDefiningOp();
+          if (memrefDefOp && !memrefHasConflict.contains(memrefDefOp)) {
+            auto it = memrefToPriorityCol.find(memrefDefOp);
+            if (it != memrefToPriorityCol.end()) priorityCol = it->second;
+          }
+        }
+      }
       llvm::sort(tiles, [&](const TileLoc &a, const TileLoc &b) {
         if (a.col == priorityCol) return true;
         return a.col < b.col;
@@ -312,9 +362,20 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
       // more DMA channels on those new tiles than needed, and as a result we
       // will end up exhausting the DMA channels. Currently the following fix
       // works for L3 buffers.
+      //
+      // Only apply this when a priority column was actually found. `tiles` is
+      // sorted with the priority column first, then ascending by column
+      // (see above); without a priority column, truncating still keeps
+      // whichever tile sorted first -- always column 0 -- so every objectFifo
+      // that legitimately needs its own distinct tile (e.g. one L2 buffer per
+      // physical core in a many-core broadcast dispatch) but has no priority
+      // column resolved yet collapses onto the same single tile instead of
+      // being load-balanced by the usage-based fallback below. Skipping the
+      // truncation in that case lets that fallback (`tileLocAndUsageCmp`)
+      // actually see all candidate tiles and spread the assignment out.
       auto fromMemrefOp = dyn_cast<AMDAIE::LogicalObjectFifoFromMemrefOp>(
           objFifo.getOperation());
-      if (fromMemrefOp) {
+      if (fromMemrefOp && priorityCol != -1) {
         Operation *defOp = fromMemrefOp.getMemref().getDefiningOp();
         if (defOp && uniqueL3L2Pair.contains(defOp))
           tiles.truncate(

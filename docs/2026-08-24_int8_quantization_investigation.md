@@ -1,1429 +1,992 @@
-# int8 quantization investigation (in progress, paused)
-
-Goal: get `vector.contract` actually vectorized on npu4 (AIE2P/Strix). aievec's
-npu4 lowering (`getSuportedAie2PTypes()` in
-`compiler/plugins/target/AMD-AIE/aievec/VectorToAIEVecConversions.cpp:118-126`)
-only has an int8×int8→i32 matmul intrinsic — no bf16 entry. (npu1/AIE2/Phoenix
-does have both, `getSupportedAie2Types()` lines 107-115 — this is an
-npu4-backend-specific gap, not a general aievec limitation.) So the plan is:
-quantize a model to int8 instead of chasing bf16 vectorization support.
-
-This picks up after the BERT e2e work (`bert` branch, see
-`docs/2026-08-20_batch_matmul_row_overflow_fix.md` and the BERT model READMEs).
-Everything below happened in one session and is **not committed** — see
-"Current state / what's uncommitted" at the bottom before doing anything else.
-
-## 1. Does int8 vectorization even work at all? — YES, confirmed on real hardware
-
-Built a minimal single `[32,128]x[128,64]` matmul, quantized with
-`onnxruntime.quantization.quantize_static` (NOT `quantize_dynamic` — that
-function's signature in the installed onnxruntime 1.29.0 has no `quant_format`
-param and always emits `QuantizationMode.IntegerOps`/`MatMulInteger`-style
-output, not QDQ. `quantize_static` with `quant_format=QuantFormat.QDQ`,
-`weight_type`/`activation_type=QInt8`, `extra_options={"ActivationSymmetric":
-True}`, and a trivial random-data `CalibrationDataReader` does produce the
-expected `DequantizeLinear`/`QuantizeLinear`/`MatMul`/... QDQ node sequence).
-
-Confirmed the **entire compiler chain from ONNX QDQ down to `aievec.matmul` is
-already wired up unconditionally, with zero new passes needed**:
-
-1. ONNX `QuantizeLinear`/`DequantizeLinear` → torch-mlir's ONNX importer
-   already lowers these (`third_party/iree/third_party/torch-mlir/lib/Conversion/TorchOnnxToTorch/DefaultDomainAtoF.cpp:2339`)
-   to `torch.aten._make_per_tensor_quantized_tensor` + `aten.dequantize`.
-2. IREE's Torch input pipeline (`createTorchToIREEPipeline`,
-   `compiler/plugins/input/Torch/InputConversion/Passes.cpp:60`) unconditionally
-   runs torch-mlir's `FuseQuantizedOps` pass
-   (`third_party/iree/third_party/torch-mlir/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp`),
-   fusing the Q/DQ chain into real int8 arithmetic before `aten.mm`/`aten.matmul`.
-3. Lowered to linalg this becomes `linalg.quantized_matmul` (4-input: lhs, rhs,
-   lhsZp, rhsZp). IREE's GlobalOptimization pipeline unconditionally runs
-   `LinalgQuantizedMatmulToMatmulPass`
-   (`third_party/iree/compiler/src/iree/compiler/GlobalOptimization/QuantizedMatmulToMatmul.cpp`),
-   turning it into a plain int8 `linalg.matmul` (with a zero-point correction
-   term, or none at all — the "easy case" — when both zero points are
-   compile-time-constant zero, i.e. symmetric quantization).
-4. From there it hits the existing, already-working AMD-AIE int8 path
-   (`AMDAIEPadContractionDispatches`, `getSuportedAie2PTypes`).
-
-Compiled with the vgg16/bert_tiny flag recipe **minus**
-`--iree-amdaie-demote-contraction-inputs-to-bf16` (irrelevant — inputs are
-already int8) and **minus** `--iree-amdaie-enable-vectorization-passes=false`
-(this flag defaults to `true` — `AIETarget.h:58` — just omit it).
-
-**Verified on real npu4 hardware**: `aievec.matmul %_, %_, %_ : vector<8x8xi8>,
-vector<8x8xi8> into vector<8x8xi32>` appears in the `--mlir-print-ir-after-all`
-dump (not a scalar fallback), `iree-run-module` exits 0, output correlates
-0.9998 with the fp32 reference — with zero calibration tuning effort.
-
-A red herring ruled out along the way: `FuseDequantizationMatmul`
-(mentioned in `docs/2026-08-16_frontend_lowering_passes.md`) is NOT relevant
-here — it's a weight-only-dequant "group dequant" reassociation that produces
-*float* arithmetic (memory-saving, not compute), and sits behind a
-default-off flag (`clEnableQuantizedMatmulReassociation`).
-
-Repro scratch (gitignored, `_local/int8_debug/`, not committed):
-`gen_and_quant.py` (2D matmul gen+quantize), outputs in `out/mm_int8.*`.
-
-## 2. VGG16 attempt — blocked on a real upstream `third_party/iree` bug
-
-Tried quantizing VGG16's 13 Conv + 3 Gemm layers
-(`quant_vgg16.py`, `op_types_to_quantize=["Conv","Gemm"]`, static QDQ,
-8 random `[1,3,224,224]` calibration samples). Gemm alone would work fine (see
-§1) but Conv fails to compile:
-
-```
-error: 'linalg.generic' op operand #2 must be variadic of shaped of any type
-values, but got 'i32'
-```
-
-**Root cause** (confirmed via a research pass, file:line-cited):
-`third_party/iree/compiler/src/iree/compiler/Preprocessing/Common/ConvertConvToChannelsLast.cpp:358-359`
-(`transposeConvLikeLinalgOp`) hardcodes operand index 2 as the DPS "output":
-
-```cpp
-Value input = convOp->getOperand(0);
-Value filter = convOp->getOperand(1);
-Value output = convOp->getOperand(2);   // <-- hardcoded index
-```
-
-This is only valid for the standard 2-input+1-output conv layout. A
-**quantized** conv is `linalg::Conv2DNchwFchwQOp` (built by torch-mlir's
-`ConvertAtenConvolutionOp`,
-`third_party/iree/third_party/torch-mlir/lib/Conversion/TorchToLinalg/Linear.cpp:1239`),
-which has 5 operands: `input=0, filter=1, inputZp=2, weightZp=3, output=4`.
-So the channels-last pass grabs `inputZp` (a bare scalar `i32`) as "output"
-instead of the real output tensor at index 4 — the real output silently
-disappears and a malformed `linalg.generic` with a scalar wired as the DPS
-output is built (exactly the error above). Channels-last conversion is
-mandatory for AIE conv codegen (standard NCHW conv codegen isn't supported on
-this backend at all), so there's no flag to route around this.
-
-**This needs a real patch to vendored `third_party/iree`** (not this repo's
-own AMD-AIE plugin code) — `getDpsInputOperand()`/`getDpsInits()` instead of
-fixed indices, threading zero-point operands through the transpose/pack logic
-and `defaultConvBuilderFn`/`namedConvBuilderFn`, likely also a dedicated
-`Conv2DNchwFchwQOp`→`Conv2DNhwcHwcfQOp` named-op channels-last pattern
-(paralleling the existing non-quantized `ConvertLinalgConvNchwFchw` around
-line 451 of the same file). **Not started.** `LinalgQuantizedConvToConv`
-(the pass that would eventually turn a valid `linalg.quantized_conv` into a
-plain conv) never even gets a chance to run — the IR is already malformed
-and rejected by the verifier before reaching that stage.
-
-Given this, the user chose to switch focus to BERT (no conv at all — purely
-matmul/batch_matmul) rather than sink time into this upstream conv fix right
-now. VGG16 int8 is parked at "Gemm-only would work, Conv is a real
-multi-hour third_party/iree patch, not attempted."
-
-## 3. BERT batch matmul (attention QK^T / Attn@V) — found and fixed a second gap
-
-Built a minimal batched matmul repro matching BERT attention's shape: two
-**dynamic** (non-constant, non-weight) activations, `x1:[2,16,16]`,
-`x2:[2,16,64]`, `y = x1 @ x2` (`gen_and_quant_bmm.py`). Confirmed
-`onnxruntime.quantize_static` happily QDQ-quantizes a MatMul between two
-dynamic activations (both get their own Q/DQ pairs) — this is realistic for
-attention, not just weight-quantization.
-
-First compile attempt crashed in this repo's own
-`AMDAIEBufferizeToAllocation.cpp:210` ("expected only one target op, found 2
-target ops"). Digging into *why* revealed the real, deeper problem — dumping
-IR after `iree-global-opt-quantized-matmul-to-matmul` showed the batched
-matmul was being computed in **plain float**, sandwiched between a quantize
-and dequantize:  `i8 → dequant(f32) → linalg.batch_matmul (f32!) → quant(i8) →
-dequant(f32)`. Quantization was happening, but the actual arithmetic wasn't —
-zero vectorization benefit even if it hadn't crashed.
-
-**Root cause, precisely pinned down** (unlike VGG's Conv bug, this one is
-*not* an IREE-level gap):
-
-- `LinalgQuantizedMatmulToMatmulPass`
-  (`third_party/iree/compiler/src/iree/compiler/GlobalOptimization/QuantizedMatmulToMatmul.cpp:44`)
-  already fully supports the batch case —
-  `isa<linalg::QuantizedMatmulOp, linalg::QuantizedBatchMatmulOp>(op)`, with
-  batch-aware affine maps throughout. **Not the bottleneck.**
-- Torch-mlir's `ConvertAtenMatmulOp`
-  (`third_party/iree/third_party/torch-mlir/lib/Conversion/TorchToLinalg/Linear.cpp:241`)
-  already emits `linalg::QuantizedBatchMatmulOp` for its batch branches
-  (lines ~545, ~614). **Also not the bottleneck.**
-- The real gap: ONNX's batched `MatMul` (two rank-3 operands) imports to
-  **`torch.aten.bmm`**, not `torch.aten.matmul`. Confirmed by dumping IR
-  before/after the `torch-fuse-quantized-ops` pass — completely unchanged,
-  because:
-  - `FuseQuantizedOps.cpp`'s pattern list
-    (`third_party/iree/third_party/torch-mlir/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp:452-465`)
-    had `QuantizeOperandsPastCommutingOps<AtenMatmulOp,2>` and
-    `<AtenMmOp,4>` — but nothing for `AtenBmmOp`.
-  - `ConvertAtenBmmOp`
-    (`.../Conversion/TorchToLinalg/Linear.cpp:696`, original code) never
-    called `getZeroPoint` at all and unconditionally built a plain float
-    `linalg::BatchMatmulOp`.
-
-### Fix applied (uncommitted — see bottom)
-
-Two edits, both in the vendored `third_party/iree/third_party/torch-mlir`
-submodule:
-
-1. `FuseQuantizedOps.cpp` — added
-   `QuantizeOperandsPastCommutingOps<AtenBmmOp, 2>,` next to the
-   `AtenMatmulOp` entry. (`AtenBmmOp` needs no `QuantInfo` specialization —
-   the default `operandsToQuantize = {0, 1}` is already correct for its
-   `(self, mat2)` operand pair.)
-2. `Linear.cpp`'s `ConvertAtenBmmOp` — added zero-point detection
-   (`getZeroPoint(op.getSelf(), lhsZeroPoint)` /
-   `getZeroPoint(op.getMat2(), rhsZeroPoint)`, mixed-quantization mismatch
-   check) and, when present, the same truncate/`signShift`/
-   `linalg::QuantizedBatchMatmulOp`-construction dance
-   `ConvertAtenMatmulOp`'s `maxRank==3` branch already does (lines ~538-565
-   of the same file) — simpler here since `aten.bmm`'s operands are always
-   exactly rank 3 on both sides, no broadcasting/collapsing needed.
-
-Rebuilt `iree-compile` incrementally (only **14 seconds**, ccache warm —
-`cmake --build build -j 6 --target iree-compile`).
-
-**Confirmed working at the IR level**: recompiling the bmm repro now produces
-a real `linalg.batch_matmul ins(%3, %5 : tensor<2x16x16xi8>,
-tensor<2x16x64xi8>) outs(... : tensor<2x16x64xi32>)` (no float sandwich), and
-`aievec.matmul` appears 20 times in the full IR dump — it vectorizes.
-
-**But wrong on real hardware — this is the open bug, see §4.**
-
-Repro scratch: `gen_and_quant_bmm.py`, outputs in
-`out/bmm_int8.*`, `out/bmm_int8_v2.vmfb` (post-patch compile),
-`out/bmm_out*.npy`.
-
-## 4. Update: root-caused and mostly fixed — see §4a for what's still open
-
-**The correctness bug described below was root-caused and fixed.** Root
-cause: the §3 patch only added half of what `AtenMatmulOp`/`AtenMmOp` already
-had. `FuseQuantizedOps.cpp`'s pattern list also has `QuantizeAccumulator<AtenMmOp>`/
-`<AtenMatmulOp>` (line ~464) — a *second* pattern, independent from
-`QuantizeOperandsPastCommutingOps`, that handles the **output** side: it
-redeclares the op's result as `!torch.qint32` (raw accumulator), wraps it with
-`Aten_MakePerTensorQuantizedTensorOp` using `scale = lhsScale * rhsScale`, then
-`AtenDequantizeTensorOp`s it back to the original float type — this is where
-the actual "multiply the raw i32 accumulator by the combined input scale"
-math happens. I had only added `QuantizeOperandsPastCommutingOps<AtenBmmOp,2>`
-(input side) and missed `QuantizeAccumulator<AtenBmmOp>` (output side).
-Without it, `aten.bmm`'s declared result type stayed plain `f32`, so my
-`ConvertAtenBmmOp` patch's `accumulatorDType(i32) != resultElementType(f32)`
-branch fired and called `torch_to_linalg::convertTensorToElementType` — which
-does a **naive `sitofp` type cast, not a scaled dequantization**
-(`third_party/iree/third_party/torch-mlir/lib/Conversion/TorchToLinalg/Utils.cpp:631-642`,
-just `convertScalarToDtype`). So the raw int32 accumulator (e.g. `14411`) got
-reinterpreted as `14411.0f` with no scale multiply, and the downstream
-(unfused, unmodified) `aten.quantize_per_tensor(14411.0, y_scale=0.0015,...)`
-naturally saturated to the int8 extremes on nearly every element — exactly
-matching the observed `0.19019213`/`-0.19168971` (`≈ ±127/-128 * y_scale`)
-pattern.
-
-Confirmed by hand-simulating the *intended* correct math in plain numpy with
-the real calibrated scales (`x1_scale=0.0031067322`, `x2_scale=0.0035386747`,
-`y_scale=0.0014975759`, all zero-points 0): quantize→int8-batch-matmul→
-dequantize gives corr 0.9998 against `bmm_ref.npy`, with **zero** saturation —
-proving the scales/calibration were always fine, and the bug was purely in
-the missing accumulator-rescaling pattern.
-
-**Fix**: added `QuantizeAccumulator<AtenBmmOp>,` next to
-`QuantizeAccumulator<AtenMmOp>, QuantizeAccumulator<AtenMatmulOp>` in
-`FuseQuantizedOps.cpp`'s pattern list (line ~464-465). Rebuilt (10s
-incremental). Confirmed:
-- **CPU-only** (`--iree-hal-target-device=local`, no NPU at all): corr
-  **0.9998**.
-- **npu4, vectorization OFF**: corr **0.9998**, both batches correct.
-- **npu4, vectorization ON** (the actual goal): batch index 1 is now
-  correct, but **batch index 0 is still exactly all-zero**. See §4a.
-
-This also means the earlier "compare against bf16" instinct and the initial
-"maybe it's an NPU DMA/packing bug" hypothesis were both wrong — the bug was
-100% in the torch-mlir patch from §3, reproducible on plain CPU codegen, with
-nothing AMD-AIE-specific about it. Good general lesson: when a *newly added*
-code path misbehaves identically on a completely different backend (CPU),
-suspect the new code/pass itself before suspecting the specialized backend.
-
-## 4a. OPEN, narrower bug: batch index 0 is all-zero, but only with vectorization ON
-
-Shape: batch=2, M=16, K=16, N=64 (padded to M=32,K=32 by the existing
-`AMDAIEPadContractionDispatches` batch-matmul padding path from
-`docs/2026-08-20_batch_matmul_row_overflow_fix.md` — **confirmed still
-working correctly** for int8 via
-`--mlir-print-ir-before/after=iree-amdaie-pad-contraction-dispatches`: pads
-via `pad_dispatch_0`/`pad_dispatch_1`, crops via `crop_dispatch_2`, same
-structure as the bf16 case). This is deliberately the exact shape that
-originally triggered the bf16 row-overflow bug — that bf16 case is long since
-fixed and verified (corr 0.999997).
-
-**Before the §4 accumulator fix**, the symptom looked like a plausible NPU
-DMA/packing bug (all elements saturated at int8 extremes, batch 0 all-zero
-only with vectorization on). **After the §4 fix**, most of that turned out
-to be downstream noise from the accumulator bug — the "both batches show the
-saturation pattern" symptom (vectorization off, pre-fix) is fully explained
-by §4's root cause alone and has nothing to do with the NPU or batching.
-
-**What's confirmed genuinely open, post-fix** — the CPU-only sanity check
-from the original plan *was run* (see §4, "Confirmed" bullets) and gives a
-clean, narrow answer:
-
-| Target | Vectorization | Correctness |
-| --- | --- | --- |
-| CPU only (`--iree-hal-target-device=local`, no NPU) | n/a | **corr 0.9998**, both batches correct |
-| npu4 | off | **corr 0.9998**, both batches correct |
-| npu4 | **on** (the actual goal) | batch 1 correct; **batch 0 exactly all-zero** |
-
-So this residual bug is real, narrow, and **specific to
-`iree-amdaie-vectorization`/`aievec` lowering interacting with the batch
-dimension** — not the packing/DMA/tiling machinery shared with the
-non-vectorized path (that's proven correct by the vectorization-off row
-above), and not a general aievec-batch problem either, since `aievec.matmul`
-itself has no notion of "batch" (it's a fixed single-tile 8×8×8 int8 GEMM
-intrinsic called repeatedly by the surrounding loop nest regardless of batch,
-M-tile, or N-tile index — and that repeated-calling machinery already works
-correctly for the non-batched 2D case in §1, which also needs multiple tile
-iterations). The bug is most likely in whatever code decides *how many times*
-and *with what tile/core assignment* to iterate over the **batch** dimension
-specifically when vectorization is on — something that doesn't get exercised
-at all by the already-working non-batched-vectorized (§1) or
-batched-non-vectorized (this table's middle row) cases individually. This is
-the intersection of "batch" and "vectorized" that's never been exercised
-before this session.
-
-A forked deep-dive (pass-by-pass IR bisection, mirroring the original
-row-overflow investigation's methodology) was started but interrupted/killed
-by the user in favor of first reasoning about the likely cause more
-efficiently — that reasoning is what produced the table above.
-
-**Progress so far, going deeper (same session, continued):**
-
-1. **Diffed IR around `iree-amdaie-vectorization` directly** (before/after,
-   for the dispatch function and for the outlined per-tile compute function
-   `generic_matmul_0_outlined` separately). Finding: the **outer batch loop
-   (`scf.forall (%arg0,...) in (2,1,1)`) and every surrounding DMA copy are
-   byte-identical** whether vectorization is on or off — vectorization only
-   changes what's *inside* `generic_matmul_0_outlined` (`linalg.fill` →
-   `vector.transfer_write`, `linalg.generic` → `vector.contract`). The output
-   indexing map on the vectorized `vector.contract` has two dims transposed
-   relative to the original `linalg.generic`'s output map, but every affected
-   dim has extent 1 at this point (already sliced down by the caller's
-   subview), so this looks like a harmless relabeling, not a real bug.
-2. **Diffed the control-code stage** (`iree-amdaie-controlcode-loop-unroll`,
-   which lowers to the actual DMA/lock/wait instruction sequence sent to the
-   NPU) between vectorized and non-vectorized compiles: op-count diff showed
-   **exactly one difference, an attribute string** (`amdaie.packing_config`
-   present in one, absent in the other) — the actual DMA/sync/lock schedule
-   is identical. This rules out a lock-count or DMA-scheduling mismatch at
-   the MLIR level.
-3. **Went one level below MLIR: dumped and disassembled the actual AIE core
-   machine code** peano generates, via `--iree-hal-dump-executable-intermediates-to=<dir>`
-   (a generic IREE flag; the AMD-AIE backend's `serializeExecutable` in
-   `AIETarget.cpp` honors `serOptions.dumpIntermediatesPath`) → `input.ll`
-   (pre-opt LLVM IR), `input.opt.ll` (post-peano-opt), per-core `.elf`, and
-   `.stacksizes`; disassembled with `/workspace/llvm-aie/bin/llvm-objdump -d`.
-   Artifacts saved at `_local/int8_debug/out/intermediates{,_novec}/` and
-   `_local/int8_debug/out/core_7_5_{vec,novec}.dis`.
-
-**Important correction to the mental model from earlier**: the batch loop is
-fully unrolled by the time it reaches the core program — **each physical core
-runs BOTH batch iterations sequentially inside ONE program invocation**, not
-two separate host-triggered runs. `core_7_5`'s disassembled body is two
-near-identical blocks (acquire lock → zero-fill accumulator → acquire input
-locks → matmul-accumulate loop → store result → release 3 locks, repeated for
-batch 1 with different buffer addresses: batch 0 uses `0x70400`/`0x70500`/
-`0x78000`, batch 1 uses `0x74000`/`0x74100`/`0x7c000`, non-overlapping,
-consistent double-buffer stride).
-
-**Hypotheses tested directly against the disassembly and ruled out:**
-- Dead-store elimination removing batch 0's result store — not present; the
-  `vst` to the accumulator and the 3 `rel` (lock release) calls appear in the
-  correct order as separate, non-elided instructions.
-- Acquire/release lock sequence divergence between vec/novec — identical.
-- Buffer address collision between batch 0 and batch 1 — no overlap.
-- Stack overflow/spill corrupting a buffer (vectorized code using more
-  stack) — refuted by `.stacksizes`: vectorized `core_7_5`/`main` use **zero**
-  bytes of stack; non-vectorized uses 64.
-- Missing pipeline-latency NOPs between the last `vmac` and the store — NOP
-  bundles are present.
-
-One structural difference WAS found — vectorization causes
-`generic_matmul_0_outlined` to get **inlined** into the caller (non-vectorized
-keeps it as an opaque `call`, a natural optimization barrier) — but the two
-batch blocks remain structurally isomorphic even inlined, so this alone
-doesn't explain a batch-0-vs-1 asymmetry.
-
-**Where this stands now**: no code-level asymmetry between the batch 0 and
-batch 1 blocks was found anywhere from MLIR down through disassembly — they
-are structurally identical, differing only in buffer addresses (which don't
-overlap). The remaining, unconfirmed hypothesis is a genuine **runtime
-hazard** — e.g. batch 0's output DMA racing the core's completion/lock-release
-signal — which is invisible to static IR/disassembly reading and would need
-actual hardware trace/timing tooling to confirm.
-
-**Cheap follow-up test that DOES support the runtime-hazard theory**: reran
-the identical repro at **batch=4** instead of batch=2 (`gen_and_quant_bmm_b4.py`,
-same M=16,K=16,N=64 shape, quantized/compiled/run the same way, vectorization
-on). Result: **only batch index 0 is wrong (all-zero); batches 1, 2, and 3
-are all correct** (corr 0.9998 each). This generalizes the symptom from
-"batch=2 specifically" to "the first of N sequential batch iterations is
-always wrong, regardless of N" — consistent with something not being
-properly warmed up/synchronized on the very first pass through the per-core
-loop (e.g. a lock/semaphore initial-state issue, or a pipeline that needs one
-iteration to fill before results are safe to trust), and inconsistent with
-anything specific to the number 2 or to address offset 0 being special in
-some address-computation sense (since batch 0 is still the offset-0 case at
-batch=4 too, so this doesn't distinguish those two theories on its own — but
-it does rule out "something special about exactly 2 batches").
-
-**Two more targeted experiments tried (same session), both inconclusive/negative:**
-
-1. **`llc -O0` instead of `-O2`** (one-line change to the hardcoded `llcArgs`
-   in this repo's own `compiler/plugins/target/AMD-AIE/iree-amd-aie/Target/XCLBinGen.cpp:1417`,
-   also needed `--iree-amdaie-stack-size=4096` since `-O0` codegen blew the
-   default 1024-byte stack). **Did not fix batch 0** — still all-zero — and
-   batch 1's correlation actually dropped to 0.90 (from 0.9998). Disassembling
-   the `-O0` output showed the store→release gap did NOT actually grow (if
-   anything it looked tighter, buried in heavy stack-spill code) — so this
-   experiment didn't cleanly test the timing-margin hypothesis at all;
-   optimization level is not a reliable lever for the store/release gap.
-   **Reverted** (not committed).
-2. **Explicit 16-NOP inline-asm injection immediately before every lock
-   release**, added to this repo's own
-   `compiler/plugins/target/AMD-AIE/aie/AMDAIECoreToStandard.cpp`'s
-   `lockToStd` (right before the `func::CallOp` to `llvm.<arch>.release`,
-   guarded on `useLock.getAction() == LockAction::Release`), via
-   `rewriter.create<LLVM::InlineAsmOp>(...)` with a `"nop\n\t"`-repeated
-   asm string, `has_side_effects=true` (to survive optimization). Compiled
-   this MLIR-level change fine, but **`llc` itself crashed**:
-   `LLVM ERROR: unable to translate instruction: call (in function: core_7_5)`
-   during GlobalISel's `IRTranslator` pass. Root cause: inline assembly
-   lowers to a `call asm sideeffect ...` construct in LLVM IR, and **peano's
-   AIE2P backend's GlobalISel implementation does not support translating
-   inline assembly at all** — this is a hard limitation of the vendored,
-   prebuilt `/workspace/llvm-aie` peano install (binaries only, no source,
-   so it can't be patched/rebuilt to add support). **Reverted** (not
-   committed) — this avenue is a dead end without a peano/LLVM-AIE source
-   checkout, which isn't available in this environment.
-
-**Third experiment — this one worked as intended, and is a real negative
-result.** Instead of inline asm (blocked by peano's GlobalISel), injected 16
-**volatile** scalar stores (`LLVM::StoreOp` with `isVolatile=true`, storing to
-a stack `LLVM::AllocaOp`) immediately before every lock release in the same
-`lockToStd` location. Volatile stores can't be eliminated or reordered by the
-optimizer (unlike a plain dead store to an unread local, which is what a
-naive `scf.for`/`memref.store` loop would have been — also considered and
-rejected before trying, since nothing reads the loop's result) and are
-ordinary, universally-supported instructions (no GlobalISel gap). Compiled
-clean, ran without crashing, and **disassembly confirmed the injection
-worked exactly as intended**: 16 real `st r0, [p3, #0]` instructions appear
-immediately before each `rel` call (verified in
-`_local/int8_debug/out/core_7_5_volstore.dis`).
-
-**Result: batch 0 is still exactly all-zero** (batch 1 still correct, corr
-0.9999). This is a much stronger negative result than the previous two
-attempts — the store→release timing margin was genuinely, substantially
-widened (16+ real cycles guaranteed, not "maybe" like the `-O0` attempt) and
-it made no difference. **This is fairly strong evidence that the root cause
-is NOT simply insufficient time between the compute's final store and the
-lock release** — the write-buffer-drain-time hypothesis, while plausible on
-its face, does not survive this test. The bug more likely lives in something
-structural about the *very first* use of a particular lock/DMA
-channel/buffer-descriptor in the program's execution (e.g. a genuinely
-different code path or hardware state on a "cold" first acquire/release of a
-given resource, not simply "not enough wait time on every release") — but
-this is still speculation; no further experiment has isolated it. Reverted
-(not committed).
-
-**Fourth experiment, testing the OTHER side of the hazard.** A key
-observation motivated this: batch 0's output isn't garbage, it's *exactly*
-all-zero — matching the accumulator/buffer's pre-computation zero-filled
-state, not a corrupted nonzero value. That's more consistent with "the core
-computed 0×0=0 because its input buffer hadn't been written yet by the
-producing DMA" than with "the compute/register-aliasing corrupted a real
-result into zero." So the same verified-real volatile-store delay technique
-was moved to the **acquire** side instead of release: inject the 16 volatile
-stores immediately *after* every `LockAction::Acquire`/`AcquireGreaterEqual`
-call in `lockToStd` (i.e. give the core extra guaranteed time after
-successfully acquiring an input-ready lock, before it starts reading that
-buffer — testing whether the core is racing ahead of its own *input* DMA,
-the mirror image of the release-side test). Compiled and ran fine.
-
-**Batch 0 is still exactly all-zero.** So delay on neither side of the
-hazard (before signaling "output ready", after confirming "input ready")
-changes anything. Reverted (not committed).
-
-**Taken together, all three delay experiments (release-side NOP, release-side
-volatile-store, acquire-side volatile-store) failed to change the outcome at
-all, despite the second and third being independently verified to inject
-real, non-optimizable delay at exactly the intended points.** This is now
-fairly strong evidence against any theory of the form "there's insufficient
-wait time somewhere in the core's own instruction stream." Two directions
-this leaves open: (a) the "exactly zero, not garbage" observation could still
-mean the input DMA for batch 0 never completes at all (not just "completes
-late") — a different bug than a timing margin, e.g. a BD/DMA-configuration
-error specific to the first use of a given channel — which no amount of
-delay in the CORE's program could ever fix, since the core isn't what's
-broken; or (b) the bug isn't on the DMA/lock/timing axis at all, and lies
-somewhere neither disassembly-reading nor delay-injection can reach (e.g. an
-actual hardware erratum, or something in the amdxdna runtime/driver's BD
-programming that's specific to this exact shape/configuration).
-
-**Fifth angle: decoded the raw NPU DMA transaction format itself.** All four
-delay experiments above only touched the AIE *core's* own program
-(acquire/release lock timing inside `generic_matmul_0_outlined`/`main`) — none
-of them looked at the DMA controller/BD (buffer descriptor) side, which is
-where the write-back copy from the core's local result to the real output
-buffer actually gets programmed, and where the batch index genuinely is used
-as a runtime offset multiplier (`amdaie.dma_cpy_nd(%lof_16[%arg0, 0, 0], ...)`)
-— unlike inside the core, where every address was already a resolved
-compile-time constant. This is exactly the kind of place a "batch × stride
-collapsing to something degenerate at batch=0" bug (a plausible, cheap-to-
-suspect class of bug) could live, and it's a completely different mechanism
-from anything the delay experiments could have caught or fixed.
-
-Decoded `_local/int8_debug/out/intermediates/bmm_int8_srcasync_dispatch_2_batch_matmul_0.npu_inst.txt`
-(the raw hex "TXN" transaction IREE's AMD-AIE backend emits) using struct
-layouts from `third_party/aie-rt/driver/src/global/xaiegbl.h`
-(`XAie_TxnHeader`, `XAie_Write32Hdr`, `XAie_BlockWrite32Hdr`) and
-`third_party/XRT`'s documented `patch_op_t` fields. The decode is
-**validated**: walking all 63 ops lands exactly on the declared `TxnSize`
-(2464 bytes) with zero bytes left over, and the header's `NumCols=8` matches
-the compile target — strong confidence the byte layout/field decode is
-correct, not guessed.
-
-**Finding: this per-dispatch transaction file does not contain the batch=2
-loop at all.** It has 3 groups of `BLOCKWRITE` (BD config) +
-`CUSTOM_OP_DDR_PATCH` + kick-off `WRITE`, corresponding to input-tile loads
-and an output-side transfer for ONE dispatch invocation — no field anywhere
-resembles a `batch_index * stride` computation, and no literal
-duplicated-with-different-offset pair exists that would represent "batch 0's
-BD" vs "batch 1's BD". The batch loop is realized ABOVE this artifact, most
-likely at the HAL command-buffer / control-code level, which invokes this
-same per-dispatch BD sequence twice with **different HAL buffer argument
-bindings** supplied from outside — meaning if a "batch × constant" address
-computation exists and degenerates at batch=0, it lives in
-`runtime/src/iree-amd-aie`'s HAL driver / command-buffer dispatch sequencing
-code, which **has not been inspected in this investigation** and is a
-genuinely new, unexplored layer (distinct from everything else in this doc,
-which stayed within the compiler's IR/codegen/disassembly).
-
-**Sixth experiment — the "bypass test", and the single most decisive result
-of this whole investigation.** Motivated by wanting to separate "input DMA
-never arrives" from "compute corrupts a good value" from "the write-back
-path itself drops batch 0's write regardless of content." Implemented a
-compute bypass at the correct point in the pipeline (`AMDAIEVectorization.cpp`,
-right after `AMDAIEVectorizationPass`'s main vectorize loop — NOT in
-`AMDAIECoreToStandard.cpp`, where a first attempt at this failed silently
-because by that late stage `vector.contract` has already been converted to
-`aievec.matmul`, a different op type, so the walk found nothing to replace).
-Two variants tried:
-- Replace `vector.contract` with its own (already sign-extended) LHS operand
-  — i.e. write the real input straight to the output. This got as far as
-  compiling at the MLIR level (confirmed via disassembly: the RHS input
-  became provably dead and dropped from the function signature, proving the
-  rewrite fired) but **crashed `llc`** with a different GlobalISel failure
-  (`unable to legalize instruction: G_SEXT <64 x s8> to <64 x s32>`) — the
-  aievec.matmul lowering pattern normally absorbs/elides this exact
-  sign-extension as part of building the matmul intrinsic; with the
-  contract removed, the bare sign-extend has to go through generic codegen,
-  which AIE2P's backend can't legalize at this width. Abandoned in favor of
-  a cleaner test.
-- Replace `vector.contract` with a **hardcoded constant vector** (broadcast
-  value 7, later 7000 once the first value turned out too small and got
-  rounded to zero by the output requantization scale) of the exact same
-  type/shape as the contract's result. No load-dependent arithmetic at all,
-  so no legalization surprises — this is the purest possible test of "does
-  ANYTHING the core tries to store into batch 0's slot survive," with zero
-  dependency on input correctness or compute correctness.
-
-**Result: batch 1 correctly shows the constant (`0.07637637`, matching
-`7000 * combined_scale` through the output requantization) — but batch 0 is
-STILL exactly all-zero, even for a value that has nothing to do with input
-data or matmul arithmetic at all.**
-
-This is decisive: **it rules out both "input DMA for batch 0 never arrives"
-and "the vectorized compute corrupts a real result into zero."** Neither of
-those could produce this outcome — a value with zero dependency on either
-mechanism still fails to reach the final output for batch 0. The bug is
-conclusively in the **write-back path** for batch 0's result specifically
-(core-local buffer → real output buffer), independent of what's being
-written. Combined with the earlier finding that the control-code/DMA
-sequencing IR is identical between vectorized and non-vectorized compiles,
-this leaves a genuinely narrow, strange target: something about batch 0's
-write-back fails only when the *compute path preceding it* is the vectorized
-one — even though the writes/DMA/locks around it are structurally identical
-to the (working) non-vectorized case. Reverted (not committed).
-
-**Seventh experiment — a MACRO-scale delay, and the biggest breakthrough of
-the day.** All four earlier delay experiments were micro-scale (a handful of
-extra cycles at a specific point). This one tests something categorically
-different: a large, real, runtime-looped delay (tens of thousands to
-millions of iterations of a volatile store) inserted at the very *start* of
-the whole core program, before anything else — testing a coarse host-driver
-vs. core-startup race rather than a few-cycle instruction-level one.
-
-Implementation note: a plain `scf.for` doesn't work here — by the time
-`AMDAIECoreToStandardPass` runs (in `XCLBinGen.cpp`'s separate
-`generateUnifiedObject` pass manager), SCF-to-CF lowering has already run
-once earlier in the pipeline and never runs again, so a freshly-inserted
-`scf.for` is left unconverted and later crashes the final LLVM-IR
-translation (`LLVM Translation failed for operation:
-builtin.unrealized_conversion_cast`). Built the loop by hand instead, out of
-`cf.br`/`cf.cond_br` blocks (`rewriter.splitBlock` to carve the rest of the
-entry block into an "exit" block, then a header block with the loop
-condition and a body block with one volatile store) — this lowers cleanly
-since `cf` ops are already proven to work throughout this exact pipeline.
-
-**Results, escalating the iteration count:**
-
-| Delay (iterations) | Result |
-| --- | --- |
-| 0 (no delay, baseline) | batch 0 exactly all-zero, 100% deterministic across every prior run this session |
-| 50,000 | **non-deterministic** — reran 3×: two runs all-zero, one run byte-identical to the original single 50k run (rows 0-7 correct, rows 8-15 zero) |
-| 500,000 | deterministic again, but now correct: rows 0-7 exactly match the fp32 reference (corr ~0.9998), rows 8-15 still exactly zero — reran 3×, byte-identical every time |
-| 2,000,000 | **identical to 500,000** — no further improvement |
-| 10,000,000 (20x more than 500k) | **identical to 500,000 and 2,000,000** — confirms a genuine plateau, not "just needs more time" |
-
-**This proves two separate things conclusively:**
-
-1. **A real, macro-scale timing race exists and is fixable by delay** — the
-   jump from "always deterministically zero" to "non-deterministic" at
-   50,000 iterations, and then to "deterministically better" at 500,000, is
-   the classic signature of perturbing a genuine race window. This does NOT
-   contradict the four earlier micro-scale (few-cycle) experiments failing —
-   it explains why they failed: the actual race window is apparently much
-   larger than a few cycles (something at the scale of host-driver
-   kickoff/DMA-queue setup, not core-instruction spacing), so a 16-cycle
-   nudge was noise relative to it, while a 500,000-cycle nudge is not.
-2. **The residual failure (rows 8-15, all-zero, unaffected by 20x more
-   delay) is a SEPARATE bug, unrelated to timing.** M is padded 16→32 and
-   tiled into multiple M-sub-tiles, each handled by a *different physical
-   core* (tile assignment is a function of the M-tile/N-tile loop indices
-   only, not the batch index — recall `amdaie.tile(%11, %12)` computed from
-   `%arg3/%arg4`, the M/N-tile loop variables). Rows 0-7 and rows 8-15 are
-   different M-tiles running on different physical cores. The delay fully
-   fixed whichever core(s) handle the row-0-7 tile, but had zero effect —
-   not even at 20x the iteration count — on whichever core(s) handle the
-   row-8-15 tile. So "batch 0 is broken" was never quite the right framing:
-   it's closer to "certain specific physical cores have a first-use problem,
-   and at least one flavor of that problem is a fixable macro-timing race,
-   while another flavor (on a different core) is not fixed by delay at all."
-
-All delay values tested via the same hand-built `cf.br`/`cf.cond_br` loop
-inserted at the very start of `coreToStd`'s output function; reverted after
-each test (not committed).
-
-**Eighth: compared the delay-fixable tile (physical row 2) against the
-delay-immune tile (physical row 3) at every level the toolchain exposes —
-found total symmetry.** Disassembled `core_0_2.elf` (row 2, M-tile 0, rows
-0-7 of output — fixed by the macro delay) and `core_0_3.elf` (row 3, M-tile
-1, rows 8-15 — delay-immune) from the ORIGINAL, unpatched compile: **byte-
-for-byte identical instructions**, differing only in meaningless internal
-LLVM debug label numbers (`.LBB32_1` vs `.LBB24_1`). Went one level up and
-compared the amdaie-dialect MLIR (`--mlir-print-ir-before=iree-amdaie-controlcode-to-transaction`):
-`tile_1_2`/`tile_1_3` (and every other column pair checked) have identical
-buffer/lock declarations (6 buffers, 6 locks, same IDs 0-5, same initial
-values); the `amdaie.core` ops for both have the same 2-input/1-output
-shape, correctly sharing the RHS operand (which doesn't depend on M-tile)
-and differing only in which LHS-slice SSA value feeds each. Went one level
-further and checked the actual NPU transaction's explicit BD/queue
-programming (`amdaie.npu.write_bd`/`push_to_queue`/`address_patch`/`tct_sync`,
-lines 1786-1941 of that dump): **every single one of these ops has `row =
-0`** — this block only programs the shim row (the DDR↔memtile DMA hop) and
-never references row 2, 3, 4, or 5 at all. The actual row-to-row data
-movement is handled entirely inside each core's own compiled program via
-its object-FIFO/lock mechanism — which is the thing already proven
-byte-identical between row 2 and row 3.
-
-**Conclusion: no structural difference exists between row 2's and row 3's
-configuration anywhere IREE/the compiler generates** — not in the core ELF,
-not in the MLIR-level tile/lock/buffer setup, not in the explicit NPU
-transaction programming (which doesn't even address these rows). Combined
-with the delay result (500k iterations fixes row 2 fully; 10M iterations —
-20x more — still doesn't touch row 3 at all), the only remaining explanation
-is a genuine **physical/hardware asymmetry between AIE tile rows**
-(e.g. a real difference in NoC distance/arbitration to the memtile or shim
-DMA engine between row 2 and row 3, with row 3 having some non-delay-fixable
-startup behavior) that lives below anything this toolchain — or static
-analysis of its output — can express. Confirming this further needs actual
-hardware-level tooling (JTAG/AIE trace), not more compiler-side comparison;
-there is nothing left to diff at the compiler/IR/disassembly level.
-
-**Hypothesis considered and refuted with direct evidence: AIE "checkerboard"
-row-parity memory mirroring.** AMD/Xilinx AIE hardware has a real, documented
-concept where even/odd tile rows have their local data memory positioned
-asymmetrically (East vs. West of the core), which can mirror the
-core-to-neighbor-memory address mapping between even and odd rows — a
-plausible-sounding explanation for a row-parity-specific bug that survives
-identical compiled code (row 2 and row 3 could read a fixed address
-differently in hardware even with byte-identical instructions). Checked this
-against real vendored driver source rather than accepting it on general AIE
-knowledge:
-
-- The mechanism is real and present in `third_party/aie-rt`'s
-  `_XAie_GetTargetTileLoc` (`driver/src/core/xaie_elfloader.c:145-179`):
-  data memory addresses are split into 4 directional 64KB windows
-  (South/West/North/East, at 0x40000/0x50000/0x60000/0x70000), and for
-  East/West, `RowParity = Loc.Row % 2` determines whether a given address
-  window resolves to the same tile or an adjacent-column tile.
-- Our kernel's actual addresses (`0x70400`/`0x70500`/`0x78000`) land exactly
-  in the **East** window (0x70000-0x7FFFF) — DataMemSize is 64KB on AIE2P
-  (`xaie2pgbl_reginit.c:185`), so this is precisely the address range the
-  mechanism operates on. The theory's target was a real match.
-- **But**: AIE2P's device config sets `IsCheckerBoard = 0`
-  (`xaie2pgbl_reginit.c:180`) — only original AIE1 sets it to `1`
-  (`xaiegbl_reginit.c:1140`). The code forces `RowParity = 1` unconditionally
-  whenever `IsCheckerBoard == 0`, meaning **on AIE2P (what npu4/Strix uses),
-  row-parity mirroring never happens at all** — it's an AIE1-generation
-  behavior explicitly disabled at the vendor-driver level for our hardware
-  generation. (Separately, re-deriving the mechanism's direction by hand
-  also gave the opposite of the observed asymmetry — row 2 working, row 3
-  not — a second, independent reason this specific theory doesn't fit even
-  if checkerboard behavior were somehow active.)
-
-**Verdict: refuted for this hardware, not confirmed.** A good, well-reasoned
-hypothesis that turned out not to apply to AIE2P specifically — recorded here
-so it isn't re-derived and re-investigated from scratch in a future session.
-(One loose end not chased further: `_XAie_GetTargetTileLoc` is the ELF
-*loader's* host-side logic for deciding which physical tile to load
-initialization data into, not necessarily the exact same code path a
-*running* core's own load/store address decoding uses — confirming those are
-governed by the identical `IsCheckerBoard` gate was not verified beyond what
-this pass established.)
-
-**Ninth: the decisive confirmation — a single-shot (non-batched) sanity
-check, then delay moved to the batch BOUNDARY instead of the start.**
-
-First, a cheap but critical check using data already in hand: does physical
-tile row 3 work correctly at all when there's no batch loop (the original §1
-2D matmul, M=32, no batching, so every physical core in rows 2-5 runs its
-tile exactly once)? Checked row-wise correlation of that repro's output by
-M-tile:
-
-| M-tile (rows) | Physical row | corr |
-| --- | --- | --- |
-| 0 (0-7) | 2 | 0.9999 |
-| 1 (8-15) | 3 | 0.9998 |
-| 2 (16-23) | 4 | 0.9998 |
-| 3 (24-31) | 5 | 0.9999 |
-
-**Every row works perfectly when each core only runs once.** Row 3 is not
-defective — it only fails when the SAME physical core is asked to execute
-the same kernel body twice in a row (once per batch), and only on that
-core's first execution among the two. This reframes the whole bug: it was
-never "row 3 is broken," it's "a given physical core's first-of-N-repeated-
-executions has a problem, and the specific flavor of that problem differs by
-row (row 2's is a fixable timing race near the very start; row 3's looked
-delay-immune when delay was only inserted before the first iteration)."
-
-That "before the first iteration only" caveat turned out to be the missing
-piece. All delay experiments so far inserted the busy-wait at the very
-*start* of the whole core program (before batch 0 begins). None had tried
-inserting it at the *boundary between batch iterations* — right after batch
-0's locks release, before batch 1's locks acquire. Moved the same
-`cf.br`/`cf.cond_br` busy-wait loop (500,000 volatile stores) to fire
-immediately after **every** lock-release call in `lockToStd`'s output
-(implemented in `coreToStd` instead, walking for `func.call`s to the
-`*.release` runtime function after cloning the region into the new
-`func.func`, splitting the block right after each one) — this naturally
-lands between batch 0's last release and batch 1's first acquire (and
-harmlessly again after batch 1's own final release).
-
-**Result: fully correct.** `iree-run-module`, 4 runs: batch 0 corr 0.9998,
-batch 1 corr 0.9999, every time, no zero rows anywhere. Also verified at
-**batch=4**: all 4 batches corr 0.9998. **This is a complete, reproducible
-fix for the bug this entire investigation has been chasing** — not by
-patching the real root cause, but by proving conclusively that the root
-cause is a timing race specifically at the *inter-iteration boundary* on a
-per-physical-core basis, and that a sufficiently large delay placed exactly
-there eliminates it for every affected row, not just row 2.
-
-**This is a workaround, not a real fix.** Inserting a ~500,000-cycle
-busy-wait after every one of the ~3 locks released per batch (≈1.5M cycles
-between each pair of iterations, plus another ≈1.5M wasted at the very end)
-burns most of the performance benefit vectorization was supposed to provide.
-The actual fix belongs at the level of whatever is racing here — most likely
-host-driver/DMA-kickoff sequencing relative to core-to-core lock reuse
-timing (see the still-unexplored `runtime/src/iree-amd-aie` HAL driver
-angle from earlier) — not a permanent busy-wait baked into every kernel.
-Reverted after verification (not committed); the exact patch (in
-`coreToStd`, walking `func.call`s to `*.release` and inserting the
-`cf`-based delay loop after each) is preserved in git history of this
-conversation/session if needed again — see "Suggested next steps" below for
-what to try to shrink or properly fix this.
-
-**Tenth: pinning down WHY it's always batch 0 specifically, and finding a
-much cheaper fix shape as a result.** A sharp follow-up question: if the
-race is simply "release doesn't wait for the real hardware handshake before
-the same lock gets reused," that race should apply to *every* iteration
-boundary (0→1, 1→2, 2→3, ...), not just the very first one. But every
-experiment this session, at both batch=2 and batch=4, found the bug on
-*exactly* the first iteration and nowhere else. Why would only the very
-first use of a lock be exposed to this, when the lock gets reused
-identically every time?
-
-**Hypothesis: AIE locks are counting semaphores with a pre-charged initial
-value**, and this is exactly the double-buffering bootstrap idiom (a lock
-representing "buffer slots free to write" starts pre-loaded with credit so
-the *very first* use doesn't need to wait for anything — correctly, since
-nothing has been produced yet, there's genuinely nothing to wait for). The
-theory: this pre-charged credit is also what lets the first
-acquire-after-release cycle skip the REAL hardware confirmation that gates
-every subsequent reuse of the same lock. From the second use onward, the
-credit is exhausted and every acquire genuinely blocks on real hardware
-confirmation — which is why iterations 1, 2, 3, ... are always safe
-regardless of batch count, and only iteration 0 ever races.
-
-**This is directly testable**: if true, inserting the delay ONLY after the
-very first release of each distinct lock (skipping every subsequent
-release of that same lock) should still fully fix correctness, at any batch
-count. Implemented this precisely: tagged each acquire/release
-`func.call` in `lockToStd` with a stable per-lock integer id (derived from
-`useLock.getLock()`'s defining op via a `DenseMap`, since the call's actual
-value operand is just the acquire/release count — usually a useless
-constant `1` for every call, not a lock identity — a first attempt at this
-filtered on that value by mistake and inserted the delay only once total,
-coincidentally reproducing the original all-zero bug and initially looking
-like a refutation before the bug in the filter was found and fixed). Then
-in `coreToStd`, grouped release calls by that id and inserted the delay
-loop only after each id's *first* occurrence.
-
-**Result: still fully correct, at both batch counts, with far less
-delay:**
-- batch=2: batch 0 corr 0.9998, batch 1 corr 0.9999 — reproduced across 4
-  runs, byte-consistent.
-- batch=4: all 4 batches corr 0.9998.
-- Only **3 delay insertions total per core** (one per distinct lock),
-  regardless of batch count — versus 6 (batch=2) or 12 (batch=4) under the
-  "every release" version from the Ninth experiment. Confirmed via
-  disassembly that peano/llc even compiles the delay loop into AIE's
-  zero-overhead hardware loop feature (`lc`/`ls`/`le` registers) rather than
-  a chain of compare-and-branch instructions, so the actual code-size cost
-  is small (~150-170 bytes) — the real cost is only the wall-clock time the
-  loop burns, and critically, that time is now paid ONCE per core rather
-  than once per batch iteration.
-
-**This is strong, direct confirmation of the pre-charged-lock hypothesis**,
-and changes the shape of the eventual real fix: it should target
-whatever governs a lock's INITIAL credit value / the very first
-acquire-release cycle specifically, not something that needs to run on
-every iteration boundary. It also gives a dramatically cheaper *workaround*
-shape in the meantime — fixed one-time cost per core instead of a cost that
-scales with the number of batches/repeated dispatches, which matters a lot
-for something like BERT with many repeated attention-batch dispatches.
-Still not committed; reverted after verification, same as every other
-experiment this session.
-
-**Where this genuinely stands now (updated after the "Tenth" experiment
-above): root cause fully understood down to the mechanism, working
-workaround confirmed and made cheap, real fix not yet implemented.** The bug
-is a timing race specific to the very *first* acquire-release cycle of each
-lock on a reused physical core — consistent with AIE locks being
-pre-charged counting semaphores where the first use skips the real hardware
-confirmation that gates every later reuse. Not a per-row hardware defect,
-not a code-generation asymmetry, not the earlier checkerboard-memory theory.
-A delay inserted only after each lock's first-ever release reliably fixes
-every affected row at both batch=2 and batch=4, at a FIXED one-time cost per
-core (not one that scales with batch count). What's still missing is a real
-fix — something that doesn't need a busy-wait at all — which most likely
-means finding and correcting the actual initial-credit/lock-configuration
-value itself (or the real hardware confirmation path being skipped for that
-first cycle) rather than working around its absence with a delay. See
-"Suggested next steps" for where that fix likely lives.
-
-## Runtime hardware debugging tooling — surveyed, mostly unavailable
-
-Before the two experiments above, surveyed what's actually available in this
-environment for RUNTIME (not static IR/disassembly) visibility into the AIE
-core during the buggy run:
-
-- **AIE hardware trace units exist but aren't wired into our pipeline.**
-  `third_party/mlir-air` has full documented trace support (`docs/trace.md`,
-  `air-to-aie`'s `insert-trace-packet-flow=true`, `airrt-to-npu`'s
-  `trace-size`/`trace-offset`, a `parse_trace.py` for Chrome Trace output) —
-  but this lives entirely in the separate mlir-air/`aircc` toolchain, not the
-  `compiler/plugins/target/AMD-AIE` plugin `iree-compile` actually uses.
-  Porting it over is substantial, multi-day-scale infrastructure work, not a
-  flag.
-- **`xrt-smi` is installed on the host** (`/opt/xilinx/xrt/bin/xrt-smi`,
-  v2.25.0) and works (`xrt-smi examine` confirms device presence: "NPU Gorgon
-  Point 1", aie2p, 6x8, firmware 1.1.2.64) but only exposes
-  `aie-partitions`/`all`/`host`/`platform` reports for this device class — no
-  error-register, timeline, or trace report. `-r aie-partitions` right after
-  a run just says "No hardware contexts running on device" — no history.
-- **`dmesg` and `/sys/kernel/debug/accel/`** need root; not accessible with
-  current permissions. `/sys/class/accel/accel0/device/` has only generic PCI
-  attributes, nothing amdxdna-specific.
-- **A real Vitis 2025.2 (and 2023.2) install exists on the HOST** (not in the
-  lightweight dev container) at `/tools/Xilinx/2025.2/Vitis`, including a real
-  `aiesimulator` binary (`/tools/Xilinx/2025.2/Vitis/aietools/bin/aiesimulator`)
-  — a cycle-accurate AIE simulator that could in principle show the exact
-  relative timing of "core writes SRAM" vs "DMA reads it." **Not actually
-  tried**: `aiesimulator` consumes artifacts from the `aiecc`/mlir-air graph
-  compilation flow, not the `.vmfb`/HAL-executable format `iree-compile`
-  produces for the amdxdna runtime — compatibility between the two is
-  unconfirmed and would need its own investigation before this is usable for
-  our specific repro.
-
-Bottom line at the time: no real runtime visibility without either porting
-mlir-air's trace infrastructure into the AMD-AIE plugin, or confirming/wiring
-up `aiesimulator` compatibility with our `iree-compile` output — both
-non-trivial, unstarted.
-
-## Current state / what's uncommitted — READ BEFORE CONTINUING
-
-- **`third_party/iree/third_party/torch-mlir` has an uncommitted, unpinned
-  local patch** (the `AtenBmmOp` quantization support from §3 AND §4 — three
-  edits total now: `QuantizeOperandsPastCommutingOps<AtenBmmOp,2>` and
-  `QuantizeAccumulator<AtenBmmOp>` in `FuseQuantizedOps.cpp`, plus the
-  zero-point-aware `ConvertAtenBmmOp` rewrite in `Linear.cpp`). This
-  submodule points at plain upstream `iree-org/torch-mlir` (not a fork this
-  team controls, unlike `third_party/iree` itself which is `ace-knu/iree`).
-  The patch exists **only in this working tree's checkout** — it is NOT
-  committed anywhere, not even locally in that nested repo (checked: `git -C
-  third_party/iree/third_party/torch-mlir status --short` shows the two files
-  modified, uncommitted). It is at real risk of being silently lost on any
-  `git submodule update`/reset/fresh clone. Before doing anything that could
-  discard it, either commit it locally in that nested repo, or copy the two
-  diffs somewhere durable. The two files: `lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp`
-  and `lib/Conversion/TorchToLinalg/Linear.cpp`. **This patch is now
-  correctness-verified** (§4) for the non-vectorized/CPU paths — it's good,
-  not speculative.
-- `models/vgg16/vgg16-12.onnx` was downloaded (553MB, gitignored, not
-  committed — re-download via the curl command in `models/vgg16/README.md`
-  if needed again).
-- All scratch/repro work is in `_local/int8_debug/` (gitignored, not
-  committed): quantization gen scripts, ONNX/MLIR/vmfb intermediates, and
-  `.npy` input/output/reference comparisons for every experiment above. Latest
-  batch-matmul vmfbs: `bmm_int8_v3.vmfb` (npu4, vectorization on — the one
-  with the remaining §4a bug), `bmm_cpu_v2.vmfb` (CPU, correct),
-  `bmm_out_npu_novec_v2.npy`/etc. (npu4 vectorization-off, correct).
-- No source changes in this repo's own `compiler/plugins/target/AMD-AIE`
-  were needed for §1-§4 — all of that was either "already works" (§1) or a
-  fix inside vendored `third_party/iree`/`torch-mlir` (§2 not-yet-attempted,
-  §3+§4 attempted+uncommitted+verified). The remaining §4a bug, being
-  specific to `iree-amdaie-vectorization`/aievec lowering, will most likely
-  need a fix in this repo's own AMD-AIE plugin — but not yet confirmed. Two
-  exploratory patches to this repo's own AMD-AIE plugin (`llc -O0` in
-  `XCLBinGen.cpp`, inline-asm NOP injection in `AMDAIECoreToStandard.cpp`)
-  were tried for §4a and **reverted** — `git status`/`git diff` on
-  `compiler/` should show clean at the end of this session.
-- Nothing from this session is committed to git. `git status` on the main
-  repo only shows the two pre-existing untracked VGG docs from a prior
-  session; the torch-mlir submodule's dirty state doesn't even surface there
-  (nested submodule, two levels down) — don't rely on top-level `git status`
-  to notice if that patch goes missing.
-
-## Eleventh experiment: shrinking the delay (binary search) + a correction
-
-Shrank the 500,000-iteration bound at batch=2, confirming 100,000 → 10,000
-all still passed reliably, but 1,000 failed consistently (batch 0 all-zero)
-and 5,000-6,000 was flaky (occasional failures). This first pass used `sed`
-with a *value-specific literal* replacement (old exact number → new exact
-number), which is safe since each old value was unique in the file.
-
-Then, to re-test the same range at **batch=4** in one shot, the loop switched
-to a `sed` regex `getI32IntegerAttr([0-9]*)` intended to only touch the delay
-`bound` constant. This regex is unanchored to which constant it's replacing —
-it matched **every** numeric `getI32IntegerAttr(...)` call in the whole
-delay-loop block, clobbering `oneI32` (alloca size, was `1`), `dummy` (stored
-value, was `0`), `zero` (loop init, was `0`), and `stepOne` (increment, was
-`1`) down to the *same* value as `bound`. Two effects: (a) `zero == bound`
-made the loop's entry condition `iv < bound` false immediately, so the "delay"
-executed **zero iterations** regardless of the value being tested, and (b)
-the alloca's size operand became the same huge number, allocating that many
-`i32`s on the stack. This produced a batch=4 result of **100% failure at
-every tested value including the previously-verified 500,000** — which looked
-like a serious regression/contradiction of the earlier finding, but was
-actually an artifact of a broken loop, not a real hardware result. Caught by
-reading the file back and noticing all five constants had become identical.
-
-**Lesson recorded for future edits to this file: never use a value-agnostic
-regex across multiple sibling constants that happen to share a token prefix
-— anchor by line number or by the old constant's known distinct value.**
-
-After restoring the correct constants (`oneI32=1`, `dummy=0`, `zero=0`,
-`stepOne=1`, only `bound` varying) and re-verifying 500,000 was genuinely
-clean again (0/10 at batch=2, 0/10 at batch=4), the real binary search at
-**batch=4** (the more sensitive case — see below) found:
-
-| delay (iterations) | batch=4 result | batch=2 result |
+# int8 양자화 조사 (일시 중단, 미완료) — 한국어 정리 (2026-08-26 재작성)
+
+목표: npu4(AIE2P/Strix)에서 `vector.contract`를 실제로 vectorize하는 것. aievec의
+npu4 lowering(`getSuportedAie2PTypes()`,
+`compiler/plugins/target/AMD-AIE/aievec/VectorToAIEVecConversions.cpp:118-126`)은
+int8×int8→i32 matmul intrinsic만 있고 bf16은 없음 (npu1/AIE2/Phoenix엔 둘 다
+있음 — `getSupportedAie2Types()` 107-115줄. npu4 백엔드에 국한된 갭이지 aievec
+자체의 일반적인 한계는 아님). 그래서 bf16 vectorization을 쫓는 대신 모델을 int8로
+양자화하는 쪽으로 방향을 잡음.
+
+`bert` 브랜치, BERT e2e 작업(`docs/2026-08-20_batch_matmul_row_overflow_fix.md`,
+BERT 모델 README들) 이후에 이어지는 작업. 아래는 전부 한 세션 안에 일어난 일이고,
+**대부분 커밋되지 않은 상태로 세션이 종료**됨 (파일별 변경사항은 맨 아래 표 참고).
+
+## 1. int8 vectorization 자체는 되는가? — 예, 실제 하드웨어에서 확인됨
+
+`[32,128]x[128,64]` 단일 matmul을 `onnxruntime.quantization.quantize_static`
+(`quantize_dynamic`이 아님 — 설치된 onnxruntime 1.29.0엔 `quant_format` 파라미터가
+없고 항상 QOperator 포맷을 냄, `quantize_static`에 `quant_format=QuantFormat.QDQ`를
+줘야 진짜 QDQ 노드가 나옴)로 양자화해서 `iree-import-onnx` → 컴파일 → 실행까지
+전부 통과. IR 덤프로 `aievec.matmul %_, %_, %_ : vector<8x8xi8>, vector<8x8xi8>
+into vector<8x8xi32>`가 20회 나오는 것 확인 (스칼라 fallback 아님). 실제 npu4에서
+`iree-run-module` exit 0, fp32 레퍼런스 대비 corr 0.99985 (calibration 노력 거의
+없이). **"vectorization이 되긴 하는가"라는 질문은 여기서 확정적으로 해결됨** —
+2D matmul 한정, 이 이후 재확인할 필요 없음.
+
+## 2. VGG16 Conv int8 — 업스트림 IREE 버그로 막힘 (별도 큰 작업, 미착수)
+
+VGG16의 13개 Conv 레이어를 양자화하면 `iree-compile`이 크래시함:
+`ConvertConvToChannelsLast.cpp:358-359`가 conv의 DPS "output"을 operand index
+2로 하드코딩하는데, 양자화된 conv(`linalg::Conv2DNchwFchwQOp`)는 operand가
+5개(`input=0,filter=1,inputZp=2,weightZp=3,output=4`)라 실제로는 zero-point
+스칼라를 잘못 집어감. channels-last 변환은 AIE conv codegen에 필수라 우회 불가.
+진짜 고치려면 vendored `third_party/iree`에 patch(DPS-aware operand 접근 +
+양자화된 conv용 channels-last 패턴)가 필요 — 여러 시간짜리 작업, 미착수. VGG16을
+Gemm/FC만 양자화하는 건 (2D matmul 케이스랑 같은 메커니즘이라) 될 텐데, BERT로
+방향 전환하면서 안 함.
+
+## 3. BERT batch matmul(attention) 양자화 — torch-mlir 패치, 커밋 완료
+
+원인은 IREE가 아니라 torch-mlir이었음: ONNX의 배치 `MatMul`은
+`torch.aten.bmm`으로 import되는데(`aten.matmul`이 아님), `torch.aten.bmm`엔
+양자화 처리가 아예 없었음. `FuseQuantizedOps.cpp`와 `ConvertAtenBmmOp`에 패치
+2개 추가 (input 쪽 `QuantizeOperandsPastCommutingOps<AtenBmmOp,2>`, output 쪽
+`QuantizeAccumulator<AtenBmmOp>` — 후자가 없으면 raw int32 accumulator를
+`sitofp`로 그냥 캐스팅해버려서 스케일 곱셈 없이 값이 포화됨, corr 0.9998로
+검증 완료).
+
+**2026-08-25 업데이트: 이 패치는 이제 로컬 커밋 3단으로 완전히 커밋됨** (git
+log/status로 확인, 2026-08-25 아침): torch-mlir 브랜치 `wjjang/bmm-int8-quantization`
+커밋 `6ce189ce` → `third_party/iree` 커밋 `9c8b2b7` → 메인 저장소 `bert` 브랜치
+커밋 `40654aa`. 전부 로컬에만 있고 어디에도 push는 안 됨 (torch-mlir 서브모듈은
+팀 포크가 아니라 순정 upstream을 가리키고 있어서 push할 곳이 없음; `third_party/iree`는
+`ace-knu/iree` 포크를 가리켜서 push는 가능한데 아직 안 함). **더 이상 "uncommitted라서
+날아갈 위험" 상태는 아님.**
+
+## 4. BERT-tiny 전체 파이프라인 — 성공
+
+BERT-tiny의 16개 `MatMul` 노드(Q/K/V/output/FFN + 배치 attention matmul 전부)를
+int8 QDQ로 양자화, vectorization ON으로 컴파일 (기존 bf16 BERT-tiny 레시피는
+vectorization off였음), 10,000회 delay fix까지 적용. 실제 npu4에서 **20/20회
+전부 성공, corr=0.99678, 완전히 결정론적** (매번 동일한 결과). 2레이어 트랜스포머
+전체에 delay fix가 일반화됨을 처음 확인.
+
+## 5. 진짜 원인 규명: batch-0 lock-precharge race — SOLVED, 작동하는 workaround 있음
+
+npu4 + vectorization ON에서 배치 matmul을 돌리면 **batch index 0이 항상 all-zero**로
+나오는 문제 발견 (batch 1은 정상). MLIR IR부터 디스어셈블된 기계어까지 전부 훑어서
+원인을 찾음 (아래는 요약, 전체 실험 과정은 git 히스토리에 더 상세히 있었음):
+
+- **정적 분석으로는 원인을 못 찾음**: 벡터화 전후 control-code, lock/BD 선언,
+  DMA 큐 드레인 전부 동일함을 확인. bypass 테스트(matmul 결과를 상수로 치환)로
+  batch 0의 write-back 경로 자체가 실패한다는 것까지는 확인.
+- **매크로 스케일 delay 실험이 돌파구**: core 프로그램 시작부에 진짜 busy-wait
+  루프(cf.br/cf.cond_br 기반)를 넣어보니 — 0회: 항상 실패, 50,000회: 비결정론적,
+  500,000회: batch 0의 앞부분 행은 고쳐지고 뒷부분 행은 여전히 실패 (M=16이
+  4개 물리 코어에 타일링되는데, 그중 일부 코어에만 효과가 있었음을 시사).
+- **진짜 원인 확정**: delay를 core 시작부가 아니라 **매 lock의 첫 release
+  직후**로 옮기니 완전히 해결됨 (batch=2, batch=4 전부 corr 0.9998+, 4회
+  재현). **AIE lock은 미리 충전된(pre-charged) 카운팅 세마포어라서, 특정
+  lock의 첫 acquire-release 사이클만 실제 하드웨어 확인 게이트를 건너뛴다**는
+  게 메커니즘 — 그래서 항상 정확히 "첫 번째" 반복(batch 0)만 레이스가 남.
+- **비용 최적화**: 500,000회에서 10,000회로 50배 줄임 (batch=4로 stress-test,
+  20/20 성공, batch=2도 10/10 성공). Peano/llc가 이 delay 루프를 AIE 하드웨어
+  전용 zero-overhead loop(`lc`/`ls`/`le` 레지스터)로 컴파일해줘서 코드 크기
+  비용은 거의 없고(~150-170바이트), 배치 수와 무관하게 코어당 딱 한 번만
+  드는 고정 비용.
+
+**결론: 이건 workaround지 진짜 fix는 아님** — lock의 초기 credit 값 설계
+자체를 고치는 게 진짜 fix인데, 그건 안 찾음. `AMDAIECoreToStandard.cpp`의
+`lockToStd`에 각 lock의 첫 release 직후에만 delay를 넣는 코드로 구현.
+
+## 6. 두 번째, 더 심각한 버그: BERT-base(12레이어)에서 발견, 미해결
+
+BERT-tiny(2레이어)와 같은 레시피를 BERT-base(12레이어)에 그대로 적용하면
+corr 0.70~0.90으로 비결정론적. delay를 20k→500k→5M(10배씩 두 번)로 올려도
+**전혀 개선 안 됨** — 원래 버그는 delay에 단조롭게 반응했는데, 이건 완전히
+평평한(flat) 반응. 다른 메커니즘의 버그.
+
+- 순수 batch matmul을 아무리 크게(레이어 수, 배치 수) 합성해서 반복해도
+  재현 안 됨 — **실제 BERT 아키텍처(LayerNorm/Softmax/GELU가 섞인)**를 잘라서
+  써야 재현됨: L=1,2는 결정론적, L=4는 거의 결정론적, **L=6, L=8은 정확히 두
+  개의 값으로 갈라지는 패턴** (넓게 퍼지는 게 아니라 이산적인 두 값). L=12는
+  훨씬 넓게 퍼짐 (0.70~0.90).
+- **최소 재현 발견**: non-batched 프로젝션 matmul + Reshape/Transpose + batched
+  attention matmul을 번갈아가며 배치하면(같은 물리 타일을 재사용하면서) 비결정론적.
+  같은 타입의 dispatch만 반복하면(circuit/circuit 또는 batched/batched) 결정론적.
+  **"두 개의 서로 다른 dispatch 타입이 같은 물리 타일을 공유하며 번갈아 실행되는 것"**이
+  트리거라는 게 확정됨 — batch 크기, 레이어 수, CPU-op 개입 자체는 원인이 아님.
+- **모든 소스 레벨 감사가 클린하게 나옴**: lock 값이 dispatch마다 재초기화되는지
+  (재초기화됨, 확인), stale BD 레지스터 내용(BD write는 항상 전체 memset+재작성,
+  read-modify-write 아님), dispatch 간 DMA 큐 드레인 레이스(기본 설정에서는
+  호스트가 완전히 동기화해서 다음 dispatch 전에 이전 게 끝났음을 보장함),
+  `AMDAIEFoldDmaWaits.cpp`가 wait를 비대칭적으로 누락하는지(둘 다 20개 wait를
+  1개로 정확히 fold함, coverage gap 없음), `NpuDmaWaitOp`의 lowering이
+  dispatch 타입에 따라 다른지 (실제 IR 덤프로 확인, 완전히 동일함).
+- **호스트 사이드 settling delay 실험도 전부 음성**: sleep 기반, spin 기반
+  (5천~50만 마이크로초) 전부 시도했는데, interleaved A/B 테스트로 제대로
+  통제해보니 전부 통계적으로 유의미한 개선 없음 (초기에 "괜찮아 보였던" 신호는
+  전부 노이즈로 밝혀짐 — 이 머신 자체의 실패율이 시간에 따라 흔들리는 confound가
+  있어서, block sampling이 아니라 반드시 interleaved A/B로 테스트해야 함).
+
+**남은, 소스에서 확인 불가능한 유일한 지점**: 실제 하드웨어/펌웨어의 TCT
+completion-token 메커니즘이 `repeat_count>1`일 때 반복당 하나씩 토큰을 정확히
+발행하는지 (아니면 첫/마지막 반복에만 발행하는지) — 이 코드베이스엔 문서화가
+안 돼있고, AMD 드라이버/펌웨어 문서나 실제 하드웨어 트레이스 없이는 확인 불가.
+
+**결론: 소스/컴파일러/런타임에서 감사 가능한 모든 레이어(lock 값, BD 내용, DMA
+큐 드레인, wait-folding, TCT-sync lowering)가 다 정상으로 확인됨. 이건 진짜
+하드웨어/펌웨어 레벨의 현상일 가능성이 높고, 이 저장소의 컴파일러/런타임 코드
+버그가 아닐 가능성이 높음.**
+
+> 이 두 번째 버그는 2026-08-26에 다시 마주쳤어요 — roadmap item 2(matmul+bias
+> 퓨전) 조사에서 완전히 다른 경로로 정확히 같은 결론에 도달했습니다: 독립적인
+> mlir-aie 툴체인으로 **packet flow + 하드웨어 `repeat_count`** 조합을 재현했더니
+> 똑같이 hang이 났어요. 자세한 내용은
+> [docs/2026-08-26_matmul_bias_fusion_runtime_hang.md](2026-08-26_matmul_bias_fusion_runtime_hang.md)
+> 참고 — 이번 버그(값이 틀림, dispatch는 완료됨)와 그쪽 버그(dispatch 자체가
+> 영원히 안 끝남)는 증상은 다르지만, 둘 다 "TCT/repeat_count 하드웨어 메커니즘이
+> 미묘하게 안 맞는다"는 같은 계열의 문제로 보입니다.
+
+## 7. bf16 vectorization 작업 전체 결론 (2026-08-25, 팀 결정)
+
+이 두 번째 버그가 **dtype과 무관**하다는 게 확정적이라(순수 batch matmul
+레벨에서는 재현 안 되고 실제 트랜스포머 구조에서만 재현되는 걸 보면, int8이든
+bf16이든 vectorized backend라면 똑같이 이 벽에 부딪힐 것), bf16 vectorization
+backend를 새로 만들어도 더 적은 비용으로 우회할 방법이 없다고 판단. **팀 결정:
+vectorization 작업 자체를 이 시점에서 중단.**
+
+## 파일별 변경사항
+
+| 파일 | 변경 내용 | 상태 |
 |---|---|---|
-| 500,000 | 0/10 failed | 0/10 failed |
-| 100,000 | 0/10 failed | (not re-tested) |
-| 20,000 | 0/10 failed | (not re-tested) |
-| 12,000 | 0/10 failed | (not re-tested) |
-| 10,000 | **0/20 failed** | **0/10 failed** |
-| 8,000 | 0/12 failed | (not re-tested) |
-| 6,000 | 1/12 failed | 0/15 failed (smaller sample, less sensitive) |
-| 5,500 | — | 1/10 failed |
-| 5,000 | — | 3/5 failed |
-| 1,000 | — | 5/5 failed (full batch-0-zero, the original bug) |
+| `compiler/plugins/target/AMD-AIE/aie/AMDAIECoreToStandard.cpp` | §5의 batch-0 lock-precharge race 픽스: 각 lock의 첫 release 직후에 10,000회 busy-wait 삽입 (`lockToStd`) | **커밋됨** — `bert` 브랜치 `1600078` (roadmap item 2 세션에서 2026-08-26에 커밋) |
+| torch-mlir (`third_party/iree/third_party/torch-mlir`) `FuseQuantizedOps.cpp`, `ConvertAtenBmmOp` | §3의 `aten.bmm` int8 양자화 지원 (input-side + accumulator-side 패턴 2개) | **커밋됨** (로컬만, push 안 됨) — torch-mlir 브랜치 `wjjang/bmm-int8-quantization` 커밋 `6ce189ce` → `third_party/iree` 커밋 `9c8b2b7` → 메인 저장소 `bert` 브랜치 `40654aa` |
+| `runtime/src/iree-amd-aie/driver/amdxdna/direct_command_buffer.cc` | §6 두 번째 버그 조사 중 시도한 호스트 사이드 settling delay 실험 | **되돌림, 커밋 안 됨** — 효과 없음으로 결론, 현재 원본 상태 |
+| `_local/int8_debug/` 하위 여러 스크립트/mlir/onnx 파일 | 위 모든 조사에 쓰인 최소 재현 스크립트들 (`gen_bmm_bias.py`, `gen_chained_mixed.py`, `quant_bert_tiny.py`, `export_bert_base_ntrunc.py` 등) | gitignore된 스크래치 디렉토리, 저장소에 커밋 안 됨 (의도적) |
 
-Two findings beyond "what's the minimum number":
+이 문서 자체가 다루는 §1~7 범위에서 **컴파일러/런타임 소스 변경으로 지금 살아있는
+건 `AMDAIECoreToStandard.cpp`의 delay fix 하나뿐**이고, 이건 이미 커밋됐습니다.
+나머지는 전부 (a) 이미 커밋된 torch-mlir 패치이거나, (b) 검증 후 되돌린 실험이거나,
+(c) 애초에 커밋 대상이 아닌 스크래치 스크립트입니다.
 
-- **The failure boundary is sharper/appears earlier when tested at batch=4
-  than batch=2**, even though the underlying mechanism (each lock's first
-  release racing) doesn't itself depend on batch count. This is consistent
-  with the race being an *independent per-core* probability: batch=4 doesn't
-  change how risky any single core's first release is, but with 16 physical
-  cores all doing this once per invocation, the probability that *at least
-  one* core loses the race is higher than when testing with fewer
-  observations (batch=2's `sed`-literal 6,000 test, which showed 0/15, was
-  simply a smaller/luckier sample — batch=4 is the more reliable stress test
-  precisely because it multiplies the number of independent per-core trials
-  per single hardware invocation).
-- At delay=6,000 the one observed failure showed **two** batches corrupted
-  (batch 0 *and* batch 2), not just batch 0 — confirming the corruption
-  isn't special-cased to "batch 0" per se, just to "whichever core's first
-  release happens to lose the race," which is overwhelmingly batch 0 in
-  practice (it's genuinely the first use) but not exclusively.
+## 다음에 이어서 할 것 (우선순위 순)
 
-**Chosen final value: 10,000** (down from 500,000 — a 50x reduction),
-verified with 0 failures across 20 runs at batch=4 and 10 runs at batch=2.
-This is now the value live in `AMDAIECoreToStandard.cpp`'s first-release-only
-delay loop (uncommitted, per the note above).
+1. §5(batch-0 레이스)는 메커니즘까지 규명됐고 workaround도 있음 — 남은 건 "진짜
+   fix"로 승격시키는 것. lock의 initial credit 값이 어디서/어떻게 결정되는지
+   (`2,0,2,0,2,0` 패턴이 뭘 인코딩하는지), `runtime/src/iree-amd-aie`의 HAL
+   드라이버/커맨드버퍼 dispatch 순서 코드(이번 세션엔 전혀 안 봄)를 봐야 함.
+2. §6(두 번째 버그)은 소스 레벨 감사가 다 끝났음 — 더 파려면 실제 하드웨어
+   트레이스 도구가 필요함. 이건
+   [docs/2026-08-26_matmul_bias_fusion_runtime_hang.md](2026-08-26_matmul_bias_fusion_runtime_hang.md)에서
+   더 진행됐으니 거기 참고.
+3. §5 fix가 진짜 fix로 바뀌면: torch-mlir 패치를 더 안전한 곳에 (팀 포크?) 올리는
+   것도 고려 — 지금은 순정 upstream repo를 가리키는 서브모듈이라 push할 곳이 없음.
+4. VGG16 Conv int8(§2)은 별개의, 더 큰 upstream IREE 작업으로 남아있음 — BERT
+   작업 우선순위에 밀려서 의도적으로 보류 중.
 
-## Twelfth experiment: applying the fix to real BERT-tiny (not just the minimal repro)
+## 8. 실행 시간 측정 (2026-08-31, 뒤늦게 채움) — §1의 "int8 벡터화 확인"은 정확성만 봤지 속도는 한 번도 잰 적이 없었음
 
-Quantized all 16 `MatMul` nodes in `models/bert_tiny/bert_tiny.onnx` (2-layer,
-hidden=128, seq_len=32 — Q/K/V/output/FFN projections plus the batched
-QK^T/Attn@V attention matmuls) to int8 QDQ via `onnxruntime.quantization.
-quantize_static` (`op_types_to_quantize=["MatMul"]`, symmetric activations,
-16-sample random-`input_ids` calibration — script: `_local/int8_debug/
-quant_bert_tiny.py`, output `_local/int8_debug/out/bert_tiny_int8.onnx`).
-Imported and compiled with vectorization **on** (no
-`--iree-amdaie-enable-vectorization-passes=false`, unlike the existing bf16
-BERT-tiny recipe) and the current 10,000-iteration first-release-only delay
-fix live in `AMDAIECoreToStandard.cpp`. Confirmed via
-`--mlir-print-ir-after=iree-amdaie-vectorization` that all 16 matmuls
-actually vectorize (16 `vector.contract` ops in the dump, matching the 16
-quantized `MatMul` nodes one-to-one).
+§1에서 "int8 벡터화가 되는가"를 확정할 때, 확인한 건 IR에 `aievec.matmul`이 실제로
+나오는지와 정확도(corr 0.99985)뿐이었고, **실행 시간은 이 조사 전체에서 단 한 번도
+측정되지 않았음** (`_local/int8_debug/*.py` 전체에 `time.perf_counter`,
+`iree-benchmark-module` 호출이 전혀 없음 — grep으로 확인). 뒤늦게 채움.
 
-Ran on real npu4 hardware, **20/20 runs correlate 0.99678 against the fp32
-torch reference, fully deterministic (identical correlation every run,
-`maxabsdiff`=0.347)** — no sign of the batch-0-zero corruption pattern
-(which would show near-zero or negative correlation, or run-to-run
-variance). This is the first time the delay-based workaround has been
-verified on an actual model rather than the minimal 2D/batched matmul repro,
-and it holds up: the fix generalizes past the isolated batch-matmul case to
-a full transformer encoder with LayerNorm/Softmax/GELU/reshapes interleaved
-between the vectorized int8 matmuls.
+**측정 대상**: §1과 동일한 2D matmul(M=32, K=128, N=64, `_local/int8_debug/out/mm_int8.mlir`,
+QDQ int8 양자화, 이미 존재하던 아티팩트 재사용) vs 같은 shape의 bf16 스칼라 버전
+(`_local/int8_debug/perf_check/mm_baseline.mlir`, 새로 생성 — bf16은 npu4에 벡터화
+intrinsic이 없어서(문서 맨 위 참고) 항상 스칼라로만 컴파일됨, 이게 이 백엔드에서
+지금 실제로 쓸 수 있는 "베이스라인").
 
-0.99678 is a real (if modest) drop from the 0.9998-0.9999 seen on the
-isolated single/batched matmul cases — expected, since this model chains 16
-quantized matmuls' worth of rounding error through 2 encoder layers, rather
-than checking one matmul in isolation. Not yet compared against an
-int8-but-non-vectorized or CPU-backend run of the same quantized ONNX to
-isolate how much of that 0.3% gap is unavoidable quantization noise
-(inherent to 8-bit weights/activations with only 16-sample calibration) vs.
-something specific to the vectorized NPU path — worth doing before treating
-0.99678 as a hard ceiling.
+**방법**: `iree-benchmark-module --device=amdxdna --device=local-task
+--benchmark_repetitions=5 --benchmark_min_time=2s` (실제 npu4 하드웨어, 5회 반복 ×
+각 2초 이상). 두 vmfb 모두 correctness 먼저 재확인(둘 다 참조값과 일치).
 
-## Thirteenth experiment: bert_base reveals a SECOND, delay-immune bug
+| | 평균(mean) | 중앙값(median) | 표준편차 | CV |
+|---|---|---|---|---|
+| **int8, 벡터화 O** (`mm_int8.vmfb`) | 117 ms | 120 ms | 16.8 ms | 14.4% |
+| **bf16, 스칼라** (`mm_baseline_bf16.vmfb`) | 102 ms | 97.5 ms | 11.2 ms | 11.0% |
 
-Applying the exact same recipe (quantize all `MatMul` nodes, vectorization
-on, current delay fix) to `models/bert_base/bert_base.onnx` (12-layer,
-hidden=768, 12-head, batch=12 attention — a scaled-up sibling of BERT-tiny,
-which worked perfectly) did **not** work: 8 runs gave non-deterministic
-corr in **0.70-0.90**, with the delay bumped from 20,000 → 500,000 →
-5,000,000 (10x, then another 10x) making **no improvement at all** — a flat
-plateau, unlike the clean monotonic improvement seen tuning the original
-batch-matmul bug. This is the signature of a second, different bug, not
-just "not enough margin for the known one."
+**결론: 이 크기(M=32,K=128,N=64)에서는 측정 가능한 속도 개선이 없음.** 두 그룹의
+차이(~15ms)가 각 그룹 자체의 표준편차(11~17ms)보다 작아서 노이즈 안에 있음 —
+오히려 표면적으로는 int8(벡터화)이 근소하게 더 느리게 나왔는데, 이것도 유의미한
+회귀가 아니라 노이즈로 보는 게 맞음.
 
-**Error localization (per-position, per-head breakdown of the wrong
-outputs)** showed two distinct, superimposed patterns:
-- A small, present-in-every-run baseline error concentrated in the **last
-  M-tile** (sequence positions 24-31, the 4th/outermost of M=32's four
-  8-row tiles) and gently increasing toward the last attention head
-  (head 11) — this looks structural/deterministic, not a race.
-- On top of that, in roughly 30-40% of runs, **one additional head spikes
-  ~2x** above the baseline — and *which* head spikes varies randomly run to
-  run (seen: heads 3, 6, 8, 9, 11 across different runs) — this part *is* a
-  genuine race, just not the same one already fixed.
+**왜 이런 결과가 나오는지(중요한 발견)**: 두 경우 다 `iree-benchmark-module`이
+보고하는 host CPU 시간은 1.3~1.7ms인데 벽시계 시간(real_time)은 90~140ms —
+즉 **측정 시간의 99% 이상이 host가 NPU 드라이버 응답을 기다리는 시간**이지 실제
+행렬곱 연산 시간이 아님. 이 정도로 작은 matmul(32×128×64)의 실제 코어 연산은
+마이크로초 단위일 텐데, 매 호출마다 붙는 고정 오버헤드(커맨드 버퍼 제출, PDI/컨텍스트
+재구성, xrt 큐 대기 등으로 추정 — 정확히 어느 구성요소가 지배적인지는 미분리)가
+100ms 안팎으로 이 전부를 덮어버림. **즉 이 정도 규모의 단일 dispatch에서는 int8
+벡터화가 실제로 빠른지 여부 자체가, 벤치마킹 방법을 더 정교하게 만들지 않는 한
+안 보임.**
 
-**Ruled out via targeted isolation tests** (each a fast, cheap repro,
-minutes not the ~3-8 min full bert_base compile):
-1. **Not tensor size at the last row/tile**: a plain *non-batched* 2D
-   matmul at bert_base's actual FFN scale (`M=32,K=768,N=3072`, all 4
-   M-tiles/rows exercised, vectorization on) gave **0/8 error across every
-   single row, deterministic, corr=0.9998** — completely clean. Rules out
-   "the last physical row (row 5, farthest from the shim DMA) has a timing
-   margin that only breaks down once tensors are big enough" — size alone,
-   without batching, is fine at any scale tested.
-2. **Not batch size or layer/dispatch count in isolation, nor their
-   product**: a synthetic chain of `N_LAYERS` sequential batched matmuls
-   (`M=32,K=32,N=64`, matching bert's attention shape) at every
-   combination of `{layers, batch} = {2,12}×{2,12}` — including the full
-   `L=12,B=12` combination matching bert_base's actual scale — gave
-   **fully deterministic** results at every setting (0.9998 / 0.9985 /
-   0.9968 / 0.9814 respectively), the degradation pattern of ordinary
-   accumulating quantization noise, not a race. So neither axis alone, nor
-   their combination, reproduces the bug in a *synthetic* back-to-back
-   NPU-dispatch chain with no CPU work interleaved.
-3. **Does reproduce with the REAL bert_base architecture, truncated to N
-   encoder layers** (`_local/int8_debug/export_bert_base_ntrunc.py`, using
-   `model.encoder.layer = model.encoder.layer[:N]` on the actual
-   `bert-base-uncased` checkpoint, not a hand-built approximation — full 8
-   matmuls/layer: Q/K/V/output/intermediate/output-dense projections plus
-   QK^T/Attn@V, with real LayerNorm/Softmax/GELU/reshape CPU ops between
-   them). Ran 8 hardware trials at each of N=1,2,4,6,8,12:
+**더 정밀한 측정을 시도했으나 막힘**: 이 고정 오버헤드를 걷어내고 코어 자체의
+반복 실행 시간만 재는 전용 메커니즘이 이미 이 저장소에 있음
+(`--iree-amdaie-enable-infinite-loop-around-core-block=true` 컴파일 플래그 +
+`--amdxdna_n_kernel_runs`/`--batch_size` 런타임 플래그, `AMDAIEInsertInfiniteLoopAroundCoreBlock`
+패스). 두 모델 다 이 플래그를 켜고 재컴파일 시도했으나 **둘 다 서로 다른, 이 벤치마킹
+작업과 무관한 기존 버그에 막힘**:
+- int8(양자화, 클램프 있는 버전): Peano(`llc`)가 `G_FMINIMUM`(스칼라 f32 min/max,
+  requantize 클램프에서 씀)을 legalize 못 하고 크래시 (`unable to legalize
+  instruction ... G_FMINIMUM ... in function: core_7_5`). 참고로 **루프 래핑 없이
+  컴파일할 땐 이 크래시가 안 남** — 벡터화 경로는 원래도 이 스칼라 클램프를 우회해서
+  괜찮았는데, loop-wrap 패스가 뭔가 다른 코드 경로를 타게 만들면서 노출된 것으로
+  보임. (이 크래시는 사실 §1과 별개로 순수 스칼라 int8 경로
+  (`--iree-amdaie-enable-vectorization-passes=false`)에서도 loop-wrap 없이 그냥
+  단독으로 재현됨 — 즉 이 requantize 클램프 코드는 애초에 스칼라 경로 자체가
+  깨져 있었던 것으로 보이고, 지금까지 항상 벡터화 경로만 썼기 때문에 안 걸렸던 것.)
+- bf16 스칼라: `_XAie_LoadProgMemSection(): Overflow of program memory` — 코어
+  프로그램 메모리 초과. loop-wrap이 코드를 줄이는 게 아니라 오히려 (아마 무한 루프
+  구조 자체가 요구하는 추가 제어 흐름 때문에) 이미 큰 스칼라 K=128 언롤 코드를 더
+  키운 것으로 보임.
 
-   | layers | corr (8 runs) | deterministic? |
-   |---|---|---|
-   | 1 | 0.9859 | yes |
-   | 2 | 0.9673 | yes |
-   | 4 | 0.9509-0.9510 | almost (±0.0001) |
-   | 6 | 0.9291-0.9399 | **no** — splits into exactly two clustered values |
-   | 8 | 0.9314-0.9401 | **no** — same two-cluster pattern, similar spread |
-   | 12 | 0.70-0.90 | **no** — much wider, qualitatively different spread |
+**둘 다 이 세션에서 고칠 만한 사이즈가 아니라서(각각 별도의 Peano/코드젠 조사가
+필요) 여기서 멈춤** — "코어 연산만 순수 격리한 시간"은 여전히 미확보 상태.
 
-   Confirmed the non-determinism is real (not just "needs more delay")
-   by recompiling L=6 at delay=500,000 (50x the working baseline): **the
-   exact same two-value split persists, unchanged** (0.9291/0.9292 vs
-   0.9399), unlike the original bug which improved monotonically and then
-   fully resolved with enough delay.
+**요약**: 이 int8 양자화 작업 전체의 원래 동기("npu4에서 벡터화가 되긴 하는가")는
+§1에서 확정됐지만, **"그래서 실제로 빨라지는가"는 이번에 처음 측정했고, 답은
+"이 문제 크기에서는 측정 가능한 차이가 없다"**였음. 벡터화의 실제 이득을 보려면
+(a) 이 dispatch-당 고정 오버헤드보다 계산량이 훨씬 큰 문제(더 큰 M/K/N, 또는
+여러 레이어를 하나로 묶은 체인)로 다시 재거나, (b) 위에서 막힌 loop-wrap 경로의
+두 버그를 각각 고쳐서 코어 전용 시간을 분리 측정해야 함 — 둘 다 미착수.
 
-**Interpretation**: the discrete (not continuously-varying) two-cluster
-pattern at L=6/8 — the same two correlation values recur across many runs,
-rather than a smooth spread — suggests something closer to "one of two
-possible scheduling/ordering outcomes" than a smooth timing skew. This only
-emerges once enough real encoder layers (and therefore real interleaved
-CPU↔NPU dispatch round-trips, each with genuine wall-clock-variable host
-compute in between) accumulate — a synthetic NPU-only back-to-back dispatch
-chain of the same nominal size never triggers it, pointing at the
-CPU/NPU interleaving itself (variable real-time gaps between dispatches
-from actual host-side LayerNorm/Softmax/GELU compute, absent in the
-synthetic chain) as a plausible differentiator, though this is not yet
-directly confirmed — only inferred from what does and doesn't reproduce it.
+**재현 자료**: `_local/int8_debug/perf_check/`에 저장 (gitignore됨) —
+`mm_baseline.onnx`/`.mlir` (bf16 베이스라인 소스, `mm_int8.mlir`과 동일 shape·동일
+시드), `mm_baseline_bf16.vmfb` (컴파일된 베이스라인), `x.npy`/`ref.npy` (입력/참조값,
+`_local/int8_debug/out/x.npy`와 값 동일 — 같은 seed=0 재생성). 벤치마크 명령은 위
+"방법" 문단 그대로.
 
-**Status: unresolved, needs a different investigation approach than more
-delay-tuning.** The delay fix (10,000, restored as the working value for
-the *original* bug) stays in `AMDAIECoreToStandard.cpp`, uncommitted. BERT-tiny
-(2 layers) is unaffected by this second bug (deterministic, corr 0.99678,
-confirmed extensively in the Twelfth experiment) — it's specifically
-scale/layer-count-gated, likely starting around 5-6 real encoder layers.
-BERT-base int8+vectorization is NOT currently usable end-to-end.
+## 9. 실행 시간, BERT-tiny 전체 모델로 확장 (2026-08-31, 이어서) — 같은 패턴이 그대로 나옴
 
-## Fourteenth experiment: found a cheap, reliable repro of the second bug
+§8의 질문("BERT-tiny도 비슷한가?")에 답하기 위해, 이미 §4에서 만들어져 있던 완전한
+BERT-tiny e2e vmfb 두 개를 그대로 재사용해서 같은 방식으로 실측:
+`_local/int8_debug/out/bert_tiny_int8.vmfb` (§4, int8 QDQ + 벡터화, 10,000회 delay
+fix 포함, corr 0.99678 검증됨) vs `_local/int8_debug/out/bert_tiny_bf16.vmfb`
+(양자화 없는 원래 bf16 레시피, 벡터화 off). 입력은 `models/bert_tiny/input_ids.npy`
+(`[1,32]` 토큰 ID), 둘 다 먼저 `iree-run-module`로 정확성 재확인(두 출력이 서로
+거의 동일한 값으로 나옴 — 새 버그 없음).
 
-Tested two more isolation hypotheses for the second (delay-immune) bug,
-both scripts in `_local/int8_debug/`:
+`iree-benchmark-module` 동일 방식(5회 × 3초 이상, 실제 npu4):
 
-1. **CPU-NPU interleaving with real host compute, refuted.** Took the
-   already-clean synthetic chain (`gen_chained_bmm.py`, repeated SAME-TYPE
-   batched matmuls, deterministic even at L=12,B=12) and inserted a real
-   `LayerNormalization` (genuine CPU-scheduled op, same op bert uses after
-   every block) between every matmul
-   (`gen_chained_bmm_cpu_interleave.py`). At L=12,B=12: **fully
-   deterministic, 10/10 runs identical (corr=0.97928)**. So real CPU work
-   interleaved between NPU dispatches, by itself, is not the trigger —
-   refutes the "host-side wall-clock jitter between dispatches" theory in
-   this form.
+| | 평균 | 표준편차 |
+|---|---|---|
+| **int8 (벡터화)** | 1615 ms | ±219 ms |
+| **bf16 (스칼라)** | 1635 ms | ±197 ms |
 
-2. **Alternating batched and non-batched matmul DISPATCH TYPES (with tile
-   reuse), confirmed as a reproducer.** Real BERT alternates non-batched
-   (Q/K/V/output/FFN projections) and batched (QK^T/Attn@V) matmul
-   dispatches within every layer, connected by `Reshape`/`Transpose` to
-   split/merge the per-head batch dimension — tile assignment being a pure
-   function of M/N-tile index (not batch or dispatch-type) means these two
-   dispatch types can land on the *same* physical AIE tiles.
-   `gen_chained_mixed.py` builds exactly this per-layer shape (non-batched
-   `MatMul(M=32,K=64,N=64)` → `Reshape`+`Transpose` → batched
-   `MatMul(batch=12,M=32,K=64,N=64)` → `Transpose`+`Reshape` back),
-   repeated 12 times. **Result: non-deterministic** — 10 runs gave 3
-   distinct correlation values (0.96992/0.97074/0.97103), a small but
-   real, non-zero spread (compare: every earlier same-type-only chain gave
-   *exactly* one value across every run, always). Confirmed non-delay-fixable
-   by recompiling at delay=500,000 (50x): **still non-deterministic, 4
-   distinct values across 15 runs (0.96522-0.97074), if anything a wider
-   spread than at 10,000** — matching the exact "no improvement, sometimes
-   worse" signature seen with the real bert_base model's second bug.
+**§8과 똑같은 결론: 차이가 노이즈 안에 있음 — 측정 가능한 속도차 없음.** 이번엔
+host CPU 시간이 19~24ms, 벽시계 시간이 1.4~1.9초 — 여전히 98%+ 가 오버헤드/대기
+시간. BERT-tiny(2레이어 트랜스포머)는 레이어당 여러 개 dispatch(Q/K/V 생성,
+배치 attention matmul 2개, softmax, output projection, FFN up/down 등)로
+쪼개지는데, 총 벽시계 시간(~1.6초)을 §8에서 측정한 "dispatch 1개당 고정 오버헤드
+~100ms"로 나누면 대략 15~16개 dispatch에 해당 — 실제 BERT-tiny 구조(임베딩 +
+2레이어 × 레이어당 ~7개 dispatch)와 대략 맞아떨어짐. **즉 여러 dispatch를 체인으로
+묶어도 똑같은 메커니즘(dispatch 개수 × 고정 오버헤드)이 전체 시간을 지배하고,
+int8 벡터화가 주는 실제 계산 이득은 이번에도 안 보임.**
 
-**This is now the best available minimal repro of the second bug**: a
-~40-second compile (vs. bert_base's 3+ minutes), 12-"layer" synthetic model
-with no BERT-specific semantics at all — just alternating
-batched/non-batched matmul dispatch types with shared physical tiles. Two
-prior hypotheses are now cleanly separated: repeating ONE dispatch type
-(batched-only, any batch/layer count, with or without CPU ops between them)
-never reproduces it; introducing a SECOND, alternating dispatch type does.
-The likely mechanism: a non-batched dispatch's use of a physical tile
-between two batched dispatches' uses of that same tile (or vice versa)
-creates a genuinely different lock/timing pattern than the "reuse the same
-dispatch type repeatedly" case the original fix was built and tested
-against — plausibly a *different* lock (or the same lock in a different
-acquire/release sequence position) gets its "first use" moment at a point
-the current fix's "first release of each lock, once per core" tagging
-doesn't correctly single out, once two different dispatches' worth of
-lock/buffer setup interleave on the same tile. Not yet root-caused further
-than this — the next step would be comparing this repro's compiled
-core-level IR/disassembly for the tiles that are shared between the two
-dispatch types against a matching tile that's used by only one dispatch
-type, the same way the original bug's row 2/row 3 comparison was done.
+**결론(§8+§9 종합)**: 이 백엔드에서 "int8 벡터화가 빠르다"는 주장은 **단일
+2D matmul에서도, 실제 2레이어 BERT 전체에서도 아직 한 번도 실측으로 확인된 적이
+없음** — 둘 다 dispatch당 고정 오버헤드에 완전히 가려짐. 이 오버헤드를 줄이거나
+(dispatch 수를 줄이는 퓨전, 혹은 §8에서 시도했다가 막힌 loop-wrap 기반 코어 전용
+시간 분리) 계산량 자체가 훨씬 큰 워크로드(BERT-base, 더 긴 seq_len)로 다시 재야
+진짜 이득이 보일지 알 수 있음 — 둘 다 미착수.
 
-## Fifteenth: four more hypotheses checked and refuted for the second bug (session pause point)
+## 10. BERT-base MLM decoder matmul(N=30528)을 실제로 int8+벡터화해서 확인해봄 (2026-08-31, 이어서) — 컴파일 자체가 새로운 버그로 막힘
 
-Continued narrowing the second (delay-immune) bug using the cheap
-`chainmix_L12` repro. Each of the following was checked with real evidence
-(file:line + actual IR/hardware dumps, not just plausibility) and refuted:
+`models/bert_base/README.md` §5 / `project-bert-e2e-plan` 메모리에 기록된, 예전에
+NPU에서 못 돌려서 host numpy로 우회했던 그 matmul(`[32,768]×[768,30528]`,
+BERT-base MLM head의 vocab-projection) — "벡터화하면 그때 문제(타임아웃, 이후
+비결정성)가 해결됐을까?"를 직접 확인해보려 했음.
 
-1. **Stale lock hardware values across dispatches sharing a tile** —
-   refuted. `AMDAIEControlCodeToTransaction.cpp:73-81`'s `appendLockOp` →
-   `initializeLock` (`runtime/src/iree-amd-aie/aie_runtime/
-   iree_aie_configure.cc:306-313`, `XAie_LockSetValue`) unconditionally
-   force-resets every lock a dispatch uses via a real MMIO write, every
-   single dispatch, regardless of what dispatch type previously touched
-   that physical tile. (Tile-sharing itself IS real, though: dumped
-   `--mlir-print-ir-after=iree-amdaie-assign-tiles` for `chainmix_L12` and
-   confirmed both the non-batched and batched dispatch use the identical
-   full tile set `tile_{0..7}_{0..5}`.)
-2. **Stale BD (buffer descriptor) register content** — refuted.
-   `configureDMABD`/`initDMADesc` (`iree_aie_configure.cc:25,54`) always
-   starts from `XAie_DmaDescInit`'s full `memset`
-   (`third_party/aie-rt/driver/src/dma/xaie_dma.c:69-97`), and
-   `_XAieMl_TileDmaWriteBd` (`xaie_dma_aieml.c:867-1035`) does one full
-   6-word `XAie_BlockWrite32` every time a BD is configured — never a
-   read-modify-write, so no field can carry over from a prior dispatch.
-3. **Cross-dispatch DMA start-queue drain race** (a genuinely different
-   *timing/occupancy*-based hazard, unlike 1-2's value-staleness) —
-   refuted for our test configuration. Dispatches are fully
-   host-synchronous by default:
-   `iree_hal_amdxdna_native_queue_submit_and_wait`
-   (`runtime/src/iree-amd-aie/driver/amdxdna/native_linux_kmq.cc:574-610`)
-   blocks on `wait_command` until `ERT_CMD_STATE_COMPLETED` before the next
-   dispatch is even submitted (`direct_command_buffer.cc:771-855`,
-   `:841-843`). (An opt-in `ERT_CMD_CHAIN` batching path exists,
-   `--amdxdna_cmd_chain=1`, that *would* remove this guarantee — but it's
-   off by default and wasn't used in any test run so far.)
-4. **`AMDAIEFoldDmaWaits.cpp` dropping a needed wait for one dispatch shape
-   but not the other** — refuted. Its fold logic
-   (`foldDmaWaitsByQueue`/`foldDmaWaitsByBatch`) only ever *merges*
-   consecutive wait ops into fewer waits; `canFoldByQueue` (line 103-129)
-   and `canFoldByBatch` (line 245-268) both force a real, unfoldable wait
-   whenever a per-(tile,connection) BD-tracking set is empty or the real
-   hardware queue depth (`getDmaMaxQueueSize`, backed by genuine aie-rt
-   hardware introspection, not a hardcoded constant) is hit. Empirically
-   confirmed on `chainmix_L12`'s actual compiled IR
-   (`--mlir-print-ir-before/after=iree-amdaie-fold-dma-waits`): both the
-   non-batched and batched dispatch fold 20 wait ops down to 1, and in
-   both cases every one of the 20 DMA-producing tokens is still covered by
-   a wait occurring later in program order — no gap in either shape.
+**결과: 확인 자체를 못 함 — 컴파일이 §8/§9와 무관한, 이전에 발견 못 했던 세 번째
+Peano 버그에 막힘.** 같은 shape(M=32,K=768,N=30528)을 §8과 동일한 QDQ int8
+레시피(가중치 상수 버전, `gen_and_quant.py` 그대로 — §9의 실제 decoder matmul과
+가장 가까운 구조)로 양자화 + 벡터화 ON으로 컴파일 시도 → **§8에서 loop-wrap
+플래그를 켰을 때 봤던 것과 정확히 같은 크래시**:
+```
+LLVM ERROR: unable to legalize instruction: %_(s32) = G_FMINIMUM %_, %_ (in function: core_7_5)
+```
+**중요한 재발견: 이번엔 loop-wrap 플래그 없이, 순정 벡터화 컴파일 자체에서
+크래시남.** 즉 §8에서 "loop-wrap이 원인인 줄 알았던" 그 크래시가, 사실은
+**loop-wrap과 무관하게 어떤 N 규모 이상에서는 벡터화 경로 자체가 이 requantize
+clamp를 못 다루는 것**임이 이번에 드러남 — §8의 "loop-wrap 때문"이라는 설명은
+정정 필요.
 
-**Where this leaves things**: every layer of "is the compile-time IR/host
-synchronization logically correct" has now checked out clean — lock values,
-BD register content, inter-dispatch host synchronization, and wait-folding
-are all individually provably correct by direct code+dump inspection, not
-just argued from plausibility. The remaining unaudited layer is the actual
-lowering of `NpuDmaWaitOp` into whatever primitive really blocks on
-hardware completion (a task-completion-token read) — i.e. whether that
-*specific* translation has an unconditional, correct semantics, rather than
-auditing further which waits the IR keeps (already confirmed correct).
-Given the original bug also turned out to be a genuine, undocumented
-hardware quirk (a lock's pre-charged first-use credit) rather than
-anything visible from source alone, it's plausible this second bug is
-similarly something no amount of source reading will surface — worth
-weighing real hardware trace tooling against continuing the source audit
-if this pattern of clean-but-inconclusive audits continues.
+**이분탐색으로 경계 확인** (같은 K=768, 상수 가중치, 매번 새로 양자화+컴파일만
+함 — 하드웨어 실행 없이 컴파일 성공/실패만 확인, 수 초 단위라 빠름):
 
-**Sixteenth: isolated dispatch-TYPE change as the active ingredient, separate from the CPU op that mediates it.** `gen_chained_mixed.py`'s repro changed two things at once between the non-batched and batched matmul: the dispatch TYPE (non-batched vs batched) AND the specific CPU op (`Reshape`+`Transpose`, vs. the earlier LayerNorm-interleave test's `LayerNormalization`). To separate these, `gen_chained_bmm_transpose.py` keeps dispatch type FIXED at batched throughout (matching the already-clean LayerNorm test) but swaps in a real `Transpose`+`Transpose`-back pair (genuine data movement, permuting within the `[B,M,N]` tensor, no rank/batch-count change) between every matmul. Result: **fully deterministic, 15/15 identical (corr=0.98135)**. So neither LayerNorm nor Transpose, by itself, triggers anything when dispatch type stays constant — confirms the trigger is specifically the *dispatch-type transition* (non-batched↔batched), independent of which CPU op is sandwiched in between it.
+| N | 결과 |
+|---|---|
+| 3072 (기존에 이미 검증된 FFN 스케일, `mm_large_int8.vmfb`) | **컴파일 성공** |
+| 3584 | **크래시** (`G_FMINIMUM`, `core_7_5`) |
+| 4096, 6144, 12288, 24576, 30528(진짜 decoder 크기) | **전부 크래시** (동일) |
 
-## Seventeenth: PDI/hardware-context reload confirmed real; host-side settling delay tried and found inconclusive due to environmental noise
+**즉 N=3072와 3584 사이 어딘가에 실제 경계가 있고, 그 이상은 이 저장소가 시도한
+모든 N에서 100% 크래시함.** BERT-base의 FFN(N=3072)은 마침 이 경계 바로 아래라
+지금까지 "벡터화된 int8이 잘 된다"고 검증된 모든 사례가 우연히 이 버그를 피해간
+것으로 보임 — decoder matmul(N=30528)은 이 경계를 10배 가까이 넘는 규모라 정면으로
+걸림.
 
-Following up on the "PDI reconfiguration" theory: confirmed via
-`direct_command_buffer.cc:970-990` that **every** dispatch (not just
-type-transitions) calls `iree_hal_amdxdna_native_device_create_context` →
-a real `create_hw_context` ioctl passing PDI bytes — so a fresh hardware
-context genuinely is (re)established every single dispatch, same-type or
-not. Since same-type dispatch chains (which also reload every time) stay
-clean, the refined theory is: reloading with **identical** PDI content
-(same-type dispatches) is safe/idempotent, while reloading with
-**different** PDI content (a real type-transition, non-batched↔batched) is
-a genuine fabric/switchbox reconfiguration — a qualitatively bigger,
-riskier event, consistent with everything observed and with why it's
-delay-immune at the core level (the reload is host-confirmed-complete
-*before* the core's own program starts).
+**결론**: BERT-base MLM decoder matmul을 벡터화 int8로 바꿔서 "그때의 타임아웃/
+비결정성 버그가 없어지는지" 확인하는 건, 그 질문에 답하기도 전에 **컴파일 자체가
+안 돼서 막힘**. 원래 bf16 스칼라 버전이 겪었던 문제(타임아웃, 그다음 비결정성)와는
+완전히 다른, 세 번째의 별개 버그. 정리:
+1. bf16 스칼라: 컴파일됨, 느려서 타임아웃 → 타임아웃 올리면 컴파일+실행은 되는데
+   비결정성 버그 (§ models/bert_base/README.md §5, 원인 미규명).
+2. int8 벡터화: **이 규모에서는 컴파일 자체가 안 됨** (이번에 새로 발견, 원인 미규명
+   — Peano/LLVM의 GlobalISel 레지스터 할당이 이 규모의 requantize epilogue를 어느
+   시점부터 못 legalize하는 것으로 보이나 더 파고들지 않음).
 
-Tried a host-side settling delay (`std::this_thread::sleep_for`, gated
-behind `getenv("AMDXDNA_PDI_SETTLE_US")` for fast iteration without
-rebuilding) inserted in `direct_command_buffer.cc` right after
-`open_cu()` returns, before the first dispatch against the freshly-loaded
-context is submitted — the same idea as the original core-internal delay
-fix, but relocated to the correct (host/driver) level this time. Result:
-**inconclusive, not a clean fix.** At 5,000us: 2/15 runs still wrong. At
-50,000us (10x): first sample 8/20 wrong (worse!), but a back-to-back
-30-run comparison of baseline (no delay) vs. 50,000us gave **0/30 wrong
-for BOTH** — then a further 40-run baseline batch immediately after
-that showed the expected ~20-30% failure rate again (5 distinct
-correlation values, not just the earlier two).
+**How to apply**: "벡터화하면 다 해결된다"고 가정하지 말 것 — 오히려 이 규모의
+큰 matmul은 스칼라든 벡터화든 각자 다른 이유로 막혀 있어서, decoder matmul을
+NPU에서 돌리려면 **두 개의 서로 다른 버그**(bf16 비결정성 OR int8 G_FMINIMUM
+legalization)를 각각 별도로 고쳐야 함. 당장은 host numpy 우회(`bert_mlm_trunk.vmfb`
+방식)가 유일하게 검증된 정답이라는 기존 결론이 그대로 유지됨.
 
-**This reveals an important confound that likely affects every
-non-determinism measurement in this investigation so far**: the race's
-observed failure rate is not stable over time even with the exact same
-code and delay value — it appears to depend on some external, uncontrolled
-system condition (thermal state, host/NPU load, driver internal state,
-etc.) that fluctuates between test batches, sometimes suppressing the race
-almost entirely (0/30) and sometimes exposing it at a high rate (~20-30%).
-Getting 30/30 clean by chance if the true rate were a stable ~20-30% has
-probability ~0.001-0.02% — far too unlikely, so the *true* per-batch rate
-itself must be moving around, not just sampling noise around a fixed rate.
+**재현 자료**: `_local/int8_debug/decoder_check/`(gitignore됨) — `bisect_<N>*.onnx/.mlir`
+이분탐색에 쓴 각 N별 산출물, `mm_decoder_int8.mlir`/`mm_decoder_w_int8.mlir`
+(진짜 decoder 크기 N=30528, 두 가지 양자화 스타일 — activation 2개짜리와 상수
+가중치짜리 둘 다 동일하게 크래시함, 구조 문제 아니라 순수 크기 문제임을 확인).
+로그 파일은 안 남겨뒀지만 컴파일 자체가 몇 초면 끝나서 위 "방법"대로 재컴파일하면
+바로 재현됨.
 
-**Practical implication**: small-sample (10-20 run) A/B comparisons used
-throughout this investigation to accept/reject a hypothesis are less
-reliable than they appeared — a clean result in a small sample could
-reflect a temporarily-quiet system state rather than an actual fix, and
-apparent differences between two conditions tested at different times
-could reflect this drift rather than the code change under test. The
-*qualitative*/structural findings (dispatch-type-alternation is necessary,
-tensor size alone isn't, batch/layer count alone isn't, Transpose alone
-isn't) are probably still sound since each was checked via a same-type vs.
-different-structure comparison, but exact failure-rate numbers and
-"which delay value is safest" conclusions should be treated as
-directional, not precise, until re-verified with much larger sample
-sizes or a way to control/monitor whatever this environmental variable
-is.
+## 11. 배경 지식: QDQ vs QOperator, dequantize가 왜/어디서 나오는가 (2026-09-01, 참고용)
 
-The experimental `direct_command_buffer.cc` host-side-delay patch was
-reverted (`git checkout --`) after this inconclusive result — no changes
-left in that file. `AMDAIECoreToStandard.cpp`'s delay value remains at the
-validated 10,000 (unrelated, unchanged).
+지금까지 이 문서 전체가 `quant_format=QuantFormat.QDQ`(§1)를 전제로 쓰여있는데,
+"QDQ가 뭐고 왜 그걸 골랐는지", "dequantize는 왜 필요한지"를 나중에 다시 볼 때
+헷갈리지 않도록 개념을 정리해둠. 코드 조사 결과 기반, 실험은 아님.
 
-## Eighteenth: re-tested the host-side PDI settling delay properly (interleaved, real bert_base) — negative result
+**QDQ는 별도의 양자화 "방법"이 아니라 양자화 그래프의 표현 방식.** ONNX에는 두 가지
+표현이 있음:
+- **QOperator**: `QLinearMatMul`/`QLinearConv` 등 int8 전용 연산자로 그래프를 짬.
+- **QDQ**: 원래 fp32 연산(`MatMul`, `Conv` 등)은 그대로 두고 앞뒤에
+  `QuantizeLinear`/`DequantizeLinear` 노드 쌍을 끼워 넣음.
 
-The Seventeenth experiment's host-side delay test used block-sampling
-(N runs of condition A, then N runs of condition B), which the discovered
-environmental-noise confound makes unreliable — a time-drift in the
-"true" failure rate would masquerade as a condition difference. Redid it
-properly: **interleaved** A/B/A/B/... sampling (alternating baseline and
-delay on every single run, not in blocks) against the real
-`bert_base_L6_int8.vmfb` (layer-truncated real bert_base, the same one
-that showed a clean two-cluster non-determinism earlier), using the
-`AMDXDNA_PDI_SETTLE_US` env var for fast toggling without rebuilding.
+installed onnxruntime 1.29.0의 `quantize_static`은 `quant_format`을 안 주면
+QOperator를 냄 — QDQ를 쓰려면 명시적으로 지정해야 함(§1에 이미 기록됨). 이 저장소가
+QDQ를 고른 이유: torch-mlir의 `FuseQuantizedOps` → IREE의
+`LinalgQuantizedMatmulToMatmul`(`third_party/iree/compiler/src/iree/compiler/GlobalOptimization/QuantizedMatmulToMatmul.cpp`)
+패스 체인이 Q→matmul→DQ 패턴을 인식해서 순수 int8 matmul로 재구성하도록 설계되어
+있고, 이 컴파일 경로가 실제로 검증/커밋된 경로이기 때문(QOperator용
+`QLinearMatMul` 임포터도 torch-mlir에 존재하긴 함 —
+`third_party/iree/third_party/torch-mlir/lib/Conversion/TorchOnnxToTorch/DefaultDomainQtoZ.cpp:602` —
+but 이 저장소에서 실사용/검증된 쪽은 QDQ).
 
-- 50,000us delay, 20 interleaved pairs: baseline 12/20 clean (60%) vs.
-  delay 6/20 clean (30%) — delay noticeably *worse*.
-- 5,000us delay, 20 interleaved pairs: baseline 11/20 clean (55%) vs.
-  delay 9/20 clean (45%) — delay slightly worse again.
+**dequantize가 나오는 이유는 세 가지, "안전장치"처럼 보이지만 실제로는 대부분
+수학적으로 필수:**
+1. **int32 누산값 rescale (근본 원인)**: int8×int8 matmul 결과는 int32
+   누산기에 쌓이고, 이 값엔 `scale_x * scale_w`라는 합성 스케일이 곱해진 상태라
+   실제 값과 다름. `real ≈ (int32_acc - zp보정) * (scale_x*scale_w)`로 되돌리는
+   계산은 다음 레이어로 넘기기 전에 반드시 필요 — 안 하면 값 자체가 틀어짐.
+2. **정밀도 민감 연산 경계**: softmax/layernorm/GELU처럼 int8로 안 도는(혹은 안
+   도는 게 나은) 연산 앞에서는 float으로 복원해서 넘겨야 함([[project_softmax_ukernel_infra]]
+   참고 — 이 저장소는 애초에 softmax를 NPU에 못 올리고 있어서 이 경계가 실제로
+   존재함).
+3. **weight-only quantization**: activation은 float 그대로 두고 weight만
+   압축 저장한 경우, 실행 시 weight를 다시 float으로 되돌려서(dequant) float
+   matmul을 돎. IREE의 `FuseDequantizationMatmulPass`
+   (`third_party/iree/compiler/src/iree/compiler/GlobalOptimization/FuseDequantizationMatmul.cpp`)가
+   찾는 패턴이 정확히 `extui → uitofp → subf → mulf`(정수→float 변환 → zero_point
+   빼기 → scale 곱하기) — dequantize 그 자체.
 
-**Verdict: the host-side settling-delay approach does not help and may
-actively hurt, across two different delay magnitudes, with the more
-noise-resistant interleaved design.** Plausible explanation (not
-confirmed): `std::this_thread::sleep_for` puts the host thread to sleep,
-which on real hardware (this machine is a shared laptop) likely allows
-the CPU to drop into a deeper idle/power-saving state during the sleep,
-and coming back out of that state to issue the next dispatch may
-introduce its OWN new timing jitter — potentially trading one source of
-timing variance for another, worse one, rather than adding clean
-"settling time." A busy-wait (spinning instead of sleeping) might avoid
-this specific confound but wasn't tried.
+**QOperator는 dequant가 "없는" 게 아니라 op 안에 캡슐화된 것.**
+`QLinearMatMul`은 입력 8개(`a, a_scale, a_zp, b, b_scale, b_zp, y_scale, y_zp`)를
+받는데, 이건 "int8 곱 → int32 누산 → y_scale/y_zp로 rescale"이라는 계산을 op
+하나에 통째로 숨긴 것 — QDQ에서 별도 노드로 노출되던 계산이 QOperator에서는 op
+파라미터로 흡수됐을 뿐 계산량은 동일함. 또한 QOperator도 quantized 버전이 없는
+연산(위 2번 케이스)을 만나면 그 경계에서 여전히 `DequantizeLinear`/`QuantizeLinear`
+쌍을 그대로 남김 — 완전히 사라지는 게 아니라 "지원되는 연산에 한해서만" fuse된
+것.
 
-Reverted the experimental change again
-(`git checkout -- runtime/src/iree-amd-aie/driver/amdxdna/
-direct_command_buffer.cc`) — no changes left in that file.
+| | QDQ | QOperator |
+|---|---|---|
+| rescale 수학 | 있음, `DequantizeLinear` 노드로 명시적 노출 | 있음, op 내부 파라미터로 은닉 |
+| 컴파일러가 fuse 못하면 | float로 fallback해서 그냥 돌아감(정확도 손실만) | fallback 없음 — 그 op를 backend가 지원 안 하면 컴파일 실패 |
+| int8 미지원 연산 만나면 | 앞뒤에 그대로 Q/DQ 노드 유지 | 그 op만 예외적으로 Q/DQ 쌍이 그대로 남음 |
 
-**Practical implication going forward**: any future test of a *timing*-
-related fix for this bug should (a) use interleaved A/B sampling, not
-block sampling, and (b) use large sample sizes (20-30+ per condition),
-given how easily this machine's environmental noise can produce a
-misleading block-sampled result in either direction.
+**How to apply**: 이후 다른 모델/레이어를 양자화하다가 "이상하게 dequantize
+연산이 그래프/IR에 남아있다"고 놀랄 필요 없음 — 정밀도 민감 연산 경계이거나
+weight-only 케이스일 가능성이 높고, 후자라면 `FuseDequantizationMatmulPass`가
+정상적으로 처리 중인 것. 반대로 컴파일된 IR에서 dequant 노드가 하나도 안
+보이면 `LinalgQuantizedMatmulToMatmul`이 완전 fuse에 성공해서 순수 int8
+matmul이 된 것(§1의 `aievec.matmul ... i8, i8 into i32` 케이스가 이거).
 
-## Nineteenth: busy-wait (spin) instead of sleep — promising signal at 500ms, session ended here
+## §11 — 2026-09-04: 두 번째 버그(BERT-base 비결정론)를 IREE 밖, 순수 IRON(손으로 짠 `aie.device` MLIR)에서 재현 시도 — 최소 버전은 음성(negative) 결과
 
-Retried the host-side settling delay using a busy-wait spin
-(`std::chrono::steady_clock`-based, no `sleep_for`) instead of sleeping,
-to rule out the "sleep lets the host CPU drop into a power-saving state
-and reintroduces jitter on wake" explanation for the Eighteenth
-experiment's negative result. Env-var gated (`AMDXDNA_PDI_SETTLE_US`)
-in the same spot in `direct_command_buffer.cc`, tested interleaved
-against real `bert_base_L6_int8.vmfb` (48 dispatches per run, so the
-settle cost applies per-dispatch — expensive to test at scale: 500us ×
-48 ≈ 24s of pure spin added per model run at the largest value tried).
+**동기**: 지금까지 이 두 번째 버그(§"Thirteenth"~"Twentieth")의 최소 재현은
+전부 ONNX→`iree-import-onnx`→`iree-compile` 경로로만 만들어졌고, IRON으로
+손으로 검증한 적이 없었음. 첫 번째 버그(batch-0 lock pre-charge race)는
+IREE 컴파일러 산출물이 아니라 AIE 락 자체의 하드웨어 동작(pre-charged
+counting semaphore)이 근본 원인이었던 선례가 있으므로, 이번에도 "IREE가 만드는
+특정 코드 패턴 때문"이 아니라 "타일 공유 + dispatch 전환"이라는 더 일반적인
+하드웨어 레벨 현상일 가능성을 IREE 컴파일러 경로와 완전히 무관하게 먼저
+검증하기로 함 (`_local/mlir_aie_repro/2026-09-04_dispatch_type_alternation/`).
 
-- 50,000us spin, 20 interleaved pairs: baseline 60% clean vs. spin 50%
-  clean — still no help, similar to sleep_for's result.
-- 500,000us spin (10x more), 10 interleaved pairs (session ended before
-  reaching the planned 20 — a background continuation was started then
-  stopped early at the user's request): **baseline 3/10 clean (30%,
-  including two unusually-bad outlier correlations 0.914-0.915 not seen
-  at other delay values) vs. spin 6/10 clean (60%), with NO outliers
-  that bad** — a real, if modest-sample, positive signal, unlike every
-  delay value tried before it (5k/50k via sleep_for, 5k/50k via spin).
+**최소 repro 설계**: 같은 물리 타일 `tile(0,2)` 위에서 실행되는, 구조적으로
+다른 두 개의 단일 실행(배치 루프 없음) 프로그램을 각각 별도 xclbin으로 컴파일:
+- TYPE A: `out = in + 10`, 락 4개(0-3).
+- TYPE B: `out = in*3 + 5`, 락 6개(0-5, extra scratch buffer/lock pair 추가) —
+  단순히 상수만 다른 게 아니라 타일 위 프로그램 이미지(.elf, 락 테이블)가
+  실제로 다르도록 구성.
 
-**Not conclusively proven** (n=10 is small, and this investigation has
-already demonstrated how noisy small samples can be) but the FIRST
-positive-direction result after four consecutive negative/neutral
-attempts at nearby smaller values — suggests a possible threshold
-effect where the needed settling time is much larger than initially
-guessed (500us-50ms didn't help; 500ms showed promise). Worth prioritizing
-as the next thing to properly re-verify (larger interleaved sample, e.g.
-20-30 pairs) before drawing a firm conclusion either way.
+의도적으로 배치 루프(이미 고친 버그 #1의 메커니즘)는 아예 넣지 않아서, 여기서
+뭔가 깨진다면 그 원인은 순수하게 "다른 타입의 프로그램을 같은 타일에 번갈아
+로드/실행하는 것" 하나로 좁혀지도록 설계.
 
-Reverted the experimental change again (`git checkout --
-runtime/src/iree-amd-aie/driver/amdxdna/direct_command_buffer.cc`) — no
-changes left in that file. `AMDAIECoreToStandard.cpp`'s delay value
-remains at the validated 10,000 (unrelated to this experiment, unchanged).
+**실행 방법**: 하나의 `xrt::device`에 xclbin A/B를 모두 `register_xclbin`하고
+별도의 `xrt::hw_context`(즉 실제 PDI reconfigure가 일어남)를 만들어 `A, B,
+A, B, ...`를 반복 실행하며 매번 출력 전체를 검증 (`diag_alternate.cpp`).
 
-**Session paused here at the user's request, having reached a genuinely
-promising (not yet confirmed) lead: a ~500ms host-side busy-wait after
-PDI/context reload, right before the first dispatch against it, may
-substantially reduce the second bug's failure rate.** To resume:
-re-implement the same env-var-gated busy-wait patch (see this entry for
-the exact code), and run a proper 20-30-pair interleaved A/B test at
-500,000us (and perhaps try a couple of nearby values, e.g. 200,000 and
-1,000,000, to bracket it) against `bert_base_L6_int8.vmfb` before
-deciding whether to make this a real (non-experimental) fix. Delay fix value confirmed
-restored to the validated 10,000 in `AMDAIECoreToStandard.cpp` before
-stopping (still uncommitted). No compiler source is left in a
-half-edited/experimental state. To resume: continue at "TCT/NpuDmaWaitOp
-lowering audit" above, using the `chainmix_L12` repro
-(`_local/int8_debug/gen_chained_mixed.py`, ~40s compile) as the cheap test
-case rather than full bert_base.
+**결과**: 개별 sanity check(A만 1회, B만 1회) 모두 정상(`run state 4`, 출력
+일치). Alternation 테스트: **10회 alternation(20회 실행) 0/20 실패, 100회
+alternation(200회 실행) 0/200 실패** — 전부 `run state 4`, 매 실행 출력
+100% 일치, 행(hang)이나 손상 전혀 없음.
 
-## Suggested next steps, in order
+**결론 (negative, 하지만 유의미)**: "구조적으로 다른 두 프로그램을 같은 물리
+타일에 번갈아 로드하는 hw-context/PDI 스위치" 자체는, 이 정도의 최소 스케일
+(타일 1개, 컬럼 1개, 배치/반복 메커니즘 없음, 코어 프로그램 자체도 아주 작음)
+에서는 200번을 시도해도 전혀 문제를 일으키지 않음. 즉 실제 버그는 단순
+"dispatch type이 바뀐다"는 사실만으로 트리거되는 게 아니라, 실제 BERT-base
+dispatch가 갖는 다음 요소 중 하나 이상이 진짜 필요조건일 가능성이 높음:
+1. **진짜 batch 실현 메커니즘** — §"Twentieth"에서 확인했듯, 실제 batched
+   dispatch는 코어 내부 `scf.for` 루프가 아니라 **shim DMA의 하드웨어
+   repeat_count**(`push_to_queue`를 N번 재사용)로 batch를 구현함. 이 repro는
+   그 메커니즘을 전혀 쓰지 않았음 — 다음 시도에서 넣어야 할 첫 번째 후보.
+2. **컬럼/타일 규모** — 실제 dispatch는 8개 컬럼(`NumCols=8`)에 걸쳐 여러
+   타일이 동시에 참여하지만, 이 repro는 컬럼 1개·코어 1개뿐.
+3. **IREE가 실제로 생성하는 TCT sync / lock 초기화 코드**는 `aiecc`(mlir-aie
+   툴체인)가 생성하는 control code와 다른 코드베이스(`AMDAIEControlCodeToTransaction.cpp`
+   vs mlir-aie 자체 lowering)라서, 여기서 "깨끗함"이 IREE 쪽 control code가
+   똑같이 깨끗하다는 보장은 아님 — 이 repro가 검증한 건 "AIE 하드웨어/드라이버
+   자체는 최소 스케일에서 문제 없다"는 것이지, "IREE의 특정 control-code
+   생성 로직도 문제 없다"는 것은 아님.
 
-**§4a is root-caused down to the mechanism (pre-charged lock credit exposes
-only the first acquire-release cycle to a real race) and has a confirmed,
-cheap (fixed one-time cost per core) working workaround, now shrunk from
-500,000 to 10,000 iterations — see the "Tenth" and "Eleventh" experiments
-above.** Remaining work is about turning "a workaround exists" into "a real,
-cheap fix exists":
+**How to apply**: 이 최소 버전을 근거로 "타일 공유는 무해하다"고 단정하지
+말 것 — 스케일/메커니즘이 실제 버그 조건과 아직 충분히 다름. 다음 단계는
+repeat_count 기반 batch 실현(§1 후보)을 이 repro에 추가해서 재시도하는 것이
+가장 저렴하고 유력한 다음 실험. 재현 자료: `_local/mlir_aie_repro/
+2026-09-04_dispatch_type_alternation/`(`gen_type.py`, `diag_single.cpp`,
+`diag_alternate.cpp`, gitignored) — 컴파일/실행은 컨테이너 밖에서
+`~/NPU/mlir-aie/ironenv` + `/opt/xilinx/xrt` + `PEANO_INSTALL_DIR=llvm-aie`로
+직접 진행(`solo_test.sh` 패턴과 동일), 실행은 반드시 `scripts/lock/with-npu-lock.sh`로 감쌀 것.
 
-1. ~~Try to shrink the delay further.~~ Done — 10,000 iterations, verified
-   with 0/20 failures at batch=4 and 0/10 at batch=2. Note the failure
-   boundary was found using batch=4 as the stress test, not batch=2 — batch=4
-   surfaces the race more often since it has the same number of independent
-   per-core trials as batch=2 (16 physical cores either way) but the boundary
-   region (5,000-8,000) showed batch=4 failing before batch=2 did in smaller
-   samples, so any future re-tuning of this constant should stress-test with
-   the highest batch count available, not just batch=2.
-2. **Find the real fix at the driver/hardware/lock-configuration level**, so
-   no busy-wait is needed at all. Given the mechanism now points
-   specifically at each lock's *initial credit value* (or whatever skips
-   the real hardware confirmation on a lock's first use), look at how lock
-   initial values get chosen/emitted (the buffer/lock declarations
-   compared earlier showed values like `2,0,2,0,2,0` — worth understanding
-   exactly what those encode and whether adjusting them removes the race
-   without any busy-wait), and/or read `runtime/src/iree-amd-aie`'s HAL
-   driver / command-buffer dispatch sequencing code (genuinely unexplored
-   all session) for anything related to how the first use of a
-   double-buffered lock gets bootstrapped.
-3. Two hypotheses considered and refuted with direct evidence along the way
-   — recorded so they aren't re-derived: AIE "checkerboard" row-parity
-   memory mirroring (real AIE1 concept, confirmed disabled on AIE2P via
-   `IsCheckerBoard=0` in `third_party/aie-rt`) and "inner vs outer row
-   generates different neighbor-routing code" (refuted by md5-identical
-   `.text` sections across every row/column checked — the file-size
-   difference that prompted the theory is entirely debug-symbol-table
-   metadata, not executable code).
-4. If a lighter software mitigation is wanted before the real driver fix
-   lands: the Tenth experiment's patch is the one to build on — tag each
-   acquire/release `func.call` in `lockToStd` with a stable per-lock id
-   (the call's own value operand is useless for this, it's just the
-   acquire/release count, normally a constant `1` for every call), then in
-   `coreToStd` (after cloning into the `func.func`) group release calls by
-   that id and insert the `cf.br`/`cf.cond_br`-based busy-wait loop only
-   after each id's first occurrence. Fixed, batch-count-independent cost.
-   Not committed; reverted after verification each time it was tried this
-   session.
-5. Once §4a has a real (non-busy-wait) fix: decide whether to commit the
-   torch-mlir patch (§3/§4's `AtenBmmOp` quantization support) somewhere
-   durable (a fork? a local patch file applied post-checkout?) before it's
-   lost — it isn't sitting in this repo's own git history even as an
-   uncommitted diff, unlike everything else touched today.
-6. VGG16 Conv int8 (§2) remains a separate, larger piece of upstream-iree
-   work, deliberately parked in favor of BERT.
+## §12 — 2026-09-04, 같은 날 이어서: "애매한 toy 실험 말고 진짜 non-batch→batch 구조로 바로 테스트" — 사용자 요청으로 즉시 업그레이드, 역시 negative (더 강한 증거)
+
+**변경 사항**: §11의 TYPE B(toy, 단일 실행+extra scratch lock만 다름)를 버리고,
+진짜 **batched dispatch 구조**로 교체 — `tile(0,2)` 코어 내부에 진짜
+`scf.for` BATCH(=4) 루프를 넣고, 매 iteration마다 같은 락(0-3)을
+재사용(`gen_type_b_batched.py`). 이건 정확히 버그 #1의 메커니즘(락의 첫
+사용에서 pre-charge 레이스)이 다시 나타날 수 있는 구조이므로, 실제 프로덕션
+수정(commit `1600078`)과 동일하게 **rep==0의 release 직후에만 10,000회
+busy-wait**를 조건부로 삽입(`scf.if %is_first`)해서 버그 #1을 무력화 — 이후
+남는 손상이 있다면 그건 순수하게 "dispatch TYPE 전환(버그 #2)" 때문이라고
+귀속할 수 있게 설계.
+
+**중간에 발견한 진짜(도구) 버그, 실제 발견과 헷갈리지 않도록 기록**: 첫 컴파일
+결과 batch 0만 정상(8), batch 1-3은 전부 정확히 0으로 실패 — 처음엔 버그 #2와
+비슷한 패턴처럼 보였지만, `gen_debug_plain_repeat.py`(delay/scf.if 없는
+순수 반복만)로 최소화해도 **동일하게 재현**돼서, 이게 실제 HW 현상이 아니라
+**이 repro 자체의 작성 버그**임이 드러남: `aiex.npu.dma_memcpy_nd`의 4-튜플
+stride 배열에서 batch 선택 차원(`memref<4x64x64xi8>`의 dim1)의 stride를
+0으로 잘못 넣어서, 4번의 출력 전송이 전부 offset 0으로만 겹쳐 쓰임 (batch
+1-3 슬롯은 아예 한 번도 안 쓰여서 host 버퍼의 초기 0이 그대로 남은 것).
+stride를 4096(=64×64 원소)으로 고치자 즉시 4/4 PASS로 해결됨 — **이 리포에서
+"host-repeat으로 여러 번 같은 버퍼/락을 재사용하는 패턴"이 N>1로 실제 검증된
+건 이번이 처음**(`gen_degree2ch.py`도 문서상 `N=1`로만 실행됐었음, §5절 인용
+참고) — 이 부분 자체가 사전 검증 안 된 새 영역이었다는 뜻이므로, 앞으로 이
+패턴을 다시 쓸 때는 항상 toy add-10 같은 가장 단순한 형태로 먼저
+단독(비-alternation) 검증부터 할 것.
+
+**stride 수정 후 진짜 실험**: TYPE A(비-batched, 단일 실행, `out=in+10`)와
+TYPE B(진짜 batched, BATCH=4, delay-fix 내장, `out=in*3+5`)를 각각 별도
+xclbin/hw_context로 등록하고 `tile(0,2)` 하나를 공유하며 A→B→A→B... alternation:
+- TYPE B 단독 안정성 먼저 확인: 5회 연속 4/4 배치 전부 PASS.
+- **Alternation 10회(A 10 + B 10×4batch=40 checks): 전부 PASS.**
+- **Alternation 100회(A 100 + B 100×4batch=400 checks): 전부 PASS, 실패 0건.**
+
+**결론: 이번에도 negative, 그러나 이번엔 §11보다 훨씬 실제 구조에 가까운
+조건에서 나온 negative임.** "비배치 단일 실행 dispatch"와 "코어 내부에 진짜
+batch 루프 + 프로덕션 delay-fix가 들어간 batched dispatch"를 같은 물리
+타일에서 hw-context 스위치로 500회 넘게 검사했는데도 전혀 손상이 없었음.
+남은 구조적 차이는 이제 명확하게 좁혀짐: (1) 실제 배치가 core-internal
+`scf.for`가 아니라 shim DMA `repeat_count` 하드웨어 메커니즘으로 구현된다는
+점(§11에서 이미 지적, 이번에도 미반영 — core 루프 방식은 검증했지만
+repeat_count 방식은 아직임), (2) 컬럼/타일 스케일(8컬럼 vs 1컬럼), (3)
+`aiecc` control-code lowering이 IREE의 것과 다른 코드베이스라는 점.
+
+**How to apply**: "core-internal 루프 기반 batch면 재현 안 된다"는 것까지는
+이제 확인됨. 다음으로 저렴하고 유력한 실험은 여전히 (1)
+`aiex.npu.push_to_queue`의 `repeat_count` 필드를 실제로 써서 shim-DMA
+하드웨어 반복 방식으로 batch를 구현한 TYPE B'을 만들어 같은 alternation
+테스트를 반복하는 것 — 이게 실제 bert-base 스케일 dispatch가 쓰는 진짜
+메커니즘이므로 구조적 gap을 가장 크게 줄임.
+
+## §13 — 2026-09-04, 같은 날 이어서: 컬럼 수까지 실제와 동일하게(8컬럼) 맞춰서 재검증 — 여전히 negative
+
+**사용자 요청**: "1컬럼만 하지 말고 IREE와 완전히 동일한 조건으로" — 실제
+bert-base dispatch가 쓰는 `NumCols=8`(Twentieth 실험에서 확인)까지 스케일을
+맞춰서 재검증.
+
+**구현**: §12의 검증된 단일-타일 TYPE A(비배치)/TYPE B(배치, delay-fix
+내장) 설계를 `gen_8col.py`의 이미 검증된 컬럼 복제 패턴(컬럼마다 독립된
+shim/memtile/core 타일 3개, plain circuit flow, 컬럼별로 유일하지만 rep에는
+불변인 DMA id)을 따라 8개 컬럼(0-7)으로 그대로 복제(`gen_multicol.py`).
+출력 텐서는 §12에서 겪은 3D stride 버그를 피하려고 `gen_8col.py`와 동일한
+"평평한 2D 텐서 + 절대 row offset" 방식으로 주소 지정(컬럼/배치별로 독립된
+`dma_memcpy_nd` 호출, 각자 자기 블록의 절대 row에서 시작).
+
+**검증 순서**: 컴파일 클린(양쪽 다) → TYPE A 단독(8컬럼×1 block=8개 블록)
+PASS → TYPE B 단독(8컬럼×4배치=32개 블록) PASS, 3회 반복 안정성 확인 →
+**A↔B alternation 10회(A 80블록 + B 320블록) 전부 PASS** → **100회(A 800블록
++ B 3200블록) 전부 PASS, 실패 0건**.
+
+**결론: 8컬럼 스케일까지 맞춰도 여전히 완전히 negative.** 실제 BERT-base
+dispatch와 동일한 컬럼 수(8), 동일한 batch 크기(4), 실제 커밋된 delay-fix
+그대로 넣은 상태에서 비배치↔배치 dispatch를 hw-context 스위치로 4000회
+가까이(800+3200) 검사했는데도 손상이 전혀 없었음.
+
+**남은 구조적 차이는 이제 정말 하나로 좁혀짐**: core-internal `scf.for`
+루프가 아니라 **shim DMA의 `repeat_count` 하드웨어 필드**로 batch를
+구현하는 것 — 이것과 `aiecc`(mlir-aie) vs IREE의 서로 다른 control-code
+lowering 코드베이스라는 점만 남음. 컬럼 수는 더 이상 변수가 아님이 확인됨.
+
+**How to apply**: 다음 실험은 반드시 `repeat_count` 기반 batch 실현으로
+가야 함 — 컬럼 수를 더 올리거나 다른 변수를 바꾸는 건 더 이상 우선순위가
+아님. 재현 자료: `gen_multicol.py`, `diag_8col_single.cpp`,
+`diag_alternate_8col.cpp` (모두 `_local/mlir_aie_repro/
+2026-09-04_dispatch_type_alternation/`, gitignored).
+
+## §14 — 2026-09-04, 같은 날 이어서: 진짜 `repeat_count` 메커니즘 구현(1컬럼 + 8컬럼) — 역시 negative
+
+**정확한 문법 확보**: `~/NPU/mlir-aie/test/npu-xrt/nd_memcpy_linear_repeat/aie2.py`
+(mlir-aie 자체 공식 테스트)를 컴파일해서 실제 생성되는 raw MLIR을 직접
+확인. 핵심: `repeat_count`는 별도 필드가 아니라 `aiex.npu.dma_memcpy_nd`의
+**4-튜플 access pattern에서 가장 바깥쪽(leftmost) 차원의 size를
+repeat_count로, 그 차원의 stride를 0(같은 데이터 반복 전송, 예: weight)
+또는 실제 원소 단위 stride(반복마다 다른 위치, 예: 우리 output)로** 주는
+것 — **호출 1번**으로 하드웨어가 N번 자동 반복하고, **`dma_wait`도 1번만
+필요**함. 지금까지 만든 TYPE B(§12,§13)는 이 호출을 N번 따로따로 한
+것이었으므로, 이번엔 정확히 이 방식으로 다시 구현(`gen_type_b_repeatcount.py`,
+`gen_multicol.py`에 `MODE=repeat` 추가). 코어 쪽(scf.for 배치 루프 +
+rep==0 delay-fix)은 완전히 그대로 유지해서 이 차이 하나만 격리.
+
+**1컬럼**: 단독 검증(5회 연속 4/4 배치 PASS) → A(비배치)↔B(repeat_count
+배치) alternation 10회 PASS, **100회(400개 체크) 전부 PASS**.
+
+**8컬럼**: 단독 검증(32/32 블록 PASS, 3회 반복 안정) → alternation 10회
+PASS, **100회(A 800블록 + B 3200블록, 총 4000개 체크) 전부 PASS**.
+
+**결론: 이제 core-internal 루프 방식과 진짜 repeat_count 방식 둘 다,
+1컬럼과 8컬럼 스케일 모두에서 완전히 negative.** 지금까지 식별했던
+"실제 dispatch와 다른 점" 후보(배치 실현 메커니즘, 컬럼 수)를 전부
+하나씩 실제와 동일하게 맞춰봤지만 손상이 재현되지 않음.
+
+**남은 후보, 이번 라운드에서 새로 발견한 것 포함**:
+1. **컬럼 간 결합된 TCT sync (`col_num`)** — Twentieth 실험 원문을 다시
+   보면 실제 IREE 컨트롤 코드는 컬럼마다 독립적으로 `dma_wait`을 하는 게
+   아니라, **연속된 여러 컬럼의 push_to_queue를 하나의 `amdaie.npu.tct_sync`로
+   묶어서(`col_num=8`/`8`/`4`) 한 번에 기다림**. 이번 8컬럼 repro는 컬럼마다
+   **독립적으로** `dma_wait`을 8번 호출했음 — 이 "여러 컬럼을 묶어서 하나의
+   완료 신호로 기다리는" 구조 자체를 아직 재현 안 함. 이게 지금 특정할 수
+   있는 것 중 가장 구체적이고 실제와 다른 지점.
+2. `aiecc`(mlir-aie) vs IREE `AMDAIEControlCodeToTransaction.cpp`가 여전히
+   다른 코드베이스라는 점 자체(구조적으로 똑같이 만들어도 최종 CDO
+   바이너리가 byte-identical이라는 보장은 없음).
+3. 실제 bert-base는 단순히 "타입 A ↔ 타입 B" 2종류만 반복하는 게 아니라
+   한 레이어 안에서 Q/K/V/output/FFN(비배치) + QK^T/Attn@V(배치)가 뒤섞인
+   더 긴/다양한 dispatch 시퀀스임 — 2종류 alternation보다 훨씬 복잡한 순서.
+
+**How to apply**: 다음 가장 유력한 실험은 (1) — 여러 컬럼의 완료 대기를
+하나의 결합된 sync로 묶는 구조를 IRON에서 재현해보는 것. 이게 재현되면
+"컬럼을 묶어서 기다리는 로직 자체의 버그"라는 훨씬 구체적인 후보로
+좁혀짐. 재현 자료: `gen_type_b_repeatcount.py`, `gen_multicol.py`
+(`MODE=repeat` 인자 추가됨), `diag_alternate_repeatcount.cpp`,
+`diag_alternate_8col_rc.cpp` (모두 `_local/mlir_aie_repro/
+2026-09-04_dispatch_type_alternation/`, gitignored).
+
+## §15 — 2026-09-04, 같은 날 이어서: 문서 대신 실제 IREE를 다시 컴파일해서 직접 검증 → 결합 TCT sync까지 IRON으로 재현 — 역시 negative
+
+**사용자 요청**: "옛날 문서 보고 확인하지 말고 지금 직접 IREE로 다시 컴파일해서
+차이를 확인하자." 옳은 지적 — `docs/`의 Twentieth 실험 기록을 그대로
+믿는 대신, `_local/int8_debug/out/chainmix_L12_int8.mlir`(그때 그 파일,
+아직 디스크에 있음)을 **지금 이 순간** 다시 `build/tools/iree-compile`로
+컴파일하고 `--mlir-print-ir-after=iree-amdaie-controlcode-lowering`로
+control code를 직접 덤프해서 확인 (NPU 실행 아니고 컴파일만이라 락 불필요).
+
+**직접 확인/재확인한 사실**:
+- `amdaie.npu.tct_sync {channel=0,col=0,col_num=8,direction=0,...}`,
+  `{channel=0,col=0,col_num=8,direction=1,...}`,
+  `{channel=1,col=0,col_num=4,direction=1,...}` — 정확히 이 3개 조합이
+  **매 dispatch마다** 나타남 (grep으로 72개 tct_sync = dispatch당 3개 ×
+  24개 dispatch, L=12 chainmix와 일치).
+- **비배치(repeat_count=2) dispatch와 배치(repeat_count=12) dispatch 둘 다
+  동일한 col_num=8/8/4 패턴** — 옛 문서 주장 그대로 재확인됨(byte-identical).
+- 소스 추적: `AMDAIEControlCodeToTransaction.cpp`의 `appendTCTSync`가
+  `col`/`row`/`colNum`/`rowNum`/`direction`/`channel`을 그대로 raw
+  `XAIE_IO_CUSTOM_OP_TCT` 트랜잭션 워드에 패킹 — 이건 `aie-rt`/XAIE
+  드라이버가 실제로 지원하는 하드웨어 프리미티브(여러 컬럼을 한 번에
+  폴링)이지, IREE가 소프트웨어적으로 흉내낸 게 아님.
+- **결정적 발견**: `~/NPU/mlir-aie`(aiecc가 쓰는 그 저장소) 자체 소스
+  `lib/Dialect/AIEX/Transforms/AIEDmaToNpu.cpp`의 `DmaWaitToSyncPattern`을
+  직접 읽어보니, 지금까지 제 모든 repro가 써온 고수준 `aiex.npu.dma_wait`는
+  **`column_num`을 무조건 1로 하드코딩**해서 저수준 `aiex.npu.sync`로
+  변환함(주석 그대로: "Create with column_num == 1 and row_num == 1 to
+  check for a single column and row"). 즉 지금까지 쓴 API로는 애초에
+  멀티컬럼 결합 sync를 만들 수 없는 구조였음 — 컬럼 수를 8로 맞춰도 이
+  차이 자체는 여전히 재현이 안 되고 있었던 것.
+- 우회책 확인: `aiex.npu.sync`는 mlir-aie 자체 raw MLIR에서 직접 쓸 수
+  있는 저수준 op이고(`test/npu-xrt/tile_dmas/writebd_tokens/aie.mlir`에
+  실제 사용례 존재), `column`/`column_num`/`row`/`row_num`/`channel`/`direction`을
+  전부 노출함 — `dma_wait`를 우회해서 이걸 직접 쓰면 IREE와 동일한
+  구조를 만들 수 있음.
+
+**구현**: `gen_multicol.py`에 `WAITMODE` 인자 추가(`percolumn`=기존,
+`combined`=8개 컬럼 각각의 `dma_wait` 대신 **`aiex.npu.sync {channel=1,
+column=0, column_num=8, direction=0(S2MM), row=0, row_num=1}` 딱 1개**로
+교체). §14의 repeat_count 기반 TYPE B와 결합해서 지금까지 나온 것 중
+IREE의 실제 control code 구조에 가장 가까운 버전을 만듦.
+
+**검증**: TYPE A(combined-wait) 단독 PASS(8/8) → TYPE B(repeat_count +
+combined-wait) 단독 PASS(32/32), 3회 반복 안정 → **A↔B alternation 10회
+PASS(80+320) → 100회 PASS(800+3200), 실패 0건.**
+
+**결론: 지금까지 특정 가능했던 실제 IREE 구조(비배치↔배치, 8컬럼,
+repeat_count 기반 batch, 컬럼 결합 TCT sync)를 전부 하나로 합쳐도
+여전히 완전히 negative.** 이 시점에서 IRON으로 소스 레벨에서 재현 가능한
+구조적 차이는 사실상 소진됨.
+
+**남은, 아직 손 안 댄 부분(솔직한 gap)**:
+1. 이번에 재현한 건 3개의 tct_sync 중 **출력 쪽 1개(channel=1, col_num=4
+   조합)뿐** — 실제로는 입력 쪽 두 그룹(channel=0, direction=0/1,
+   col_num=8)도 있고, 이건 아직 안 만듦. 완전히 동일한 3-sync 세트를
+   전부 재현하진 않음.
+2. `aiecc`(mlir-aie)와 IREE의 `AMDAIEControlCodeToTransaction.cpp`가
+   여전히 물리적으로 다른 코드베이스 — 구조적으로 동일해 보여도 최종
+   CDO 바이너리가 완전히 같다는 보장은 없음(직접 바이트 비교는 안 함).
+3. 실제 bert-base는 2종류 dispatch가 아니라 한 레이어 안에 여러
+   dispatch(Q/K/V/output/FFN + QK^T/Attn@V)가 뒤섞인 훨씬 긴 실제
+   시퀀스 — 제 테스트는 항상 정확히 2개 타입만 반복.
+
+**How to apply**: 여기서부터는 "한 가지 메커니즘을 더 추가하면 재현될
+것"이라는 가설보다, (a) 3-sync 세트를 완전히 재현하거나 (b) 실제 12-layer
+전체 dispatch 시퀀스를 그대로 IRON으로 옮기는 등 훨씬 큰 재현 비용이
+드는 방향으로 가거나, (c) 이 지점에서 소스/구조 비교는 사실상 소진됐다고
+보고 실제 HW 트레이스 도구로 전환하는 결정이 필요함 — 사용자와 상의
+필요. 재현 자료: `gen_multicol.py`(`WAITMODE=combined` 추가됨),
+`diag_alternate_8col_combined.cpp` (모두 `_local/mlir_aie_repro/
+2026-09-04_dispatch_type_alternation/`, gitignored).
+
+## §16 — 2026-09-04, 같은 날 이어서: 실제 chainmix_L12를 지금 다시 실행해서 버그 생존 확인 + hw_context 생성 방식 자체를 소스로 재확인 — 역시 negative
+
+**1) 진짜 아티팩트로 버그가 아직 살아있는지부터 확인 (사용자 요청).** 8/24에
+컴파일된 `_local/int8_debug/out/chainmix_L12_int8.vmfb`를 지금 15번 실행
+(`iree-run-module`, NPU 락으로 감쌈). **결과: 완전히 재현됨** — 15번 중
+12번은 비트 단위로 완전히 동일한 값(corr=0.97074), 나머지 3번(run1, 10,
+11)은 각각 다른 값(corr=0.96522/0.97103/0.97056). 이산적(discrete) 패턴
+그대로, 노이즈 아님. 딜레이 fix가 이미 적용된 상태에서도 여전히 남아있는
+바로 그 두 번째 버그가 오늘도 살아있음을 확인.
+
+**2) 사용자 지적: "그건 IRON에서 해보라는 거였다" — 맞는 지적, 처음엔
+잘못 이해함.** 실제 요청은 "실제 12-layer 전체 dispatch 시퀀스를 IRON으로
+옮겨서 테스트"였음. 이 방향으로 가기 전에, `iree-dump-module`로 실제
+vmfb 구조를 먼저 까봄: **24개 dispatch가 24개의 개별 xclbin이 아니라
+`hal.executable.create` 호출 1~2번뿐인 "linked" 실행파일**
+(`chainmix_L12_int8_linked_amd_aie`)로 묶여있음 — 지금까지 만든 "TYPE A용
+hw_context, TYPE B용 hw_context를 각각 별도로 만들어 전환"하는 제 모델과
+다른 것 아니냐는 우려가 생김.
+
+**3) 스키마/런타임 소스를 직접 읽어서 확인 — 실제로는 제 모델이 맞았고,
+다른 부분에서 진짜 차이를 발견함.** `runtime/src/iree-amd-aie/schemas/
+pdi_executable_def.fbs`의 주석: "`pdi_indices`는 현재 그냥 (0, entry point
+개수] 범위다 — 나중에 kernel merging을 하면 바뀔 것" → **지금 이
+코드베이스에서는 dispatch(entry point)마다 각자 별도 PDI를 가짐**(아직
+병합 안 됨), 제 모델의 기본 전제(타입마다 별도 PDI)는 맞았음. 그런데
+`runtime/src/iree-amd-aie/driver/amdxdna/direct_command_buffer.cc:977`를
+읽어보니, "reconfiguration"(하나의 context를 재사용하며 가볍게 재구성)
+경로는 `AIETarget.cpp`의 `options.enableCtrlPkt` 플래그가 켜져 있을 때만
+작동함 — **이번 조사 전체에서 쓴 표준 컴파일 플래그 레시피는 이 플래그를
+한 번도 켠 적이 없음** → 즉 `num_reconfigurations == 0` 경로만 항상 탐,
+이 경로는:
+```cpp
+iree_hal_amdxdna_native_device_create_context(...)  // 캐싱/재사용 없이 매번 새로
+```
+**dispatch 타입에 상관없이, 심지어 같은 타입을 반복 호출해도 매번 완전히
+새로운 context를 생성**함이 소스에서 직접 확인됨.
+
+**진짜 차이 발견**: 지금까지 만든 모든 alternation 테스트(§11-15)는
+`ctxA`/`ctxB`를 **딱 한 번씩만 생성**하고 계속 재사용했음 — 실제로는
+매 dispatch 호출마다 매번 새로 만들어야 정확히 맞음.
+
+**수정 후 재검증**: `diag_alternate_8col_freshctx.cpp` — 매 dispatch
+호출 직전에 `xrt::hw_context`를 새로 생성(같은 xclbin UUID로, BO는
+재사용 유지, 실제로도 버퍼는 dispatch 간 유지되고 context만 재생성되는
+것과 일치). §15의 8컬럼+repeat_count+combined-wait 버전에 이 수정을
+적용해서 재실행: **10회, 100회(800+3200개 체크) 전부 PASS, 실패 0건.**
+
+**결론: hw_context를 매번 새로 만드는 정확한 실제 패턴으로 고쳐도
+여전히 완전히 negative.** 지금까지 소스에서 확인 가능한 모든 구조적
+차이(비배치↔배치, 8컬럼, repeat_count, 결합 TCT sync, 매번-새-context)를
+전부 하나로 합쳐도 재현이 안 됨 — 이 시점에서 소스 레벨 재현 시도는
+사실상 소진됐다고 보는 게 맞음.
+
+**남은 후보 (전부 훨씬 비용이 큰 것들)**:
+1. 3개 tct_sync 세트 중 1개만 재현(입력 쪽 두 그룹 미반영)
+2. 실제 24-dispatch 전체를 정확한 순서/구성으로 복제(2종류 단순 alternation이 아니라)
+3. PDI 크기/내용 자체가 훨씬 큼(실제 matmul vs 제 toy add/mul) — 로딩
+   시간이나 타이밍에 의존하는 레이스라면 이 스케일 차이가 결정적일 수 있음
+4. `aiecc`와 IREE가 물리적으로 다른 코드베이스라는 근본적 한계
+
+**How to apply**: 다음 유력 후보는 실제 matmul 스케일(K=768 등 실제 크기)의
+core 프로그램으로 교체해서 PDI 로딩 시간을 실제와 비슷하게 맞춰보는 것 —
+지금까지 전부 매우 작은 toy 프로그램이라 PDI 로드 자체가 순식간에 끝나서,
+혹시 존재할 "PDI 로드 시간이 길어야 드러나는 레이스"를 놓치고 있을 가능성.
+재현 자료: `diag_alternate_8col_freshctx.cpp` (`_local/mlir_aie_repro/
+2026-09-04_dispatch_type_alternation/`, gitignored).
+
+## §17 — 2026-09-04, 같은 날 이어서: 실제 matmul 스케일(K=768, 진짜 리덕션)로 키워서 재검증 — 역시 negative, 새로운 미검증 변수 하나 발견
+
+**사용자 요청**: "실제 matmul 스케일로 키워봐, batch-0 문제도 그랬는데
+레이스 컨디션일 확률이 높을 것 같다."
+
+**구현**: toy add/mul을 진짜 int8 리덕션 matmul로 교체 — K=768(BERT
+hidden dim과 동일)을 12×64로 K-타일링(64x64 블록 버퍼 크기는 그대로
+유지해서 AIE2P 코어 로컬 메모리 한도(~64KB)를 넘지 않게 함 — 64x768
+버퍼를 그대로 쓰면 X만으로 48KB라 코어 메모리 예산을 넘어감). 가중치는
+`initial_value = dense<1>`로 코어에 상주하는 상수 버퍼(실제 weight가
+dispatch 간 안 바뀌는 것과 유사). 누산기(i32)는 12개 K-타일에 걸쳐
+지속되며, 최종 결과는 (X=Y=1 상수 입력이라) `K=768=3×256`이라 truncate하면
+정확히 0이 되는 계산상 우연이 있어서, 기존 진단 드라이버가 그대로 쓰던
+기대값(TYPE A=11, TYPE B=8)에 정확히 맞도록 epilogue bias를 조정 —
+기존 모든 diag 드라이버를 그대로 재사용 가능.
+
+**결과**: xclbin 크기가 확 커짐(toy 20KB → matmul768 54-56KB, PDI/프로그램
+크기가 실제로 커졌다는 직접 증거). TYPE A/B 단독 검증 PASS, TYPE B 3회
+반복 안정 확인. **8컬럼 + repeat_count + combined-wait + fresh-hw_context(모든
+검증된 요소 결합) + 실제 matmul768 스케일로 alternation 10회, 100회
+(800+3200개 체크) 전부 PASS, 실패 0건.**
+
+**결론: 실행 시간/PDI 크기를 실제 규모로 키워도 여전히 완전히 negative.**
+지금까지 소스에서 확인 가능한 구조적 차이는 사실상 전부 닫혔음에도
+재현이 안 됨.
+
+**이번에 새로 떠오른, 아직 전혀 안 건드린 변수 하나**: 지금까지 만든
+모든 core 컴퓨트(toy든 matmul768이든)는 전부 **스칼라 연산**
+(`arith.muli`/`arith.addi`)이었고, **한 번도 실제 AIE 벡터 명령어
+(`aievec.matmul` 등 vectorized codegen)를 쓴 적이 없음**. 원래 첫 번째
+버그(batch-0 lock pre-charge)는 **정확히 vectorized 코드에서만** 나타났고
+scalar는 멀쩡했다는 게 최초 조사에서 이미 확인된 사실(2026-08-24 세션).
+두 번째 버그(이번에 계속 재현 시도 중인 것)가 만약 첫 번째와 비슷하게
+**vectorized codegen 경로에만 국한된 현상**이라면, 지금까지의 모든
+scalar 기반 IRON repro는 애초에 구조적으로 재현이 **불가능**했을 수
+있음 — 다른 조건을 아무리 실제와 똑같이 맞춰도 이 축 하나가 다르면
+원천적으로 못 잡아냄.
+
+**How to apply**: 다음 실험은 scalar 대신 실제 `aievec.matmul` 벡터
+인트린식을 쓰는 코어 프로그램으로 바꿔서(기존 `gen_bmm_pure_smallN.py`류
+스크립트가 이미 손으로 짠 vectorized int8 matmul 패턴을 갖고 있으므로
+그 패턴을 이 alternation 테스트에 이식) 같은 alternation 테스트를
+재시도하는 것이 가장 유력한 다음 단계. 재현 자료:
+`gen_multicol.py`(`SCALE=matmul768` 추가됨),
+`diag_alternate_8col_freshctx_matmul.cpp` (모두 `_local/mlir_aie_repro/
+2026-09-04_dispatch_type_alternation/`, gitignored).
+
+## §18 — 2026-09-04, 같은 날 이어서: 실제 벡터화(aievec.matmul) 시도 — `aiecc` 툴체인 자체의 한계로 막힘, int8은 불가능·bf16도 실패
+
+**사용자 요청**: scalar 대신 실제 벡터 명령어로 시도. "애초에 지금 버그가
+양자화 + NPU 구조에서 나온 거라" — vectorization 경로 자체를 의심.
+
+**정확한 op 확보**: 실제 IREE가 컴파일한 int8 vectorized matmul
+(`mm_int8.mlir`, §1의 그 파일)을 지금 다시 `--mlir-print-ir-after-all`로
+컴파일해서 `LowerVectorToAIEVec` 패스 직후 IR을 직접 확인 —
+`aievec.matmul %10, %11, %12 : vector<8x8xi8>, vector<8x8xi8> into
+vector<8x8xi32>` 확인. 그런데 `aiecc`(mlir-aie 독립 툴체인)의 aievec
+dialect `.td` 정의를 보니 이 8x8x8-int8 조합은 `aievec.matmul`(AIE2
+전용)이 아니라 `aievec.matmul_aie2p`(AIE2P/npu4용, 우리 타겟)에서만
+지원됨 — IREE는 자체 vendored/fork된 aievec dialect 사본을 쓰기 때문에
+op 이름이 겹쳐도 실제 구현은 다를 수 있음.
+
+**4가지 서로 다른 구조로 시도, 전부 동일한 지점에서 크래시**:
+1. `vector<8x8xi8>` 2D strided 읽기 → `aie-opt` 단계에서
+   `vector.extract_strided_slice`가 "explicitly marked illegal"로 거부
+2. 전체 버퍼를 하나의 큰 벡터로 읽고 레지스터 내에서 슬라이스 추출 →
+   같은 거부
+3. 4D 타일 레이아웃(`memref<8x8x8x8xi8>`) + `subview`+`collapse_shape`로
+   진짜 contiguous하게 만들어서 시도 → `aie-opt`는 통과하지만 `llc`에서
+   크래시
+4. 완전히 flat한 `memref<64xi8>` 선언(실제 IREE 덤프와 거의 동일한
+   패턴, `vector.shape_cast`로 8x8 reinterpret) → 역시 동일하게 `llc`
+   크래시
+
+**4번 모두 정확히 동일한 crash**: `LLVM ERROR: unable to legalize
+instruction: %925:_(<64 x s8>) = G_CONCAT_VECTORS %25:_(<8 x s8>),
+%924:_(<8 x s8>) × 7...` — 소스 구조를 아무리 바꿔도 바이트 단위로
+동일한 실패 지점. 추가로 mlir-aie 자체의 `test/Conversion/AIEVecToLLVM/
+matmul-aie2p.mlir`(이 op의 lowering을 검증하는 공식 테스트)를 확인해보니
+**bf16 조합에 대한 테스트는 여러 개 있는데 int8×int8→int32(8x8x8) 조합에
+대한 테스트가 단 하나도 없음** — `.td`에는 "valid" 타입 조합으로 선언은
+돼 있지만 실제 lowering 패턴이 구현/테스트 안 된 상태로 보임.
+
+**결론: 이건 제가 짠 MLIR 문제가 아니라 `aiecc`(mlir-aie 업스트림)
+툴체인 자체가 int8 8x8x8 `matmul_aie2p`의 코드 생성을 완전히 지원하지
+않는 것으로 보임.** IREE는 자체 vendored aievec dialect 사본을 쓰기
+때문에 이 gap을 우회/수정한 상태이고, 업스트림 mlir-aie(아이콘 이 세션
+전체에서 IRON 작업에 쓴 그 툴체인)에는 이 수정이 없음.
+
+**bf16으로도 재시도 — 다른 지점에서 역시 크래시.** 사용자가 "int8이
+막혔으면 bf16으로 vectorization 경로 자체가 문제인지만 확인해보자"고
+방향 조정. `matmul_aie2p_8x8x8`(bf16×bf16→f32, AIEVecToLLVM 테스트에
+실제 존재하는 검증된 조합)로 시도 — `aie-opt` 단계는 통과했지만 `llc`에서
+**다른** 크래시: `unable to legalize instruction: %59:_(<64 x s32>) =
+G_INSERT_VECTOR_ELT ...` (int8 때와는 다른 명령어, f32 결과를 다시
+i8로 requantize하는 후처리 부분에서 발생 — bf16 matmul 자체보다는
+epilogue 변환 쪽 문제일 가능성).
+
+**현재 상태: `aiecc` 기반 IRON으로는 int8 vectorized matmul 재현이
+사실상 불가능하다고 결론. bf16도 다른 지점에서 막혀 미해결.** "벡터화
+경로 자체가 두 번째 버그의 필요조건인가"라는 질문은 **negative가 아니라
+inconclusive**로 남음 — scalar로는 계속 재현 안 됐지만, 벡터화를 아예
+테스트할 수 없었기 때문에 이 축은 아직 열려있음.
+
+**How to apply**: 이 방향을 계속 파려면 (a) `aiecc` 대신 IREE 자체
+컴파일러(`iree-compile`+AMD-AIE 백엔드)에 손으로 짠 저수준 MLIR을 직접
+태워서(ONNX/양자화 프론트엔드는 생략) IREE의 실제로 작동하는 aievec
+lowering을 활용하는 방법을 찾아야 함 — 진입점을 새로 찾아야 해서 품이
+더 듦. (b) 또는 bf16 epilogue 크래시를 마저 디버깅해서 최소한 "벡터화
+경로 자체"(dtype 무관)가 원인인지만이라도 확인. (c) 또는 여기서 벡터화
+축은 미해결로 남기고 scalar 기반의 종합적 negative 결과(§11-17)를
+최종으로 삼아 다른 방향(3-sync 완전 재현, 전체 dispatch 체인, HW 트레이스
+도구)으로 전환. 재현 자료: `/tmp/vecmatmul_probe/probe*.mlir` (세션
+스크래치, 저장소 밖).
+
+## §19 — 2026-09-04, 같은 날 이어서: 기존 IREE 컴파일 int8 vectorized matmul 아티팩트 재활용 + chainmix 임계값 재측정 — L=6→10으로 상승 확인
+
+**사용자 질문**: "matmul 양자화로 돌린 iron 예제 없어?" — 정곡을 찌른 질문.
+확인해보니 `aiecc`로 손으로 짠 게 아니라, **원래 버그#1 조사(8/24) 때
+IREE로 컴파일해서 실제 하드웨어에서 검증까지 끝난 진짜 vectorized int8
+matmul**이 이미 있었음: `mm_int8.vmfb`(비배치, 기존 파일 재사용),
+`bmm_int8.vmfb`(배치, 소스 `gen_and_quant_bmm.py`가 남아있어서 재컴파일,
+exit=0 — 이 빌드에 torch-mlir bmm int8 패치가 이미 반영돼 있음을 재확인).
+둘 다 개별 실행 정상(bmm corr=0.9998). `iree-run-module`로 직접 15회씩
+번갈아 실행(별도 프로세스) → 완전히 결정론적 — 다만 이건 L=1급 스케일 +
+프로세스 매번 새로 뜨는 약한 테스트라 당연한 negative, 정보량 낮음.
+
+**사용자 질문 2: "L=12 corr가 거의 100%인데 예전엔 70%대였다, 안 고쳐도
+되는 거 아니냐?"** — 원소 단위로 직접 세어봄: run1은 corr=0.965였지만
+실제로는 **24576개 중 2728개(11.10%)가 다르고 최대 절대 차이 0.28**
+(출력값 자체가 보통 0.01~0.15 스케일임을 감안하면 결코 작지 않음).
+Pearson correlation은 "일부 원소가 상당히 다르지만 나머지 대부분이
+일치"하는 상황에 안 민감해서 착시를 일으킴 — corr 숫자만 보고 "거의
+정상"이라고 판단하면 안 됨. 왜 예전 0.70-0.90과 다른지는 이 조사 자체가
+이미 기록한 "레이스 발생 빈도/심각도가 시간에 따라 통제 안 되는 요인으로
+흔들린다"(Seventeenth 실험)로 설명 가능 — 버그가 약해진 게 아니라 이번
+샘플이 우연히 덜 심각했을 뿐일 가능성이 높음.
+
+**L을 낮춰서 더 저렴한 재현 크기 재탐색 (사용자 요청)**: `gen_chained_mixed.py`로
+L=6,8,10을 새로 생성/임포트(컨테이너 안, ONNX/양자화)+컴파일(호스트,
+`iree-compile`, 동일 플래그)해서 각각 20회씩 재실행:
+- **L=6: 45/45 완전히 결정론적** (기존 문서는 "L=6에서 이산적 두 값 분리"라고 기록돼 있었음 — 재현 안 됨)
+- **L=8: 20/20 완전히 결정론적** (기존 문서는 "L=8도 이산적 분리"라고 기록 — 재현 안 됨)
+- **L=10: 재현됨 — 20회 중 15/5로 갈림**, 다른 그룹은 578/24576(2.35%) 원소가 다르고 maxdiff=0.029
+
+**결론: 버그 자체는 여전히 살아있지만(L=12 today도 재현, L=10도 재현),
+재현에 필요한 최소 L(임계값)이 원래 문서화된 6에서 10으로 올라간 것으로
+보임.** 가장 유력한 설명: 8/24 이후 이 컴파일러에 여러 커밋(row-overflow
+수정, batch matmul padding 수정, accumulator rescale 수정, batch-0
+lock-precharge delay-fix 등)이 반영되면서, 소스 MLIR은 동일해도 실제
+생성되는 control-code/타이밍 특성이 달라져 정확한 트리거 조건이 이동한
+것으로 추정(직접 diff는 안 함). 버그 원인은 바뀌지 않았을 가능성이
+높지만, 최소 재현 크기가 바뀌었으므로 앞으로는 **L=10을 최소 재현
+기준으로 사용**.
+
+**How to apply**: 앞으로 이 버그를 대상으로 한 저비용 반복 실험은
+L=6이 아니라 **L=10**(컴파일 ~32초, 20회 중 25% 발생률 확인)을 기준으로
+삼을 것 — L=6/8을 재현 안 된다고 폐기하지 말고, 임계값이 이동했다는
+사실 자체를 기억할 것. 재현 자료(모두 gitignored):
+`_local/int8_debug/out/chainmix_L{6,8,10}_int8.{onnx,mlir,vmfb}`,
+`_local/int8_debug/vecalt_test/`(mm_int8/bmm_int8 alternation 테스트).
+
+## §20 — 2026-09-04, 같은 날 이어서: chainmix를 더 저렴하게 축소 시도 — D(hidden dim)를 줄이면 L=12에서도 재현 안 됨, 크기 자체가 필요조건
+
+**시도**: `gen_chained_mixed_mini.py` 작성 — chainmix와 완전히 동일한
+구조(비배치 MatMul → Reshape/Transpose → 배치 MatMul → Transpose/Reshape,
+L번 반복)를 유지하되 D(hidden dim)/HEADS를 파라미터화해서 실제
+BERT-base 크기(D=768, HEADS=12)보다 훨씬 작게 줄여 컴파일/반복 비용을
+낮추려 시도.
+
+**D=64, HEADS=2, L=12**: 컴파일 정상(34초, chainmix와 비슷 — 즉 크기를
+줄여도 컴파일 시간 자체는 별로 안 줄어듦, per-dispatch AIE/Peano
+컴파일 오버헤드가 지배적). `--mlir-print-ir-after-all`로 확인해보니
+**vectorization은 여전히 켜져 있음**(aievec.matmul 576회 등장, 최초
+`num_cols=8` grep이 잘못된 pass를 봐서 0으로 나왔던 건 착오였고 재확인
+결과 벡터화는 문제 없이 적용됨). 그런데 **20회 실행 전부 완전히
+결정론적 — 재현 안 됨.**
+
+**D=384, HEADS=6(원래의 절반), L=12**: 마찬가지로 **20회 전부
+결정론적 — 재현 안 됨.**
+
+**결론: 벡터화가 켜져 있어도, dispatch 반복 횟수(L=12)가 원래
+재현되던 값과 같아도, D/HEADS를 줄이면(768→384, 심지어 768→64)
+재현이 안 됨.** 즉 "타입 alternation 횟수"나 "벡터화 여부"만으로는
+설명이 안 되고, **실제 텐서 크기(정확히는 이게 몇 개의 물리적 AIE
+컬럼에 걸쳐 타일링되는지)가 함께 필요조건**인 것으로 보임 — D=768은
+여러 컬럼에 걸쳐 타일링되지만 D=384/D=64는 훨씬 적은 컬럼만 쓸 가능성이
+높음(직접 컬럼 배치까지 diff하진 않음). 즉 버그는 "충분한 횟수 ×
+충분한 컬럼 스프레드"의 곱 같은 조건일 가능성이 있음 — 어느 한쪽만
+줄여도 재현이 사라짐.
+
+**실용적 함의: 이 버그는 D=768(또는 그에 가까운 크기) 없이는 값싸게
+축소 재현하기 어려움** — 지금까지 시도한 축소는 전부 실패. 저비용
+반복 실험이라는 원래 목표는 L 방향으로만 가능(L=10이 현재 최소
+확인값), D/HEADS 방향으로는 축소가 안 먹힘.
+
+**How to apply**: 크기를 더 줄이는 시도(D=128, D=256 등 중간값)는
+추가로 해볼 수 있으나, 이미 절반(D=384)에서도 실패한 걸 보면 급격한
+비선형 임계치일 가능성이 높음 — 무작정 더 줄이기보다는 실제 컴파일된
+IR에서 D=768 vs D=384/64의 **타일/컬럼 배치가 정말 다른지 직접
+diff**하는 게 다음으로 저렴하고 확실한 검증. 재현 자료(gitignored):
+`_local/int8_debug/gen_chained_mixed_mini.py`,
+`_local/int8_debug/out/minichain_L12_D{64,384}_H{2,6}_int8.{onnx,mlir,vmfb}`.
+
+## §21 — 2026-09-04, 같은 날 이어서: 타일/컬럼 배치 직접 diff — 컬럼 개수 가설 반증, "dispatch당 전송량"이 진짜 변수로 확정
+
+**사용자 요청**: "타일/컬럼 배치부터 diff해보자." `--mlir-print-ir-after-all`로
+D=768(chainmix_L12, 기존 덤프)과 D=64/384(minichain, 새로 덤프)를 직접
+비교.
+
+**1) `col_num`(몇 개 컬럼에 걸쳐 완료를 기다리는지) 비교 — 완전히
+동일함, 반증됨.** D=768과 D=64 양쪽 다 `tct_sync`가 정확히
+`col_num=8/8/4`로 byte-identical. **즉 컬럼 스프레드는 D 크기와 무관하게
+항상 고정(8개)** — "작은 크기는 컬럼을 덜 써서 안전하다"는 가설은
+틀림.
+
+**2) `push_to_queue`의 `repeat_count`(배치 실현 메커니즘) 비교 —
+D=64,HEADS=2는 배치 개수(2)가 너무 작아서 `repeat_count` 메커니즘을
+아예 안 쓰고 전부 `repeat_count=1`(완전 unroll)로 컴파일됨. 이건
+원본(D=768,HEADS=12, `repeat_count=12`)과 근본적으로 다른 배치
+구현이라 순수 크기 비교가 아니었음 — 교란 변수 발견.** D=384,HEADS=6은
+`repeat_count=6`을 정상적으로 사용(원본과 동일 메커니즘 유지) — 이
+경우가 진짜 깨끗한 비교 대상.
+
+**3) `write_bd`의 `buffer_length`(실제 DMA 전송 바이트 수) 비교 —
+D에 명확히 비례해서 스케일링됨.**
+
+| | 최대 buffer_length | 배치 메커니즘 | 재현 여부 |
+|---|---|---|---|
+| D=768, HEADS=12 | **18432 bytes** | repeat_count=12 | 재현됨 |
+| D=384, HEADS=6 | 4608 bytes (정확히 1/4) | repeat_count=6(동일 메커니즘) | 재현 안 됨 |
+| D=64, HEADS=2 | 512 bytes | repeat_count=1(다른 메커니즘) | 재현 안 됨 |
+
+D=384 케이스는 배치 메커니즘까지 원본과 동일하게 유지한 가장 깨끗한
+비교인데도 재현이 안 됨 — "메커니즘이 달라서"라는 반론도 배제됨.
+
+**결론: 컬럼 개수 가설은 명확히 반증. "dispatch당 실제 DMA 전송
+데이터량(D에 비례)"이 진짜 필요조건으로 확정.** 이 버그는:
+1. **충분한 반복 횟수(L)** — L=10 이상 (D=768 고정 상태에서 확인, §19)
+2. **충분한 dispatch당 전송량(D)** — D=768 필요, 절반(D=384)만 돼도
+   사라짐 (L=12 고정 상태에서 확인, 이번 §21)
+
+**두 개의 독립된 임계값을 동시에 넘어야 재현되는 구조**로 최종 정리됨.
+이는 "호스트 딜레이를 아무리 넣어도 안 고쳐졌다"(Seventeenth/Eighteenth
+실험)는 기존 사실과도 정합적 — 문제는 "경과 시간"이 아니라 "그
+dispatch 자체가 실제로 하드웨어를 점유하는 시간/데이터량"이라는 뜻.
+
+**How to apply**: 앞으로 이 방향(코드 레벨, 드라이버 비접근 원칙)에서
+다음으로 저렴한 검증은 D를 중간값(예: 512, 640)으로 스캔해서 정확한
+D 임계값을 찾는 것. 다만 D=384(절반)에서도 이미 실패한 걸 보면 임계값이
+768에 상당히 가까울 가능성이 있어 큰 폭의 축소는 어려울 수 있음 — 저비용
+반복 실험은 계속 L 축(L=10)이 중심이 되어야 함. 재현 자료(gitignored):
+`/tmp/minichain_d384_full.err.log`, `/tmp/minichain_full.err.log`
+(세션 스크래치, `--mlir-print-ir-after-all` 전체 덤프, 용량 커서
+저장소엔 안 남김).
