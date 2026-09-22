@@ -391,6 +391,9 @@ std::unique_ptr<Pass> createAMDAIEIntegerRequantizationPass();
 /// `iree_linalg_ext.custom_op` tiling root.
 std::unique_ptr<Pass> createAMDAIERaiseLayerNormPass();
 
+/// Create a pass to replace transcendental math ops with polynomial
+/// approximations a core can actually execute.
+std::unique_ptr<Pass> createAMDAIEApproximateMathFunctionsPass();
 
 std::unique_ptr<Pass> createAMDAIEExpandRoundEvenPass();
 

@@ -735,6 +735,13 @@ void buildAMDAIETransformPassPipeline(
     FunctionLikeNest funcPassManager(modulePassManager);
     funcPassManager.addPass(createTypePropagationPass)
         .addPass(createBubbleUpOrdinalOpsPass)
+        // Replace the math dialect's transcendental functions with polynomial
+        // approximations. A core has no libm to fall back on, so an op left
+        // standing here simply has no lowering: GELU's `math.erf` reaches
+        // translation and fails with "missing LLVMTranslationDialectInterface
+        // registration". Run it before tiling so the approximation is tiled and
+        // vectorized along with the op that consumes it.
+        .addPass(createAMDAIEApproximateMathFunctionsPass)
         .addPass(createBufferizeCopyOnlyDispatchesPass);
   }
   modulePassManager.addPass(createMaterializeUserConfigsPass());

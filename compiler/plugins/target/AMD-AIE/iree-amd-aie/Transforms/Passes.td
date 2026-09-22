@@ -643,6 +643,20 @@ def AMDAIERaiseLayerNorm :
     }];
 }
 
+def AMDAIEApproximateMathFunctions :
+    Pass<"iree-amdaie-approximate-math-functions", ""> {
+    let summary = "Replace transcendental math ops with polynomial approximations.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEApproximateMathFunctionsPass()";
+    let description = [{
+      A core has no libm, so a `math` op that survives codegen has no lowering
+      at all -- GELU's `math.erf` fails LLVM translation outright. Upstream's
+      `iree-codegen-math-transform` fixes that for every other backend, but it
+      also expands `math.roundeven`, whose expansion goes through `copysign`,
+      which peano's aie2p backend cannot legalize and which
+      `iree-amdaie-expand-roundeven` already handles a different way. So apply
+      only the polynomial approximations here, and leave the rewrite set alone.
+    }];
+}
 
 def AMDAIEExpandRoundEven :
     Pass<"iree-amdaie-expand-roundeven", ""> {
