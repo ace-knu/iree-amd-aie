@@ -5,12 +5,16 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIELayerNormUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIESoftmaxUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/Support/Path.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -27,7 +31,8 @@ class AMDAIELowerToUKernelsPass
   AMDAIELowerToUKernelsPass(const AMDAIELowerToUKernelsPass &pass) {}
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Codegen::IREECodegenDialect>();
+    registry.insert<IREE::Codegen::IREECodegenDialect,
+                    bufferization::BufferizationDialect, memref::MemRefDialect>();
   }
   void runOnOperation() override;
 };
@@ -318,6 +323,136 @@ matchQuantizedSoftmaxDAGForUKernel(RewriterBase &rewriter, Operation *op,
       genericMicroKernelOp.getOperation());
 }
 
+/// Place `data` in the core's own memory and return it as a tensor.
+///
+/// The bytes become a `memref.global` in the dispatch's module, which the
+/// per-core linker script lays out in the free part of the core's local memory
+/// (after the stack and the assigned tile buffers), so reading it needs no DMA
+/// channel and no transfer. Identical constants share one global.
+static FailureOr<Value> materializeCoreLocalConstant(RewriterBase &rewriter,
+                                                     Operation *op,
+                                                     DenseElementsAttr data) {
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  if (!moduleOp) return failure();
+  auto tensorType = dyn_cast<RankedTensorType>(data.getType());
+  if (!tensorType || !tensorType.hasStaticShape()) return failure();
+  // No memory space: the core's data memory is the only memory its own program
+  // can name, so the address space attribute would carry no information, and
+  // `aie.device`'s address-space normalization rewrites `memref.get_global`
+  // results without rewriting the `memref.global` they refer to.
+  auto memrefType =
+      MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+
+  memref::GlobalOp global;
+  unsigned index = 0;
+  for (auto candidate : moduleOp.getOps<memref::GlobalOp>()) {
+    if (!candidate.getSymName().starts_with("__amdaie_core_constant_")) continue;
+    ++index;
+    if (candidate.getType() == memrefType &&
+        candidate.getInitialValueAttr() == data) {
+      global = candidate;
+      break;
+    }
+  }
+  if (!global) {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(moduleOp.getBody());
+    global = rewriter.create<memref::GlobalOp>(
+        op->getLoc(), "__amdaie_core_constant_" + std::to_string(index),
+        rewriter.getStringAttr("private"), memrefType, data,
+        /*constant=*/true, /*alignment=*/rewriter.getI64IntegerAttr(64));
+  }
+
+  Value buffer = rewriter.create<memref::GetGlobalOp>(op->getLoc(), memrefType,
+                                                      global.getSymName());
+  return rewriter
+      .create<bufferization::ToTensorOp>(op->getLoc(), tensorType, buffer,
+                                         /*restrict=*/true, /*writable=*/false)
+      .getResult();
+}
+
+/// Replace a raised quantized LayerNorm with one int8 microkernel call.
+///
+/// Everything the kernel needs beyond the data is already folded by the raise:
+/// gamma and beta arrive packed as `[2, N]` bf16 with the output scale divided
+/// in, and the input scale survives only inside the scaled epsilon carried on
+/// the op. So this is a straight substitution -- no constants to re-derive from
+/// the tiled IR, which by this point is slices rather than the original
+/// weights.
+///
+/// Rooted on the `custom_op` itself, and it must replace it completely:
+/// `custom_op` is tensor-only, so anything left of it reaches bufferization and
+/// fails there.
+static FailureOr<IREE::Codegen::UKernelOpInterface>
+matchLayerNormDAGForUKernel(RewriterBase &rewriter, Operation *op,
+                            const std::string &ukernelName,
+                            const std::string &ukernelObjectName) {
+  auto customOp = dyn_cast<IREE::LinalgExt::CustomOp>(op);
+  if (!customOp)
+    return rewriter.notifyMatchFailure(op, "is not an iree_linalg_ext.custom_op");
+  if (!customOp->hasAttr(kLayerNormMarker))
+    return rewriter.notifyMatchFailure(op, "is not a raised LayerNorm");
+  auto epsilonAttr =
+      customOp->getAttrOfType<FloatAttr>(kLayerNormEpsilonScaled);
+  if (!epsilonAttr)
+    return rewriter.notifyMatchFailure(op, "has no scaled epsilon");
+  if (customOp.getInputs().size() != 1 || customOp.getOutputs().size() != 1)
+    return rewriter.notifyMatchFailure(op, "unexpected operand count");
+  auto gammaBetaAttr =
+      customOp->getAttrOfType<DenseElementsAttr>(kLayerNormGammaBeta);
+  if (!gammaBetaAttr)
+    return rewriter.notifyMatchFailure(op, "has no packed gamma/beta");
+
+  auto outType = dyn_cast<ShapedType>(customOp.getOutputs()[0].getType());
+  auto inType = dyn_cast<ShapedType>(customOp.getInputs()[0].getType());
+  auto gammaBetaType = dyn_cast<ShapedType>(gammaBetaAttr.getType());
+  if (!inType) return rewriter.notifyMatchFailure(op, "unshaped input");
+  // The samples are int8 when the normalization is fed directly, and int16 when
+  // an integer producer (a residual add) handed over something wider.
+  auto inElemTy = dyn_cast<IntegerType>(inType.getElementType());
+  if (!inElemTy || (inElemTy.getWidth() != 8 && inElemTy.getWidth() != 16))
+    return rewriter.notifyMatchFailure(op, "samples are not int8 or int16");
+  if (!outType || !outType.hasStaticShape() || outType.getRank() != 2 ||
+      !gammaBetaType || !gammaBetaType.hasStaticShape())
+    return rewriter.notifyMatchFailure(op, "expected static 2-D shapes");
+  int64_t m = outType.getDimSize(0);
+  int64_t n = outType.getDimSize(1);
+  // The shapes the kernel is instantiated for: a full tile and its tail.
+  if (n != 768 || (m != 16 && m != 8))
+    return rewriter.notifyMatchFailure(op, "no kernel for this tile shape");
+  if (gammaBetaType.getDimSize(0) != 2 || gammaBetaType.getDimSize(1) != n)
+    return rewriter.notifyMatchFailure(op, "gamma/beta are not packed [2, N]");
+
+  Location loc = customOp.getLoc();
+  // Gamma and beta become a core-local constant rather than an operand. A core
+  // tile has two incoming DMA channels and the two int8 activations of a fused
+  // residual add already take both, so there is no channel left to stream this
+  // in. As a `memref.global` it is placed in the core's data memory by the
+  // per-core linker script, costing a channel and a transfer of nothing.
+  FailureOr<Value> maybeGammaBeta =
+      materializeCoreLocalConstant(rewriter, customOp, gammaBetaAttr);
+  if (failed(maybeGammaBeta))
+    return rewriter.notifyMatchFailure(op, "could not place gamma/beta");
+
+  auto epsilon = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getF32Type(), epsilonAttr);
+  std::string elemTypeAndSize = "i" + std::to_string(inElemTy.getWidth()) +
+                                "_" + std::to_string(m) + "x" +
+                                std::to_string(n);
+  FnNameAndDefAttrs fn = getFnNameAndDefAttrs(rewriter, ukernelName,
+                                              elemTypeAndSize, ukernelObjectName);
+
+  auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
+      loc, outType, fn.name,
+      ValueRange{customOp.getInputs()[0], *maybeGammaBeta},
+      customOp.getOutputs()[0], ValueRange{epsilon.getResult()},
+      /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
+      /*strided_outer_dims=*/0);
+
+  return cast<IREE::Codegen::UKernelOpInterface>(
+      genericMicroKernelOp.getOperation());
+}
+
 static FailureOr<IREE::Codegen::UKernelOpInterface> matchSoftmaxDAGForUKernel(
     RewriterBase &rewriter, Operation *op, const std::string &ukernelName,
     const std::string &ukernelObjectName) {
@@ -400,6 +535,7 @@ static constexpr char kMatmulUKernelName[] = "matmul";
 static constexpr char kFillUKernelName[] = "zero_fill";
 static constexpr char kTruncIUKernelName[] = "trunci";
 static constexpr char kSoftmaxUKernelName[] = "softmax";
+static constexpr char kLayerNormUKernelName[] = "layernorm";
 
 void AMDAIELowerToUKernelsPass::runOnOperation() {
   MLIRContext *context = &getContext();
@@ -433,6 +569,8 @@ void AMDAIELowerToUKernelsPass::runOnOperation() {
       kSoftmaxUKernelName);
   patterns.insert<LowerToUKernelPattern<linalg::SoftmaxOp>>(
       context, allTargets, matchSoftmaxDAGForUKernel, kSoftmaxUKernelName);
+  patterns.insert<LowerToUKernelPattern<IREE::LinalgExt::CustomOp>>(
+      context, allTargets, matchLayerNormDAGForUKernel, kLayerNormUKernelName);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }

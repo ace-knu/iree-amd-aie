@@ -86,8 +86,8 @@ std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 
 /// Create a pass to assign per-dispatch device affinities (contraction/conv ->
 /// NPU, everything else -> CPU) for heterogeneous CPU+NPU execution.
-std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass(
-    bool enableSoftmaxUkernel = false);
+std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass(bool enableSoftmaxUkernel = false,
+                                       bool enableLayerNormUkernel = false);
 
 /// Create a pass to pad the operands of NPU contraction dispatches up to the
 /// target's pack-peel tile multiples (so divisibility holds inside the
@@ -387,6 +387,11 @@ std::unique_ptr<Pass> createAMDAIEPropagateDataLayoutPass();
 std::unique_ptr<Pass> createAMDAIEIntegerRequantizationPass();
 
 /// Create pass to expand math.roundeven into peano-selectable ops.
+/// Create a pass to raise a quantized row-wise LayerNorm chain to a single
+/// `iree_linalg_ext.custom_op` tiling root.
+std::unique_ptr<Pass> createAMDAIERaiseLayerNormPass();
+
+
 std::unique_ptr<Pass> createAMDAIEExpandRoundEvenPass();
 
 /// Create pass to reset the alignment of LLVM load operations.

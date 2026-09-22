@@ -32,6 +32,13 @@
 namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
+/// The LayerNorm microkernel's frame, rounded up. It keeps one bf16 chunk, the
+/// accumulator read-out slots and the int32 lane buffer on the stack; measured
+/// at 1152 bytes, with headroom for the tail-tile instantiation.
+constexpr uint32_t kLayerNormStackSize = 4096;
+}  // namespace
+
+namespace {
 
 /// Utility which returns 'true' is the operation needs to be inserted with an
 /// `amdaie.core` op.
@@ -211,11 +218,46 @@ static LogicalResult insertCoreOps(mlir::ModuleOp moduleOp, int64_t stackSize) {
       return WalkResult::advance();
     });
 
+    // A core-local constant is read straight out of the core's data memory, so
+    // the `memref.get_global` naming it has to sit inside the core. Lowering
+    // turns `amdaie.core` into `aie.core` by splicing its block into the
+    // device, and anything the block reads from outside would be left behind.
+    {
+      SetVector<Operation *> external;
+      coreOp.walk([&](Operation *inner) {
+        for (Value operand : inner->getOperands()) {
+          auto getGlobal = operand.getDefiningOp<memref::GetGlobalOp>();
+          if (getGlobal && !getGlobal->getParentOfType<AMDAIE::CoreOp>())
+            external.insert(getGlobal.getOperation());
+        }
+      });
+      for (Operation *getGlobal : external) {
+        rewriter.setInsertionPointToStart(coreOp.getBody());
+        Operation *clone = rewriter.clone(*getGlobal);
+        rewriter.replaceUsesWithIf(
+            getGlobal->getResult(0), clone->getResult(0), [&](OpOperand &use) {
+              return coreOp->isProperAncestor(use.getOwner());
+            });
+      }
+    }
+
     if (!ukernelObjectFiles.empty()) {
       // Concatenate all the object file names into a single string, separated
       // by commas.
       coreOp.setLinkWith(
           rewriter.getStringAttr(llvm::join(ukernelObjectFiles, ",")));
+      // A microkernel's frame has to fit the core's stack, and the default is
+      // 0x400. XCLBinGen measures the real requirement from the linked ELF and
+      // refuses to build when it does not fit, so an undersized stack is a
+      // build error rather than a wrong result -- but the value has to be right
+      // here, because buffer addresses are assigned from it. Raise it only for
+      // the cores that need it, so no other dispatch pays the local memory.
+      uint32_t required = coreOp.getStackSize();
+      for (StringRef objectFile : ukernelObjectFiles) {
+        if (objectFile.contains("layernorm"))
+          required = std::max<uint32_t>(required, kLayerNormStackSize);
+      }
+      if (required != coreOp.getStackSize()) coreOp.setStackSize(required);
     };
 
     if (forallRes.wasInterrupted()) return WalkResult::interrupt();

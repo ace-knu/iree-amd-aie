@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/IR/AMDAIEAttrs.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -145,7 +146,9 @@ static bool valueStaysInBlock(Value value, Block *block, unsigned depth = 0) {
   if (depth > 4) return false;
   for (Operation *user : value.getUsers()) {
     if (user->getBlock() != block) return false;
-    if (isa<linalg::SoftmaxOp, linalg::GenericOp>(user)) continue;
+    if (isa<linalg::SoftmaxOp, linalg::GenericOp, IREE::LinalgExt::CustomOp>(
+            user))
+      continue;
     // Fusion leaves slices on the edge; look through them.
     if (isa<tensor::ExtractSliceOp>(user) &&
         valueStaysInBlock(user->getResult(0), block, depth + 1))
@@ -187,7 +190,8 @@ static void collectChainBoundaryOperands(Operation *op, bool wantInputs,
       while (auto sliceOp = dyn_cast_if_present<tensor::ExtractSliceOp>(producer))
         producer = sliceOp.getSource().getDefiningOp();
       if (producer && producer->getBlock() == op->getBlock() &&
-          isa<linalg::SoftmaxOp, linalg::GenericOp>(producer)) {
+          isa<linalg::SoftmaxOp, linalg::GenericOp,
+              IREE::LinalgExt::CustomOp>(producer)) {
         collectChainBoundaryOperands(producer, wantInputs, result, seen,
                                      depth + 1);
         continue;
@@ -286,6 +290,15 @@ void AMDAIEBufferizeToAllocationPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
   SmallVector<Operation *> targetOps;
   funcOp->walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
+    // A `custom_op` is promoted as a unit. Its body describes what one tile
+    // computes, so the ops inside it are not separate promotion targets -- and
+    // there are several of them, which would look like several target ops.
+    if (op->getParentOfType<IREE::LinalgExt::CustomOp>())
+      return WalkResult::advance();
+    if (isa<IREE::LinalgExt::CustomOp>(op)) {
+      targetOps.push_back(op);
+      return WalkResult::advance();
+    }
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
       // Skip if the op is not elementwise/reduction/contraction/convolution.
       if (!isElementwise(linalgOp) && !isReductionOp(linalgOp) &&

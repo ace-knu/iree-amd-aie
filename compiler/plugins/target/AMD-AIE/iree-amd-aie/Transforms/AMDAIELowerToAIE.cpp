@@ -26,6 +26,7 @@
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/PassManager.h"
@@ -511,6 +512,22 @@ LogicalResult AIEDeviceBuilder::coreToAIE(AMDAIE::CoreOp coreOp,
     return failure();
   }
   for (Operation *op : toBeErased) eraseOp(op);
+
+  // A core-local constant lives in the core's own data memory, and the module
+  // that held its `memref.global` does not survive this pass. Bring the global
+  // into the device alongside the core, the same place shim globals go, so the
+  // per-core translation can still see it.
+  Block *deviceBlock = &deviceOp.getRegion().front();
+  aieCoreOp.walk([&](memref::GetGlobalOp getGlobalOp) {
+    if (SymbolTable::lookupSymbolIn(deviceOp, getGlobalOp.getNameAttr()))
+      return;
+    auto global = dyn_cast_if_present<memref::GlobalOp>(
+        SymbolTable::lookupNearestSymbolFrom(coreOp, getGlobalOp.getNameAttr()));
+    if (!global) return;
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointToStart(deviceBlock);
+    rewriter.clone(*global.getOperation());
+  });
 
   mapper.map(coreOp.getResult(), aieCoreOp.getResult());
   mapper.map(coreOp.getOperation(), aieCoreOp.getOperation());

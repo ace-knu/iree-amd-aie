@@ -175,6 +175,15 @@ static FailureOr<int64_t> recoverSubspanElementOffset(Value source) {
       cur = reinterpretOp.getSource();
     } else if (auto subviewOp = dyn_cast<memref::SubViewOp>(def)) {
       cur = subviewOp.getSource();
+    } else if (auto expandOp = dyn_cast<memref::ExpandShapeOp>(def)) {
+      // A reshape re-reads the same bytes from the same base, so it neither
+      // adds to nor hides the offset. Walking through it matters: an activation
+      // that reaches a batch matmul as `subspan -> expand_shape -> subview`
+      // (rank-2 binding, rank-3 use) otherwise looks like it has no backing
+      // subspan at all, and the whole dispatch is rejected.
+      cur = expandOp.getSrc();
+    } else if (auto collapseOp = dyn_cast<memref::CollapseShapeOp>(def)) {
+      cur = collapseOp.getSrc();
     } else {
       break;
     }

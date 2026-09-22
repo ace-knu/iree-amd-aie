@@ -94,6 +94,8 @@ iree_cc_library(
     "AMDAIEInsertLoopsForVectorization.cpp"
     "AMDAIELinkExecutables.cpp"
     "AMDAIELocalizeLogicalObjectFifo.cpp"
+    "AMDAIEApproximateMathFunctions.cpp"
+    "AMDAIERaiseLayerNorm.cpp"
     "AMDAIEExpandRoundEven.cpp"
     "AMDAIEIntegerRequantization.cpp"
     "AMDAIELoadStoreAlignmentReset.cpp"
@@ -155,6 +157,7 @@ iree_cc_library(
     IREELinalgTransformDialectPasses
     MLIRArithTransforms
     MLIRMathDialect
+    MLIRBufferizationDialect
     MLIRFuncAllExtensions
     MLIRFuncDialect
     MLIRFunctionInterfaces

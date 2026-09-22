@@ -6,6 +6,8 @@
 
 #include "iree-amd-aie/Transforms/KernelDispatch.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIELayerNormUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
@@ -84,7 +86,11 @@ void AMDAIELowerExecutableTargetPass::runOnOperation() {
     case IREE::Codegen::DispatchLoweringPassPipeline::Custom: {
       // Softmax has only a copy-based lowering. Other dispatches in the same
       // module continue to use the selected matmul pipeline.
-      if (isa<linalg::SoftmaxOp>(getRootOp(funcOp))) {
+      Operation *rootOp = getRootOp(funcOp);
+      bool isRaisedLayerNorm =
+          rootOp && isa<IREE::LinalgExt::CustomOp>(rootOp) &&
+          rootOp->hasAttr(kLayerNormMarker);
+      if (isa<linalg::SoftmaxOp>(rootOp) || isRaisedLayerNorm) {
         addGeneralCopyPassPipeline(executableLoweringPipeline,
                                    TilePassPipeline::GeneralCopyPipeline,
                                    getRootOp(funcOp));

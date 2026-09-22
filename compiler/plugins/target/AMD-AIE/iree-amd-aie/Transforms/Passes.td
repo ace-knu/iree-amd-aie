@@ -86,6 +86,9 @@ def AMDAIEAssignDeviceAffinities :
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
     let options = [
+      Option<"enableLayerNormUkernel", "enable-layernorm-ukernel", "bool",
+             /*default=*/"false",
+             "Route a raised quantized LayerNorm dispatch to the NPU.">,
       Option<"enableSoftmaxUkernel", "enable-softmax-ukernel", "bool",
              /*default=*/"false",
              "Also place a dispatch that is nothing but a quantized softmax on "
@@ -622,6 +625,24 @@ def AMDAIEIntegerRequantization :
       several KB of soft-float libcalls in each core's 16KB program memory.
     }];
 }
+
+def AMDAIERaiseLayerNorm :
+    Pass<"iree-amdaie-raise-layernorm", ""> {
+    let summary = "Raise a quantized row-wise LayerNorm chain to one tiling root.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIERaiseLayerNormPass()";
+    let description = [{
+      The ONNX importer decomposes `LayerNormalization` into thirteen
+      `linalg.generic`s, and dispatch formation then splits them at the second
+      reduction, so no single dispatch holds the whole normalization. There is
+      no named op to hang a lowering on, so wrap the chain in an
+      `iree_linalg_ext.custom_op`: one op, one dispatch, one tiling root whose
+      only loop is over rows. The feature dimension rides along as a symbol,
+      which is how `custom_op` spells "never tile this". An elementwise producer
+      such as a residual add still fuses into the same dispatch, so it does not
+      have to become part of any microkernel's ABI.
+    }];
+}
+
 
 def AMDAIEExpandRoundEven :
     Pass<"iree-amdaie-expand-roundeven", ""> {

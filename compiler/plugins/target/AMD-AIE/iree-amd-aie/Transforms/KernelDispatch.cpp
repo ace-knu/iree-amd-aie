@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-amd-aie/Transforms/KernelDispatch.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIELayerNormUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 
 #include "iree-amd-aie/IR/AMDAIEAttrs.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIETileSizeSelectionUtils.h"
@@ -890,6 +892,90 @@ static LogicalResult setRootConfigForSoftmaxCopyPipeline(
   return success();
 }
 
+/// Row-wise LayerNorm, raised to a single `iree_linalg_ext.custom_op`.
+///
+/// Only the row dimension is tiled: the normalization reduces over the whole
+/// feature dimension, so a core has to see a complete row. How many rows fit is
+/// what the local memory decides, exactly as for softmax -- input and output
+/// tiles, double buffered, minus what the stack takes.
+static LogicalResult setRootConfigForLayerNormCopyPipeline(
+    mlir::FunctionOpInterface entryPointFn, IREE::LinalgExt::CustomOp customOp,
+    AMDAIEDevice targetDevice, uint32_t numRows, uint32_t numCols,
+    uint32_t stackSize) {
+  auto inputType =
+      dyn_cast<ShapedType>(customOp.getInputs()[0].getType());
+  auto outputType =
+      dyn_cast<ShapedType>(customOp.getOutputs()[0].getType());
+  if (!inputType || !outputType || inputType.getRank() != 2)
+    return customOp.emitError("expected a 2-D row-wise LayerNorm");
+  uint32_t nBytesIn = inputType.getElementTypeBitWidth() / 8;
+  uint32_t nBytesOut = outputType.getElementTypeBitWidth() / 8;
+  int64_t rows = inputType.getDimSize(0);
+  int64_t features = inputType.getDimSize(1);
+
+  AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
+
+  // What one core holds for a tile of rows. Operands that arrive or leave over
+  // a DMA are double-buffered; what a fused producer writes stays on the core
+  // and is not.
+  int64_t bytesPerRow = features * (nBytesIn + nBytesOut) * 2;
+  int64_t flatBytes = stackSize;
+  // The streamed operands: the normalization's own input, or, when a residual
+  // add was fused in front of it, that add's two activations instead.
+  int64_t streamedInputs = 1;
+  if (auto producer =
+          customOp.getInputs()[0].getDefiningOp<linalg::GenericOp>()) {
+    streamedInputs = 0;
+    for (Value in : producer.getDpsInputs()) {
+      auto operandType = dyn_cast<ShapedType>(in.getType());
+      if (!operandType) continue;
+      ++streamedInputs;
+      bytesPerRow += features * (operandType.getElementTypeBitWidth() / 8) * 2;
+    }
+    // The producer's result is the normalization's input, counted as streamed
+    // above though it never crosses a DMA: take back its second buffer.
+    bytesPerRow -= features * nBytesIn;
+  }
+  // Gamma and beta are placed in the core's own memory rather than streamed, so
+  // they cost space but no channel.
+  if (auto gammaBeta =
+          customOp->getAttrOfType<DenseElementsAttr>(kLayerNormGammaBeta)) {
+    auto packedType = cast<ShapedType>(gammaBeta.getType());
+    flatBytes +=
+        packedType.getNumElements() * (packedType.getElementTypeBitWidth() / 8);
+  }
+  int64_t maxRowsPerCore =
+      (deviceModel.getCoreTileLocalMemorySize() - flatBytes) / bytesPerRow;
+  if (maxRowsPerCore <= 0)
+    return customOp.emitError(
+        "failed to set the tile size, one row of the feature dimension does "
+        "not fit in local memory");
+  int64_t rowsPerCore =
+      std::min<int64_t>(findLargestFactor(rows, maxRowsPerCore), 32);
+
+  // How many cores one block may spread over. Every core takes its own memtile
+  // connection for each operand it is fed, so `k` streamed inputs across `c`
+  // cores need `k * c` outgoing channels there, and `k + c` incoming ones for
+  // the loads plus the cores' results. A memtile has six of each.
+  FailureOr<uint8_t> maybeChannels = deviceModel.getDmaProp<uint8_t>(
+      AMDAIETileType::MEMTILE, AMDAIEDmaProp::NumChannels);
+  int64_t channels = succeeded(maybeChannels) ? *maybeChannels : 2;
+  int64_t maxCores = std::min<int64_t>(channels / streamedInputs,
+                                       channels - streamedInputs);
+  maxCores = std::max<int64_t>(
+      1, std::min<int64_t>(maxCores, numRows * numCols));
+  // Spread over as many of those as divide the rows evenly.
+  while (maxCores > 1 && rows % (maxCores * rowsPerCore) != 0) --maxCores;
+  int64_t rowsPerBlock = std::min<int64_t>(rows, maxCores * rowsPerCore);
+
+  // The single loop is over rows; the feature dimension is a symbol of the
+  // custom op's indexing maps and so is never tiled.
+  TileSizesListType tileSizes = {{rowsPerBlock}, {rowsPerCore}, {0}};
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPointFn, customOp, tileSizes,
+      IREE::Codegen::DispatchLoweringPassPipeline::Custom);
+}
+
 static LogicalResult setRootConfigForReductionCopyPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     AMDAIEDevice targetDevice, uint32_t numRows, uint32_t numCols,
@@ -1078,6 +1164,11 @@ static LogicalResult setRootConfigImpl(
           return setRootConfig(entryPointFn, op, passPipeline,
                                useLowerToAIEPipeline, targetDevice, numRows,
                                numCols, stackSize, enableAMDAIEUkernels);
+        })
+        .Case<IREE::LinalgExt::CustomOp>([&](auto op) {
+          if (!op->hasAttr(kLayerNormMarker)) return success();
+          return setRootConfigForLayerNormCopyPipeline(
+              entryPointFn, op, targetDevice, numRows, numCols, stackSize);
         })
         .Default([&](Operation *op) { return success(); });
   };

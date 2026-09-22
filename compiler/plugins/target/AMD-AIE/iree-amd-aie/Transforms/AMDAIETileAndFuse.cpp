@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/ADT/StringExtras.h"
@@ -475,6 +476,13 @@ void AMDAIETileAndFusePass::runOnOperation() {
     // Find the next consumer op if it does not have loops OR it is from
     // the skip ops list which currently contains linalg.copy and linalg.unpack.
     if (op.getLoopIteratorTypes().empty() || consumerToSkip(op))
+      return WalkResult::advance();
+
+    // A `custom_op` is a prescriptively fused unit: its body describes what one
+    // tile computes, so the tiling root is the op itself and never an op
+    // inside it. Without this the post-order walk reaches the body's reduction
+    // first and tiles that, leaving the custom op whole.
+    if (op->getParentOfType<IREE::LinalgExt::CustomOp>())
       return WalkResult::advance();
 
     // For matmul + elementwise dispatch, we use flag `tileElementwise` to

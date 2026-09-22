@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/IR/Iterators.h"
@@ -66,6 +67,16 @@ FailureOr<Value> promoteValue(IRRewriter &rewriter, Location loc, Value v,
 static bool readsInit(DestinationStyleOpInterface dstStyleOp,
                       unsigned initIdx) {
   if (isa<linalg::SoftmaxOp>(dstStyleOp.getOperation())) return false;
+  // A `custom_op` carries its computation in a region whose trailing block
+  // arguments stand for the destinations, so the same question is answered the
+  // same way as for a linalg body.
+  if (auto customOp =
+          dyn_cast<IREE::LinalgExt::CustomOp>(dstStyleOp.getOperation())) {
+    Block *body = customOp.getBody();
+    unsigned argIdx = customOp.getInputs().size() + initIdx;
+    return argIdx < body->getNumArguments() &&
+           !body->getArgument(argIdx).use_empty();
+  }
   auto linalgOp = dyn_cast<linalg::LinalgOp>(dstStyleOp.getOperation());
   if (!linalgOp || !linalgOp.getBlock()) return true;
   OpOperand *initOperand = linalgOp.getDpsInitOperand(initIdx);
@@ -88,7 +99,8 @@ static bool isInternalChainEdge(Value value, Operation *op) {
   while (auto sliceOp = dyn_cast_if_present<tensor::ExtractSliceOp>(producer))
     producer = sliceOp.getSource().getDefiningOp();
   return producer && producer->getBlock() == op->getBlock() &&
-         isa<linalg::SoftmaxOp, linalg::GenericOp>(producer);
+         isa<linalg::SoftmaxOp, linalg::GenericOp, IREE::LinalgExt::CustomOp>(
+             producer);
 }
 
 /// Whether every result of `op` is consumed by another compute op in the same
@@ -99,7 +111,9 @@ static bool valueStaysInBlock(Value value, Block *block, unsigned depth = 0) {
   if (depth > 4) return false;
   for (Operation *user : value.getUsers()) {
     if (user->getBlock() != block) return false;
-    if (isa<linalg::SoftmaxOp, linalg::GenericOp>(user)) continue;
+    if (isa<linalg::SoftmaxOp, linalg::GenericOp, IREE::LinalgExt::CustomOp>(
+            user))
+      continue;
     // Fusion leaves slices on the edge; look through them.
     if (isa<tensor::ExtractSliceOp>(user) &&
         valueStaysInBlock(user->getResult(0), block, depth + 1))
@@ -242,7 +256,11 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
   mlir::FunctionOpInterface funcOp = getOperation();
   SmallVector<Operation *> targetOps;
   funcOp->walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (isa<linalg::SoftmaxOp>(op) || isa<linalg::GenericOp>(op))
+    // A `custom_op` is promoted as a unit; the ops in its body describe what
+    // one tile computes and are not separate copy boundaries.
+    if (op->getParentOfType<IREE::LinalgExt::CustomOp>()) return;
+    if (isa<linalg::SoftmaxOp>(op) || isa<linalg::GenericOp>(op) ||
+        isa<IREE::LinalgExt::CustomOp>(op))
       targetOps.push_back(op);
   });
   // Tiling leaves the original ops behind, replacing their uses; with
