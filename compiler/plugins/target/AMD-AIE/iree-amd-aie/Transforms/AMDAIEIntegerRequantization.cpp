@@ -143,15 +143,14 @@ struct RequantToIntegerPattern : public OpRewritePattern<arith::FPToSIOp> {
     if (tail.mulConst) scale *= toDouble(*tail.mulConst);
     if (tail.divConst) scale /= toDouble(*tail.divConst);
 
-    IntegerRequant req;
-    if (!chooseMultiplierAndShift(scale, req))
-      return rewriter.notifyMatchFailure(op, "scale is not representable");
-
     // Only rewrite what can be shown to behave identically. Declining here
-    // simply leaves the float tail in place.
-    if (!integerRequantIsExact(tail, req))
+    // leaves the float tail in place, and on a device with no scalar float that
+    // means the whole soft-float library is linked into the core -- so it is
+    // worth looking past the first candidate representation before giving up.
+    IntegerRequant req;
+    if (!findExactMultiplierAndShift(tail, scale, req))
       return rewriter.notifyMatchFailure(
-          op, "integer form is not bit-exact for this tail");
+          op, "no bit-exact integer form for this tail");
 
     Location loc = op.getLoc();
     Type wideTy = rewriter.getI64Type();

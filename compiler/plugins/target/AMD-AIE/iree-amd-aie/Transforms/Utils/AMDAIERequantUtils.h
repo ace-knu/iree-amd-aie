@@ -11,6 +11,8 @@
 #include <optional>
 
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Support/LLVM.h"
 
 namespace mlir::iree_compiler::AMDAIE {
@@ -74,6 +76,30 @@ bool integerTailReaches(const IntegerRequant &req, int64_t acc,
 /// Returns false if they differ anywhere, or if the clamp range is too wide to
 /// check cheaply.
 bool integerRequantIsExact(const RequantTail &tail, const IntegerRequant &req);
+
+/// Find a `multiplier / 2^shift` that reproduces `tail` exactly, or report that
+/// none was found.
+///
+/// `chooseMultiplierAndShift` returns the representation that tracks `scale`
+/// most closely, and that is the one tried first, so a tail that already lowers
+/// to integers keeps exactly the multiplier and shift it has today. But
+/// exactness is a property of where the clamped step boundaries land, not of how
+/// precisely the multiplier represents the scale: the float tail rounds twice
+/// (the multiply and the divide), and a coarser multiplier can land every
+/// boundary where those roundings put them while the finest one misses by a
+/// single accumulator. So when the preferred representation is not exact, sweep
+/// the other shifts and a small window of multipliers around each.
+bool findExactMultiplierAndShift(const RequantTail &tail, double scale,
+                                 IntegerRequant &out);
+
+/// Whether `req` can be *executed* safely for `tail`, independent of whether it
+/// reproduces the float form.
+///
+/// These are the conditions the generated code depends on: a positive
+/// multiplier, a shift the round-half-to-even sequence is defined for, and an
+/// accumulator range narrow enough that `acc * multiplier` cannot overflow the
+/// i64 the multiply is done in. `integerRequantIsExact` implies this.
+bool integerRequantIsSafe(const RequantTail &tail, const IntegerRequant &req);
 
 }  // namespace mlir::iree_compiler::AMDAIE
 
