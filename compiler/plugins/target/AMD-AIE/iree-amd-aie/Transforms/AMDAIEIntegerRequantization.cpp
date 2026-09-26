@@ -9,6 +9,8 @@
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIERequantUtils.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/Matchers.h"
@@ -17,6 +19,33 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-amdaie-integer-requantization"
+
+/// Whether "is not bit-identical to the float form" is a reason to decline.
+///
+/// It is not, by default. Requiring bit-exactness means a tail whose scales
+/// happen not to be representable keeps its float arithmetic, and on aie2p --
+/// which has no scalar float -- that pulls the whole soft-float library into the
+/// core, which is both large and, at least once, the difference between a
+/// dispatch that completes and one that hangs. Measured on a 12-layer BERT
+/// encoder, dropping the condition changed no model output at all: the int8
+/// result was byte-identical at every layer boundary and at the model output,
+/// and per tail at most one element in 3.1M differed, by one LSB
+/// (`docs/2026-09-25_requantization_exactness_experiment.md`).
+///
+/// Pass `=false` to restore the strict policy, which converts a tail only when
+/// the integer form is proven to match the float one for every accumulator
+/// value. Either way the execution-safety conditions are the same: the scale
+/// must be a positive finite number, the shift must be one the
+/// round-half-to-even sequence is defined for, and `acc * multiplier` must be
+/// unable to overflow the i64 it is computed in.
+static llvm::cl::opt<bool> clForceIntegerRequantization(
+    "iree-amdaie-force-integer-requantization",
+    llvm::cl::desc(
+        "Rewrite every recognised int32->int8 requantization tail as integer "
+        "multiply/shift, without requiring the result to be bit-identical to "
+        "the float form (execution-safety conditions still apply). On by "
+        "default; pass =false to convert only tails proven bit-exact."),
+    llvm::cl::init(true));
 
 namespace mlir::iree_compiler::AMDAIE {
 
@@ -143,14 +172,48 @@ struct RequantToIntegerPattern : public OpRewritePattern<arith::FPToSIOp> {
     if (tail.mulConst) scale *= toDouble(*tail.mulConst);
     if (tail.divConst) scale /= toDouble(*tail.divConst);
 
-    // Only rewrite what can be shown to behave identically. Declining here
-    // leaves the float tail in place, and on a device with no scalar float that
-    // means the whole soft-float library is linked into the core -- so it is
-    // worth looking past the first candidate representation before giving up.
+    // Everything above is structural: from here the op is a requantization tail
+    // this pass understands, so log it as recognised and report separately
+    // whether it was declined for safety or for accuracy.
+    LLVM_DEBUG(llvm::dbgs() << "REQUANT recognised scale=" << scale << "\n");
+
     IntegerRequant req;
-    if (!findExactMultiplierAndShift(tail, scale, req))
-      return rewriter.notifyMatchFailure(
-          op, "no bit-exact integer form for this tail");
+    if (clForceIntegerRequantization) {
+      // The representation that tracks the scale most closely, checked only for
+      // whether it can be executed.
+      if (!chooseMultiplierAndShift(scale, req)) {
+        LLVM_DEBUG(llvm::dbgs() << "REQUANT reject-safety unrepresentable\n");
+        return rewriter.notifyMatchFailure(op, "scale is not representable");
+      }
+      if (!integerRequantIsSafe(tail, req)) {
+        LLVM_DEBUG(llvm::dbgs() << "REQUANT reject-safety unsafe\n");
+        return rewriter.notifyMatchFailure(
+            op, "integer form is not safe to execute for this tail");
+      }
+      LLVM_DEBUG(llvm::dbgs()
+                 << "REQUANT convert-forced mult=" << req.multiplier
+                 << " shift=" << req.shift
+                 << (integerRequantIsExact(tail, req) ? " exact" : " inexact")
+                 << "\n");
+    } else {
+      // Only rewrite what can be shown to behave identically. Declining here
+      // leaves the float tail in place, and on a device with no scalar float
+      // that means the whole soft-float library is linked into the core -- so it
+      // is worth looking past the first candidate representation before giving
+      // up.
+      if (!findExactMultiplierAndShift(tail, scale, req)) {
+        IntegerRequant probe;
+        bool safe = chooseMultiplierAndShift(scale, probe) &&
+                    integerRequantIsSafe(tail, probe);
+        LLVM_DEBUG(llvm::dbgs()
+                   << (safe ? "REQUANT reject-exactness\n"
+                            : "REQUANT reject-safety no-representation\n"));
+        return rewriter.notifyMatchFailure(
+            op, "no bit-exact integer form for this tail");
+      }
+      LLVM_DEBUG(llvm::dbgs() << "REQUANT convert-exact mult=" << req.multiplier
+                              << " shift=" << req.shift << "\n");
+    }
 
     Location loc = op.getLoc();
     Type wideTy = rewriter.getI64Type();

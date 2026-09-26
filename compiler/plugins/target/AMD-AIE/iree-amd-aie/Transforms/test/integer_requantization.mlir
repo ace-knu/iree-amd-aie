@@ -1,4 +1,5 @@
 // RUN: iree-opt --pass-pipeline='builtin.module(func.func(iree-amdaie-integer-requantization))' --split-input-file %s | FileCheck %s
+// RUN: iree-opt --iree-amdaie-force-integer-requantization=false --pass-pipeline='builtin.module(func.func(iree-amdaie-integer-requantization))' --split-input-file %s | FileCheck %s --check-prefix=STRICT
 
 // The int8 requantization tail of a fused matmul: scale by a pair of constants,
 // round half to even, clamp, narrow. aie2p has no scalar float arithmetic, so
@@ -96,11 +97,16 @@ func.func @requant_float_rooted(%x: f32) -> i8 {
 
 // -----
 
-// A clamp range far wider than a quantization tail's is declined: the pass only
-// rewrites what it can check, and checking this many steps is not worth it.
-// CHECK-LABEL: func @requant_implausible_clamp_range
-//       CHECK:   math.roundeven
-//       CHECK:   arith.fptosi
+// A clamp range far wider than a quantization tail's is more steps than the
+// exactness check will walk. Under the strict policy that leaves the tail alone.
+// Under the default policy exactness is not required, so the rewrite applies
+// anyway: how wide the clamp is has no bearing on whether the integer form can
+// be executed.
+//  CHECK-LABEL: func @requant_implausible_clamp_range
+//    CHECK-NOT:   math.roundeven
+// STRICT-LABEL: func @requant_implausible_clamp_range
+//       STRICT:   math.roundeven
+//       STRICT:   arith.fptosi
 func.func @requant_implausible_clamp_range(%acc: i32) -> i32 {
   %s2 = arith.constant 5.000000e-01 : f32
   %lo = arith.constant -1.000000e+06 : f32

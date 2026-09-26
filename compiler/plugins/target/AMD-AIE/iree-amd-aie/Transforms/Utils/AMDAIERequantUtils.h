@@ -98,7 +98,8 @@ bool findExactMultiplierAndShift(const RequantTail &tail, double scale,
 /// These are the conditions the generated code depends on: a positive
 /// multiplier, a shift the round-half-to-even sequence is defined for, and an
 /// accumulator range narrow enough that `acc * multiplier` cannot overflow the
-/// i64 the multiply is done in. `integerRequantIsExact` implies this.
+/// i64 the multiply is done in. `integerRequantIsExact` implies this; the
+/// experimental "convert every tail" mode checks only this.
 bool integerRequantIsSafe(const RequantTail &tail, const IntegerRequant &req);
 
 }  // namespace mlir::iree_compiler::AMDAIE
