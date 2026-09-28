@@ -604,26 +604,31 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 // DRAM runs instead of 64 B.
 
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
-/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim,
-/// no fused elementwise consumer) with M == 1 and an [N, K] weight (see
-/// `isGemvShape`).
+/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim)
+/// with M == 1 and an [N, K] weight (see `isGemvShape`), with at most a fused
+/// *unary* elementwise consumer (e.g. ReLU) as an epilogue.
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
-  // TODO(gemv): support a fused elementwise consumer (bias add / ReLU) as an
-  // epilogue. Today such an M == 1 dispatch is rejected here and then fails in
-  // pack-peel as well ("instruction size ... does not divide M (1)"), and the
-  // Flow pad pass only matches a plain `fill -> matmul -> store` dispatch, so
-  // fusion into contraction roots must stay disabled
-  // (`--iree-dispatch-creation-no-fuse-into-contraction-conv-roots`) and the
-  // FC bias/ReLU runs as a separate host dispatch. The natural place for the
-  // epilogue is the peeled last K step of `addGemvPassPipeline`, applied to the
-  // per-core L1 C tile before its copy back to L2 (`tileElementwise` is off
-  // there for now).
+  // A fused consumer with a second operand of its own (e.g. bias add) is
+  // rejected: `setRootConfigForGemvPipeline`'s L1 budget has no term for a
+  // second, separately-DMA'd operand, unlike pack-peel's
+  // `isMatmulWithElementwiseConsumer` handling. This is not a real restriction
+  // for this pipeline's only clients today (VGG16 FC1/FC2, M == 1): the Flow
+  // pad pass folds their bias into the contraction's K dimension
+  // (`AMDAIEPadContractionDispatches`, `matchFoldablePostAddBias`), so a fused
+  // ReLU -- one input, the matmul result itself -- is the only consumer shape
+  // that reaches here. Peeling and fusing the consumer into the last K
+  // step is otherwise identical to pack-peel: `addGemvPassPipeline` already
+  // ends in the same `addPeelAndFusePasses`, which fuses a consumer into the
+  // peeled last iteration unconditionally (`tileElementwise` is only turned
+  // off at the earlier per-K-step and per-core tiling stages, so the
+  // elementwise op is never incorrectly repeated per K step).
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
       if (isElementwise(linalgUser) &&
-          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser))
+          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser) &&
+          linalgUser.getNumDpsInputs() != 1)
         return false;
     }
   }
@@ -671,6 +676,17 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t nBytesLhs = bytesOf(linalgOp.getDpsInputOperand(0)->get());
   int64_t nBytesRhs = bytesOf(linalgOp.getDpsInputOperand(1)->get());
   int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
+  // A fused epilogue (see `isGemvLike`) writes its result to its own L1 tile,
+  // next to C, which is what then leaves the core (`AMDAIEInsertCopyOps`).
+  int64_t nBytesEpilogueOut = 0;
+  for (Operation *userOp : linalgOp->getUsers()) {
+    auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp);
+    if (linalgUser && isElementwise(linalgUser) &&
+        !isa<linalg::FillOp, linalg::CopyOp>(linalgUser)) {
+      nBytesEpilogueOut = bytesOf(linalgUser.getDpsInitOperand(0)->get());
+      break;
+    }
+  }
 
   // K tile, whole matvec ukernel vectors when the tile is lowered to it (it
   // is enabled and has a template for the element types).
@@ -704,7 +720,7 @@ static LogicalResult setRootConfigForGemvPipeline(
       getConfigGemvN1(IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn));
   FailureOr<GemvNTiling> tiling =
       chooseGemvNTiling(M, N, kTile, nBytesLhs, nBytesRhs, nBytesOut, numRows,
-                        numCols, l1Limit, n1Max);
+                        numCols, l1Limit, n1Max, nBytesEpilogueOut);
   if (failed(tiling)) {
     return linalgOp.emitOpError("no GEMV tiling of N=")
            << N << " with a per-core N tile of at least 2 that divides N and "

@@ -104,6 +104,8 @@ bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr);
 /// (`cores <= numRows || cores % numRows == 0`): the L2 weight split hands
 /// every memtile one column. n1 is at least 2 (one output per core gives wrong
 /// results), so a prime N fails here unless the pad pass has grown it.
+/// `bytesEpilogueOut` is the element size of a fused epilogue's output (0
+/// without one): that result is its own L1 tile next to C.
 struct GemvNTiling {
   int64_t n1;
   int64_t cores;
@@ -112,7 +114,8 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
                                          int64_t bytesLhs, int64_t bytesRhs,
                                          int64_t bytesOut, int64_t numRows,
                                          int64_t numCols, int64_t l1Limit,
-                                         int64_t n1Max);
+                                         int64_t n1Max,
+                                         int64_t bytesEpilogueOut = 0);
 
 /// Per-core N tile cap of the GEMV pipeline (`gemv_n1` in the executable
 /// target config; absent means 32).

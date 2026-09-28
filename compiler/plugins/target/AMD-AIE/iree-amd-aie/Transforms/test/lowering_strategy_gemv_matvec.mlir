@@ -101,3 +101,45 @@ module {
     return
   }
 }
+
+// -----
+
+// A fused unary epilogue (ReLU) keeps the dispatch on the GEMV pipeline: the
+// matmul gets the same GEMV config it would get alone (K=256 takes the full
+// 256 tile).
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
+// CHECK-SAME:      [0, 1024, 0], [0, 0, 256], [0, 32, 0]
+// CHECK-SAME:  ]>
+// CHECK:       func.func @gemv_matvec_relu_epilogue
+// CHECK:         linalg.matmul
+// CHECK-SAME:      lowering_config = #config
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @gemv_matvec_relu_epilogue() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x256xbf16>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x256xbf16>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [1, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x256xbf16>> -> tensor<1x256xbf16>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [1024, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x256xbf16>> -> tensor<1024x256xbf16>
+    %5 = tensor.empty() : tensor<1x1024xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<1x1024xf32>) -> tensor<1x1024xf32>
+    %7 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d1, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d0, d1)>]
+         ins(%3, %4 : tensor<1x256xbf16>, tensor<1024x256xbf16>) outs(%6 : tensor<1x1024xf32>) -> tensor<1x1024xf32>
+    %8 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%7 : tensor<1x1024xf32>) outs(%5 : tensor<1x1024xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %9 = arith.cmpf ugt, %in, %cst : f32
+      %10 = arith.select %9, %in, %cst : f32
+      linalg.yield %10 : f32
+    } -> tensor<1x1024xf32>
+    iree_tensor_ext.dispatch.tensor.store %8, %2, offsets = [0, 0], sizes = [1, 1024], strides = [1, 1] : tensor<1x1024xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
+    return
+  }
+}

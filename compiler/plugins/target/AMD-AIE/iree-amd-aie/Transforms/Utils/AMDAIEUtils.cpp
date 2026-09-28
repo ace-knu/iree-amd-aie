@@ -240,18 +240,21 @@ PoolColumnsPolicy getConfigPoolColumnsPolicy(
   return PoolColumnsPolicy::Max;
 }
 
-/// Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles.
+/// Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles, plus a
+/// fused epilogue's (M x n1) output tile when there is one.
 static int64_t gemvL1Bytes(int64_t M, int64_t n1, int64_t kTile,
                            int64_t bytesLhs, int64_t bytesRhs,
-                           int64_t bytesOut) {
-  return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
+                           int64_t bytesOut, int64_t bytesEpilogueOut) {
+  return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs +
+              M * n1 * (bytesOut + bytesEpilogueOut));
 }
 
 FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
                                          int64_t bytesLhs, int64_t bytesRhs,
                                          int64_t bytesOut, int64_t numRows,
                                          int64_t numCols, int64_t l1Limit,
-                                         int64_t n1Max) {
+                                         int64_t n1Max,
+                                         int64_t bytesEpilogueOut) {
   int64_t numCores = numRows * numCols;
   GemvNTiling best{0, 0};
   auto better = [&](int64_t n1, int64_t cores) {
@@ -268,7 +271,8 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
   // n1 = 1 is never taken: a GEMV with one output per core produces wrong
   // results (all zeros on npu4), cause not yet known.
   for (int64_t n1 = 2; n1 <= N; ++n1) {
-    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
+    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut,
+                    bytesEpilogueOut) > l1Limit)
       break;
     if (N % n1 != 0) continue;
     int64_t cores = 0;
