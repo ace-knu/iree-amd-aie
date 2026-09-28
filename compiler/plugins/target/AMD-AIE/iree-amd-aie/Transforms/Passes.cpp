@@ -335,7 +335,11 @@ void addGemvPassPipeline(OpPassManager &funcPassManager) {
 
   // First copy level (stands in for the first packing): A, B and C at the N
   // block. C's copy writes the forall's output slice.
-  funcPassManager.addPass(createAMDAIEInsertCopyOpsPass());
+  {
+    AMDAIEInsertCopyOpsOptions copyOptions;
+    copyOptions.stageContractionEpilogue = true;
+    funcPassManager.addPass(createAMDAIEInsertCopyOpsPass(copyOptions));
+  }
   funcPassManager.addPass(createCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 
@@ -369,6 +373,7 @@ void addGemvPassPipeline(OpPassManager &funcPassManager) {
   {
     AMDAIEInsertCopyOpsOptions copyOptions;
     copyOptions.useInitAsResultDest = true;
+    copyOptions.stageContractionEpilogue = true;
     funcPassManager.addPass(createAMDAIEInsertCopyOpsPass(copyOptions));
   }
   funcPassManager.addPass(createCanonicalizerPass());
