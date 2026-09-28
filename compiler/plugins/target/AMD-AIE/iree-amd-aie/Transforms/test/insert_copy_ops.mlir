@@ -130,3 +130,56 @@ func.func @matmul_second_copy_level(%arg0: tensor<1x64xbf16>, %arg1: tensor<32x6
        ins(%arg0, %arg1 : tensor<1x64xbf16>, tensor<32x64xbf16>) outs(%1 : tensor<1x32xf32>) -> tensor<1x32xf32>
   return %2 : tensor<1x32xf32>
 }
+
+// -----
+
+// A contraction with a fused elementwise epilogue: the epilogue reads the
+// contraction result directly (no copy of it, no promotion of the epilogue's
+// input) and writes a fresh buffer, since its payload never reads the init;
+// only the epilogue's result is copied out, to the slice the forall inserts it
+// at. With `use-init-as-result-dest` that copy goes back into the epilogue's
+// original init instead, and the contraction result is still not copied.
+// CHECK: func.func @matmul_relu_epilogue
+// CHECK:   scf.forall (%[[IV:.*]]) = (0) to (1024) step (256) shared_outs(%[[OUT:.*]] = %{{.*}})
+// CHECK:     %[[COPYA:.*]] = linalg.copy ins(%arg0 : tensor<1x64xbf16>)
+// CHECK:     %[[COPYB:.*]] = linalg.copy ins(%{{.*}} : tensor<256x64xbf16>)
+// CHECK:     %[[COPYINIT:.*]] = linalg.copy ins(%{{.*}} : tensor<1x256xf32>)
+// CHECK:     %[[MATMUL:.*]] = linalg.matmul {{.*}} ins(%[[COPYA]], %[[COPYB]] : {{.*}}) outs(%[[COPYINIT]] : tensor<1x256xf32>)
+// CHECK-NOT: linalg.copy ins(%[[MATMUL]]
+// CHECK:     %[[RELUINIT:.*]] = bufferization.alloc_tensor() : tensor<1x256xf32>
+// CHECK:     %[[EXTRACT:.*]] = tensor.extract_slice %[[OUT]][0, %[[IV]]] [1, 256] [1, 1]
+// CHECK:     %[[RELU:.*]] = linalg.generic {{.*}} ins(%[[MATMUL]] : tensor<1x256xf32>) outs(%[[RELUINIT]] : tensor<1x256xf32>)
+// CHECK:     %[[COPYOUT:.*]] = linalg.copy ins(%[[RELU]] : tensor<1x256xf32>) outs(%[[EXTRACT]] : tensor<1x256xf32>)
+// CHECK:     tensor.parallel_insert_slice %[[COPYOUT]] into %[[OUT]][0, %[[IV]]]
+// INIT-DEST: func.func @matmul_relu_epilogue
+// INIT-DEST:   %[[MATMUL:.*]] = linalg.matmul
+// INIT-DEST-NOT: linalg.copy ins(%[[MATMUL]]
+// INIT-DEST:   %[[RELUDEST:.*]] = tensor.extract_slice %{{.*}}[0, %{{.*}}] [1, 256] [1, 1] : tensor<1x1024xf32> to tensor<1x256xf32>
+// INIT-DEST:   %[[RELUINIT:.*]] = bufferization.alloc_tensor() : tensor<1x256xf32>
+// INIT-DEST:   %[[RELU:.*]] = linalg.generic {{.*}} ins(%[[MATMUL]] : tensor<1x256xf32>) outs(%[[RELUINIT]] : tensor<1x256xf32>)
+// INIT-DEST:   %[[COPYOUT:.*]] = linalg.copy ins(%[[RELU]] : tensor<1x256xf32>) outs(%[[RELUDEST]] : tensor<1x256xf32>)
+// INIT-DEST:   tensor.parallel_insert_slice %[[COPYOUT]]
+func.func @matmul_relu_epilogue(%arg0: tensor<1x64xbf16>, %arg1: tensor<1024x64xbf16>) -> tensor<1x1024xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<1x1024xf32>
+  %1 = scf.forall (%arg2) = (0) to (1024) step (256) shared_outs(%arg3 = %0) -> (tensor<1x1024xf32>) {
+    %2 = tensor.extract_slice %arg1[%arg2, 0] [256, 64] [1, 1] : tensor<1024x64xbf16> to tensor<256x64xbf16>
+    %3 = tensor.empty() : tensor<1x256xf32>
+    %4 = linalg.fill ins(%cst : f32) outs(%3 : tensor<1x256xf32>) -> tensor<1x256xf32>
+    %5 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d1, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d0, d1)>]
+         ins(%arg0, %2 : tensor<1x64xbf16>, tensor<256x64xbf16>) outs(%4 : tensor<1x256xf32>) -> tensor<1x256xf32>
+    %6 = tensor.extract_slice %arg3[0, %arg2] [1, 256] [1, 1] : tensor<1x1024xf32> to tensor<1x256xf32>
+    %7 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%5 : tensor<1x256xf32>) outs(%6 : tensor<1x256xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %8 = arith.cmpf ugt, %in, %cst : f32
+      %9 = arith.select %8, %in, %cst : f32
+      linalg.yield %9 : f32
+    } -> tensor<1x256xf32>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %7 into %arg3[0, %arg2] [1, 256] [1, 1] : tensor<1x256xf32> into tensor<1x1024xf32>
+    }
+  } {mapping = [#gpu.block<y>]}
+  return %1 : tensor<1x1024xf32>
+}

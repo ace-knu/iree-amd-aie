@@ -615,25 +615,31 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 constexpr int64_t kGemvKTile = 256;
 
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
-/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim,
-/// no fused elementwise consumer) with M == 1 (see `isGemvMExtent`).
+/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim)
+/// with M == 1 (see `isGemvMExtent`), with at most a fused *unary* elementwise
+/// consumer (e.g. ReLU) as an epilogue.
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
-  // TODO(gemv): support a fused elementwise consumer (bias add / ReLU) as an
-  // epilogue. Today such an M == 1 dispatch is rejected here and then fails in
-  // pack-peel as well ("instruction size ... does not divide M (1)"), and the
-  // Flow pad pass only matches a plain `fill -> matmul -> store` dispatch, so
-  // fusion into contraction roots must stay disabled
-  // (`--iree-dispatch-creation-no-fuse-into-contraction-conv-roots`) and the
-  // FC bias/ReLU runs as a separate host dispatch. The natural place for the
-  // epilogue is the peeled last K step of `addGemvPassPipeline`, applied to the
-  // per-core L1 C tile before its copy back to L2 (`tileElementwise` is off
-  // there for now).
+  // A fused consumer with a second operand of its own (e.g. bias add) is
+  // rejected: `setRootConfigForGemvPipeline`'s L1 budget has no term for a
+  // second, separately-DMA'd operand, unlike pack-peel's
+  // `isMatmulWithElementwiseConsumer` handling. This is not a real restriction
+  // for this pipeline's only clients today (VGG16 FC1/FC2, M == 1): their
+  // bias is folded into the contraction's K dimension regardless of any flag
+  // (`AMDAIETarget.h`'s `foldConvBiasIntoContraction` comment), so a fused
+  // ReLU -- one input, the matmul result itself -- is the only consumer shape
+  // that ever reaches here. Peeling and fusing the consumer into the last K
+  // step is otherwise identical to pack-peel: `addGemvPassPipeline` already
+  // ends in the same `addPeelAndFusePasses`, which fuses a consumer into the
+  // peeled last iteration unconditionally (`tileElementwise` is only turned
+  // off at the earlier per-K-step and per-core tiling stages, so the
+  // elementwise op is never incorrectly repeated per K step).
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
       if (isElementwise(linalgUser) &&
-          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser))
+          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser) &&
+          linalgUser.getNumDpsInputs() != 1)
         return false;
     }
   }

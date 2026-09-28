@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -125,13 +126,42 @@ LogicalResult promoteResults(IRRewriter &rewriter, Operation *op,
   return success();
 }
 
-LogicalResult promoteInputs(IRRewriter &rewriter, Operation *op) {
+/// Promotes `op`'s operands. With `onlyInits`, its inputs are left alone and
+/// an init the payload never reads gets a fresh, uninitialized buffer rather
+/// than a copy of its (dead) contents.
+LogicalResult promoteInputs(IRRewriter &rewriter, Operation *op,
+                            bool onlyInits = false) {
   OpBuilder::InsertionGuard g(rewriter);
   auto dstStyleOp = dyn_cast<DestinationStyleOpInterface>(op);
   if (!dstStyleOp) return failure();
 
   Location loc = dstStyleOp.getLoc();
   unsigned numDpsInputs = dstStyleOp.getNumDpsInputs();
+
+  if (onlyInits) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+    if (!linalgOp) return failure();
+    for (OpOperand &init : linalgOp.getDpsInitsMutable()) {
+      rewriter.setInsertionPoint(op);
+      Value replacement;
+      if (linalgOp.payloadUsesValueFromOperand(&init)) {
+        FailureOr<Value> maybeReplacement =
+            promoteValue(rewriter, loc, init.get());
+        if (failed(maybeReplacement))
+          return dstStyleOp.emitError() << "failed to promote init";
+        replacement = *maybeReplacement;
+      } else {
+        auto tensorType = dyn_cast<RankedTensorType>(init.get().getType());
+        if (!tensorType || !tensorType.hasStaticShape())
+          return dstStyleOp.emitError() << "expected a static init";
+        replacement =
+            rewriter.create<bufferization::AllocTensorOp>(loc, tensorType,
+                                                          ValueRange{});
+      }
+      init.set(replacement);
+    }
+    return success();
+  }
 
   // Promote the input operands.
   for (auto [i, operand] : llvm::enumerate(dstStyleOp.getDpsInputs())) {
@@ -182,7 +212,45 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
             linalg::ContractionOpInterface>(op))
       targetOps.push_back(op);
   });
+  // A contraction with a fused elementwise epilogue (the GEMV pipeline with a
+  // fused ReLU, say) is staged the way pack-peel's data layout propagation
+  // stages one: the epilogue reads the contraction's result where it is
+  // computed (the per-core local tile) and it is the *epilogue's* result that
+  // moves out level by level, as a standalone contraction's result would. So
+  // the contraction's result gets no copies of its own, and the epilogue's
+  // input none either; the epilogue only gets a buffer to write at each level
+  // plus the usual result copy. Promoting it like a standalone op would
+  // instead chain same-memory-space copies (L1 -> L1, which no DMA can do)
+  // around it at every level, and copy the contraction result into a slice
+  // guessed from the induction variables, since the forall inserts the
+  // epilogue's result, not the contraction's.
+  bool hasContraction = llvm::any_of(targetOps, [](Operation *op) {
+    return isa<linalg::ContractionOpInterface>(op);
+  });
+  auto isEpilogue = [&](Operation *op) {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+    return hasContraction && linalgOp && isa<linalg::GenericOp>(op) &&
+           isElementwiseWithMatmulProducer(linalgOp);
+  };
   for (Operation *targetOp : targetOps) {
+    if (isEpilogue(targetOp)) {
+      Value initDest;
+      if (useInitAsResultDest) {
+        auto dstStyleOp = cast<DestinationStyleOpInterface>(targetOp);
+        if (dstStyleOp.getNumDpsInits() != 1) {
+          targetOp->emitError("expected an epilogue with one init");
+          return signalPassFailure();
+        }
+        initDest = dstStyleOp.getDpsInits()[0];
+      }
+      if (failed(promoteInputs(rewriter, targetOp, /*onlyInits=*/true)) ||
+          failed(promoteResults(rewriter, targetOp, initDest)))
+        return signalPassFailure();
+      continue;
+    }
+    bool feedsEpilogue =
+        isa<linalg::ContractionOpInterface>(targetOp) &&
+        llvm::any_of(targetOp->getUsers(), isEpilogue);
     // Captured before the init is replaced by its promoted copy.
     Value initDest;
     if (useInitAsResultDest) {
@@ -194,6 +262,7 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
       initDest = dstStyleOp.getDpsInits()[0];
     }
     if (failed(promoteInputs(rewriter, targetOp))) return signalPassFailure();
+    if (feedsEpilogue) continue;
     if (failed(promoteResults(rewriter, targetOp, initDest)))
       return signalPassFailure();
   }
