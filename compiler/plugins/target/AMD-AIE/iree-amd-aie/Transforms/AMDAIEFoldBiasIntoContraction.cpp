@@ -400,10 +400,10 @@ static LogicalResult foldBiasIntoConv2d(RewriterBase &rewriter,
         conv, "input/filter/bias element types differ; augmenting would "
               "need a cast, not implemented");
   }
-  if (inputType.isDynamicDim(dims->inputCPos) ||
-      filterType.isDynamicDim(dims->filterCPos)) {
-    return rewriter.notifyMatchFailure(conv,
-                                       "dynamic channel dim is not supported");
+  // The augmented tensors below are built from these shapes with
+  // `tensor.empty` and no dynamic sizes, so every dim must be static.
+  if (!inputType.hasStaticShape() || !filterType.hasStaticShape()) {
+    return rewriter.notifyMatchFailure(conv, "dynamic shapes are not supported");
   }
 
   Location loc = conv.getLoc();
@@ -667,9 +667,11 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
         matmul, "lhs/rhs/bias element types differ; augmenting would need a "
                 "cast, not implemented");
   }
-  if (rhsType.isDynamicDim(*rhsKPos) || lhsType.isDynamicDim(*lhsKPos)) {
+  // The augmented tensors below are built from these shapes with
+  // `tensor.empty` and no dynamic sizes, so every dim must be static.
+  if (!lhsType.hasStaticShape() || !rhsType.hasStaticShape()) {
     return rewriter.notifyMatchFailure(matmul,
-                                       "dynamic K dim is not supported");
+                                       "dynamic shapes are not supported");
   }
 
   Location loc = matmul.getLoc();

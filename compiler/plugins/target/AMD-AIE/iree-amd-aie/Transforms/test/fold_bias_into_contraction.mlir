@@ -410,3 +410,29 @@ func.func @matmul_bias_transposed_broadcast(%lhs: tensor<128x128xf32>, %rhs: ten
                           outs(%bias_bcast : tensor<128x128xf32>) -> tensor<128x128xf32>
   return %result : tensor<128x128xf32>
 }
+
+// -----
+
+// A dynamic M dim is left alone: the augmented operands are built with
+// `tensor.empty` from static shapes only.
+
+// CHECK-LABEL: @matmul_bias_dynamic_m
+// CHECK:       linalg.generic
+// CHECK:       linalg.matmul {{.*}} tensor<?x128xf32>, tensor<128x128xf32>
+func.func @matmul_bias_dynamic_m(%lhs: tensor<?x128xf32>, %rhs: tensor<128x128xf32>,
+                                 %bias: tensor<128xf32>) -> tensor<?x128xf32> {
+  %c0 = arith.constant 0 : index
+  %m = tensor.dim %lhs, %c0 : tensor<?x128xf32>
+  %empty = tensor.empty(%m) : tensor<?x128xf32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xf32>) outs(%empty : tensor<?x128xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      linalg.yield %in : f32
+  } -> tensor<?x128xf32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<?x128xf32>, tensor<128x128xf32>)
+                          outs(%bias_bcast : tensor<?x128xf32>) -> tensor<?x128xf32>
+  return %result : tensor<?x128xf32>
+}
