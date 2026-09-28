@@ -1,0 +1,125 @@
+From 6ce189cea11892bcd433e6f0d1391ce799348014 Mon Sep 17 00:00:00 2001
+From: wjjang <woojung3516@gmail.com>
+Date: Tue, 25 Aug 2026 10:52:19 +0900
+Subject: [PATCH] Add int8 quantization support for aten.bmm (batched matmul)
+
+QuantizeOperandsPastCommutingOps and QuantizeAccumulator already existed
+for AtenMmOp/AtenMatmulOp but had no AtenBmmOp counterpart, so ONNX's
+batched MatMul (which imports to aten.bmm, not aten.matmul) silently
+skipped quantization entirely -- FuseQuantizedOpsPass had no pattern for
+it, and ConvertAtenBmmOp never checked for zero-points, always building a
+plain float linalg.BatchMatmulOp.
+
+FuseQuantizedOps.cpp: add QuantizeOperandsPastCommutingOps<AtenBmmOp, 2>
+(input-side fusion) and QuantizeAccumulator<AtenBmmOp> (output-side
+rescaling -- without this the result stayed declared as f32, so
+convertTensorToElementType did a naive sitofp instead of a scaled
+dequantize, saturating almost every element).
+
+Linear.cpp: extend ConvertAtenBmmOp::matchAndRewrite with zero-point
+detection and quantized batch matmul construction (linalg::
+QuantizedBatchMatmulOp), mirroring ConvertAtenMatmulOp's existing
+maxRank==3 branch.
+
+Verified: CPU backend and npu4 (vectorization off) both give corr 0.9998
+against an fp32 reference for a batch=2 int8 batch matmul. See
+iree-amd-aie-vgg16's docs/2026-08-24_int8_quantization_investigation.md
+for the full verification writeup.
+---
+ lib/Conversion/TorchToLinalg/Linear.cpp       | 64 +++++++++++++++++++
+ .../Torch/Transforms/FuseQuantizedOps.cpp     |  2 +
+ 2 files changed, 66 insertions(+)
+
+diff --git a/lib/Conversion/TorchToLinalg/Linear.cpp b/lib/Conversion/TorchToLinalg/Linear.cpp
+index d7d958bb..04cfb9f4 100644
+--- a/lib/Conversion/TorchToLinalg/Linear.cpp
++++ b/lib/Conversion/TorchToLinalg/Linear.cpp
+@@ -717,6 +717,70 @@ public:
+           op, "expected both operands to aten.bmm to be rank 3");
+     }
+ 
++    Value lhsZeroPoint, rhsZeroPoint;
++    getZeroPoint(op.getSelf(), lhsZeroPoint);
++    getZeroPoint(op.getMat2(), rhsZeroPoint);
++    if (static_cast<bool>(lhsZeroPoint) != static_cast<bool>(rhsZeroPoint)) {
++      return rewriter.notifyMatchFailure(
++          op, "unsupported: aten.bmm with mixed quantization");
++    }
++
++    if (lhsZeroPoint) {
++      // Quantized case: build linalg.quantized_batch_matmul, mirroring the
++      // maxRank==3 branch of ConvertAtenMatmulOp above. aten.bmm's rank-3
++      // operands never need the broadcasting/collapsing logic that path
++      // handles for the general (possibly-broadcasting) aten.matmul case.
++      bool isUnsigned = torch_to_linalg::isUnsignedTorchType(
++          cast<ValueTensorType>(op.getSelf().getType()));
++      bool isUnsignedR = torch_to_linalg::isUnsignedTorchType(
++          cast<ValueTensorType>(op.getMat2().getType()));
++      lhsZeroPoint = typeConverter->materializeTargetConversion(
++          rewriter, loc,
++          getTypeConverter()->convertType(lhsZeroPoint.getType()),
++          lhsZeroPoint);
++      rhsZeroPoint = typeConverter->materializeTargetConversion(
++          rewriter, loc,
++          getTypeConverter()->convertType(rhsZeroPoint.getType()),
++          rhsZeroPoint);
++      lhsZeroPoint = arith::TruncIOp::create(
++          rewriter, loc, rewriter.getI32Type(), lhsZeroPoint);
++      rhsZeroPoint = arith::TruncIOp::create(
++          rewriter, loc, rewriter.getI32Type(), rhsZeroPoint);
++
++      // change uint8 quantization -> int8 quantization
++      int64_t numBits =
++          cast<mlir::IntegerType>(lhsType.getElementType()).getWidth();
++      signShift(rewriter, loc, lhs, lhsZeroPoint, isUnsigned, numBits);
++      numBits = cast<mlir::IntegerType>(rhsType.getElementType()).getWidth();
++      signShift(rewriter, loc, rhs, rhsZeroPoint, isUnsignedR, numBits);
++
++      Value lhsDim0 = getDimOp(rewriter, loc, lhs, 0);
++      Value lhsDim1 = getDimOp(rewriter, loc, lhs, 1);
++      Value lhsDim2 = getDimOp(rewriter, loc, lhs, 2);
++      Value rhsDim0 = getDimOp(rewriter, loc, rhs, 0);
++      Value rhsDim1 = getDimOp(rewriter, loc, rhs, 1);
++      Value rhsDim2 = getDimOp(rewriter, loc, rhs, 2);
++      checkDimEqualHelper(rewriter, loc, lhsDim0, rhsDim0);
++      checkDimEqualHelper(rewriter, loc, lhsDim2, rhsDim1);
++
++      Type accumulatorDType =
++          getDefaultAccType(rewriter, lhsType.getElementType());
++      Value initTensor0 = createZeroInitTensor(
++          rewriter, loc, ValueRange{lhsDim0, lhsDim1, rhsDim2},
++          accumulatorDType);
++      Value bmm = linalg::QuantizedBatchMatmulOp::create(
++                      rewriter, loc, initTensor0.getType(),
++                      ValueRange{lhs, rhs, lhsZeroPoint, rhsZeroPoint},
++                      initTensor0)
++                      .getResult(0);
++      if (accumulatorDType != resultElementType) {
++        bmm = torch_to_linalg::convertTensorToElementType(rewriter, loc, bmm,
++                                                           resultElementType);
++      }
++      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, bmm);
++      return success();
++    }
++
+     // Convert the inputs element type equivalent to the result' element type.
+     if (lhsElementType != rhsElementType) {
+       if (lhsElementType != resultElementType) {
+diff --git a/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp b/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
+index 4b04151f..525c6675 100644
+--- a/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
++++ b/lib/Dialect/Torch/Transforms/FuseQuantizedOps.cpp
+@@ -460,8 +460,10 @@ public:
+         QuantizeOperandsPastCommutingOps<AtenConvolutionOp, 5>,
+         QuantizeOperandsPastCommutingOps<AtenReluOp, 0>,
+         QuantizeOperandsPastCommutingOps<AtenMatmulOp, 2>,
++        QuantizeOperandsPastCommutingOps<AtenBmmOp, 2>,
+         QuantizeOperandsPastCommutingOps<AtenMmOp, 4>,
+         QuantizeAccumulator<AtenMmOp>, QuantizeAccumulator<AtenMatmulOp>,
++        QuantizeAccumulator<AtenBmmOp>,
+         QuantizeResultLikeOperand<AtenReluOp>, QuantizeBias<AtenConvolutionOp>>(
+         context);
+ 
+-- 
+2.43.0
+
