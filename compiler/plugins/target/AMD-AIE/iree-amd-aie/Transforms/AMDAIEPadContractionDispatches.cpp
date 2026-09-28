@@ -543,6 +543,47 @@ static int firstFreeHelperIndex(ModuleOp module) {
   return next;
 }
 
+/// High-pads the 2-D bias-fold LHS `src` to `dstType`, writing 1.0 at K index
+/// `k` (the first padded position along `kDim`) of every real row and 0.0
+/// everywhere else.
+///
+/// Only that one column has to be 1.0 -- it is what contracts against the
+/// folded weight's bias row. Everything else must be 0.0 even though any value
+/// would be exact (the folded weight's rows past `k` are +0.0, and padded rows
+/// only produce output rows that are cropped away): the AIE core's scalar
+/// matmul runs measurably faster on zero operands, and the M padding all lands
+/// on one core row, which then bounds the whole dispatch. Filling the padding
+/// with 1.0 made VGG16's conv11~13 (196x512x4608, 28 padded rows) 27~33%
+/// slower.
+///
+/// Built as two chained constant-value `tensor.pad`s -- first the ones column,
+/// then zeros for the rest -- rather than one pad or a second write op:
+///  - zero-padding and then writing the column with a second op is not
+///    distributed by the CPU backend (it picks one root, leaves the other write
+///    untiled, and rejects it with "write affecting operations on global
+///    resources are restricted to workgroup distributed contexts");
+///  - a single `tensor.pad` whose body picks the value per index crashes the
+///    CPU backend's `foldPadIntoMapStore`, which assumes a constant padding
+///    value without checking.
+static Value createBiasOnesPad(OpBuilder &b, Location loc,
+                               RankedTensorType dstType, Value src,
+                               unsigned kDim) {
+  auto srcType = cast<RankedTensorType>(src.getType());
+  assert(srcType.getRank() == 2 && kDim < 2 && "bias-fold LHS is 2-D");
+  Type elemType = srcType.getElementType();
+  SmallVector<int64_t> onesShape(srcType.getShape());
+  ++onesShape[kDim];
+  Value withOnes = tensor::createPadHighOp(
+      RankedTensorType::get(onesShape, elemType), src,
+      b.create<arith::ConstantOp>(loc, b.getFloatAttr(elemType, 1.0)),
+      /*nofold=*/false, loc, b);
+  if (ArrayRef<int64_t>(onesShape) == dstType.getShape()) return withOnes;
+  return tensor::createPadHighOp(
+      dstType, withOnes,
+      b.create<arith::ConstantOp>(loc, b.getZeroAttr(elemType)),
+      /*nofold=*/false, loc, b);
+}
+
 /// Creates a `flow.executable` + `flow.dispatch` that pads `v` up to
 /// `dstShape` (high padding via `tensor.pad`), placed on `hostAffinity`. Returns
 /// the padded value, or `v` unchanged if `dstShape` already matches. A dispatch
@@ -552,25 +593,17 @@ static int firstFreeHelperIndex(ModuleOp module) {
 /// `padValue`, when set, is the constant to pad with instead of 0 (the pooling
 /// pass passes its dispatch's init fill value, -inf for max).
 ///
-/// `onesPad` pads with 1.0 instead of 0.0, for the LHS of a contraction whose
-/// bias has been folded into K (see the "Accumulator-bias K-column fold"
-/// section): the ones the fold contracts against sit at K index `k`, which is
-/// the first padded column. The remaining padded columns are 1.0 too rather
-/// than 0.0, which is exact rather than merely close -- the folded weight's
-/// rows past `k` are +0.0, and 1.0 * 0.0 == 0.0 -- and it keeps this dispatch
-/// a bare `tensor.pad`, the one shape the host backend reliably distributes.
-/// (Padding with zeros and then writing the ones column with a second op does
-/// not: the CPU backend picks one root, leaves the other write untiled, and
-/// rejects it with "write affecting operations on global resources are
-/// restricted to workgroup distributed contexts".) Padded *rows* likewise
-/// become 1.0, which is equally immaterial: the grown output rows they produce
-/// are cropped away. Requires a float element type, which is the bias fold's
-/// own precondition and is checked before it decides to fold.
+/// `onesKDim`, when set, marks `v` as the LHS of a contraction whose bias has
+/// been folded into K (see the "Accumulator-bias K-column fold" section) and
+/// names its K dim: the padding then carries the ones the fold contracts
+/// against (see `createBiasOnesPad`) instead of being all zero. Requires a
+/// float element type, which is the bias fold's own precondition and is
+/// checked before it decides to fold.
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
                                    Value v, ArrayRef<int64_t> dstShape,
                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
                                    int &counter, TypedAttr padValue = nullptr,
-                                   bool onesPad = false) {
+                                   std::optional<unsigned> onesKDim = {}) {
   Location loc = v.getLoc();
   auto srcType = cast<RankedTensorType>(v.getType());
   if (dstShape == srcType.getShape()) return v;
@@ -580,7 +613,7 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   auto outBinding = IREE::TensorExt::DispatchTensorType::get(
       IREE::TensorExt::TensorAccess::WriteOnly, dstType);
   std::string idx = std::to_string(counter++);
-  std::string prefix = onesPad ? "pad_ones" : "pad";
+  std::string prefix = onesKDim ? "pad_ones" : "pad";
 
   // Worker func: load the full input, high-pad it, store.
   auto funcOp = func::FuncOp::create(
@@ -590,14 +623,17 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   Block *entry = funcOp.addEntryBlock();
   OpBuilder fb = OpBuilder::atBlockBegin(entry);
   Type elemType = srcType.getElementType();
-  TypedAttr fillAttr = onesPad ? cast<TypedAttr>(fb.getFloatAttr(elemType, 1.0))
-                     : padValue ? padValue
-                                : cast<TypedAttr>(fb.getZeroAttr(elemType));
-  Value padScalar = fb.create<arith::ConstantOp>(loc, fillAttr);
   Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
-  Value padded = tensor::createPadHighOp(dstType, loaded, padScalar,
-                                         /*nofold=*/false, loc, fb);
+  Value padded =
+      onesKDim
+          ? createBiasOnesPad(fb, loc, dstType, loaded, *onesKDim)
+          : tensor::createPadHighOp(
+                dstType, loaded,
+                fb.create<arith::ConstantOp>(
+                    loc, padValue ? padValue
+                                  : cast<TypedAttr>(fb.getZeroAttr(elemType))),
+                /*nofold=*/false, loc, fb);
   fb.create<IREE::TensorExt::DispatchTensorStoreOp>(
       loc, padded, entry->getArgument(1), /*targetDynamicDims=*/ValueRange{});
   fb.create<func::ReturnOp>(loc);
@@ -667,7 +703,7 @@ static std::optional<SmallVector<ReassociationIndices>> collapseTo2D(
 /// `tensor.pad` fuses into the producer generic -- it is a consumer of the
 /// dispatch's existing root, not a second root -- which is exactly why this
 /// shape compiles where "pad, then write the ones column with a second op"
-/// does not (see `createPaddingDispatch`'s `onesPad` comment).
+/// does not (see `createBiasOnesPad`'s comment).
 ///
 /// Deliberately narrow. The producer must be a host dispatch with one caller,
 /// one result, one use, and a single full-tensor store, so that nothing else
@@ -675,7 +711,8 @@ static std::optional<SmallVector<ReassociationIndices>> collapseTo2D(
 /// padding dispatch, which is always correct, just slower.
 static Value growProducerDispatchToPadded(
     IRRewriter &rewriter, ModuleOp module, Value v, ArrayRef<int64_t> dstShape,
-    bool onesPad, IREE::HAL::DeviceAffinityAttr hostAffinity) {
+    std::optional<unsigned> onesKDim,
+    IREE::HAL::DeviceAffinityAttr hostAffinity) {
   auto srcType = cast<RankedTensorType>(v.getType());
   Type elemType = srcType.getElementType();
   if (!isa<FloatType>(elemType)) return {};
@@ -736,11 +773,14 @@ static Value growProducerDispatchToPadded(
                    ? store.getValue()
                    : rewriter.create<tensor::CollapseShapeOp>(
                          loc, store.getValue(), *reassoc).getResult();
-  Value padScalar = rewriter.create<arith::ConstantOp>(
-      loc, onesPad ? cast<TypedAttr>(rewriter.getFloatAttr(elemType, 1.0))
-                   : cast<TypedAttr>(rewriter.getZeroAttr(elemType)));
-  Value padded = tensor::createPadHighOp(dstType, flat, padScalar,
-                                         /*nofold=*/false, loc, rewriter);
+  Value padded =
+      onesKDim
+          ? createBiasOnesPad(rewriter, loc, dstType, flat, *onesKDim)
+          : tensor::createPadHighOp(
+                dstType, flat,
+                rewriter.create<arith::ConstantOp>(
+                    loc, rewriter.getZeroAttr(elemType)),
+                /*nofold=*/false, loc, rewriter);
   outArg.setType(IREE::TensorExt::DispatchTensorType::get(
       IREE::TensorExt::TensorAccess::WriteOnly, dstType));
   rewriter.create<IREE::TensorExt::DispatchTensorStoreOp>(
@@ -1366,14 +1406,15 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // write + read + wider re-write into a single write.
     Value lhsPadded = growProducerDispatchToPadded(
         rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
-        /*onesPad=*/biasAttr != nullptr, hostAffinity);
+        biasAttr ? std::optional<unsigned>(lhsKPos) : std::nullopt,
+        hostAffinity);
     if (!lhsPadded) {
       rewriter.setInsertionPoint(dispatch);
       lhsPadded =
           biasAttr ? createPaddingDispatch(
                          rewriter, module, dispatch.getArguments()[lhsArgNo],
                          lhsPad, hostAffinity, counter, /*padValue=*/nullptr,
-                         /*onesPad=*/true)
+                         lhsKPos)
                    : createPaddingDispatchOrConstant(
                          rewriter, module, dispatch.getArguments()[lhsArgNo],
                          lhsPad, hostAffinity, counter);

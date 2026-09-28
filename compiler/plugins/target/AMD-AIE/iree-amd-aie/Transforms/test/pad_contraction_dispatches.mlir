@@ -1274,11 +1274,18 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         %[[FILL:.+]] = linalg.fill
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<32x32xbf16>, tensor<32x64xbf16>) outs(%[[FILL]] : tensor<32x64xf32>)
 
-// The LHS padding dispatch pads with 1.0, not 0.0.
+// The LHS padding dispatch writes 1.0 only at K index 3 (a 1.0 pad of one
+// column) and 0.0 everywhere else (a second, zero pad): a zero operand is
+// faster on the AIE core's scalar matmul.
 // CHECK-LABEL: func.func @pad_ones_dispatch_
 // CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 29]
+// CHECK:         %[[P1:.+]] = tensor.pad %{{.+}} low[0, 0] high[0, 1]
 // CHECK:           tensor.yield %[[ONE]]
+// CHECK:         } : tensor<32x3xbf16> to tensor<32x4xbf16>
+// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
+// CHECK:         tensor.pad %[[P1]] low[0, 0] high[0, 28]
+// CHECK:           tensor.yield %[[ZERO]]
+// CHECK:         } : tensor<32x4xbf16> to tensor<32x32xbf16>
 
 // CHECK-LABEL: util.func public @main_biasfold
 // CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_ones_executable_{{[0-9]+}}::@pad_ones_dispatch_{{[0-9]+}}(%arg0)
@@ -1389,8 +1396,9 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // The LHS is produced by a host dispatch (im2col + bf16 truncation, reshaped to
 // the 2-D matmul operand) that nothing else reads, so the padding is folded
 // into that dispatch instead of being added behind it: its output binding grows
-// to the padded shape and the `tensor.pad` -- with the bias fold's 1.0, since
-// the bias is folded here too -- becomes a consumer of its existing root. No
+// to the padded shape and the `tensor.pad` -- with the bias fold's ones
+// column, since the bias is folded here too -- becomes a consumer of its
+// existing root. No
 // separate padding dispatch is created, and the intervening
 // `flow.tensor.reshape` is absorbed as a `tensor.collapse_shape`.
 //
@@ -1403,8 +1411,11 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         %[[C:.+]] = tensor.collapse_shape %[[G]] {{\[}}[0], [1, 2]{{\]}}
 // CHECK-SAME:      : tensor<32x3x1xbf16> into tensor<32x3xbf16>
 // CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
-// CHECK:         %[[P:.+]] = tensor.pad %[[C]] low[0, 0] high[0, 29]
+// CHECK:         %[[P1:.+]] = tensor.pad %[[C]] low[0, 0] high[0, 1]
 // CHECK:           tensor.yield %[[ONE]]
+// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
+// CHECK:         %[[P:.+]] = tensor.pad %[[P1]] low[0, 0] high[0, 28]
+// CHECK:           tensor.yield %[[ZERO]]
 // CHECK:         iree_tensor_ext.dispatch.tensor.store %[[P]], %arg1
 
 // CHECK-LABEL: util.func public @main_grown
