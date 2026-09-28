@@ -16,6 +16,8 @@
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include <numeric>
+
 #define DEBUG_TYPE "kernel-dispatch"
 
 namespace mlir::iree_compiler::AMDAIE {
@@ -673,8 +675,16 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
 
   // K tile, and the core memory taken by double-buffered A, B and C tiles for
-  // a given per-core N tile.
-  int64_t kTile = findLargestFactor(K, kGemvKTile);
+  // a given per-core N tile. The tile must keep the per-core A/B slices'
+  // byte length a multiple of 4 (`aie.dma_bd`'s transfer-length constraint);
+  // otherwise a K with only an odd large prime factor (e.g. 25216 = 2^7*197)
+  // picks that odd factor as the tile.
+  auto bytesToAlign = [](int64_t bytes) {
+    return 4 / std::gcd<int64_t>(bytes, 4);
+  };
+  int64_t kAlign =
+      std::lcm<int64_t>(bytesToAlign(nBytesLhs), bytesToAlign(nBytesRhs));
+  int64_t kTile = findLargestFactor(K, kGemvKTile, kAlign);
   int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
   auto l1Bytes = [&](int64_t n1) {
     return 2 * (M * kTile * nBytesLhs + n1 * kTile * nBytesRhs +
