@@ -15,6 +15,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 
@@ -153,6 +154,19 @@ LogicalResult distributeWholeBufferInitPack(
   scf::ForallOp forallOp =
       findEarliestCoreForallOp(oldAlloc, coreForallOps, packOp);
   if (!forallOp) return failure();
+  // The hoisted pack must run exactly once, after `packOp`'s position and
+  // before any accumulation into `newAlloc`. That holds only if nothing
+  // between `forallOp` and `packOp`'s block repeats it -- e.g. without K-loop
+  // peeling the earliest compute forall is inside the reduction `scf.for`,
+  // and packing the init there would overwrite the partial sums on every K
+  // step, silently. Reject any enclosing loop `packOp` is not itself in, and
+  // an anchor that runs before `packOp`.
+  Operation *forallAnchor = forallOp;
+  while (forallAnchor->getBlock() != packOp->getBlock()) {
+    forallAnchor = forallAnchor->getParentOp();
+    if (isa<LoopLikeOpInterface>(forallAnchor)) return failure();
+  }
+  if (!packOp->isBeforeInBlock(forallAnchor)) return failure();
   // `getInductionVars()` returns a SmallVector by value; a `ValueRange` bound
   // to it would dangle as soon as this statement ends.
   SmallVector<Value> ivs = forallOp.getInductionVars();
@@ -248,8 +262,13 @@ LogicalResult distributeLocalMemory(ModuleOp moduleOp) {
   }
   IRRewriter rewriter(moduleOp.getContext());
 
-  auto allocWalkResult = moduleOp->walk([&](memref::AllocOp oldAlloc)
-                                            -> WalkResult {
+  // Collected up front rather than rewritten from inside the walk: a user
+  // rewrite may erase ops (`distributeWholeBufferInitPack` erases the pack),
+  // and erasing the op right after `oldAlloc` -- which the walk has already
+  // captured as the next one to visit -- is a use-after-free.
+  SmallVector<memref::AllocOp> allocs;
+  moduleOp->walk([&](memref::AllocOp alloc) { allocs.push_back(alloc); });
+  auto distributeAlloc = [&](memref::AllocOp oldAlloc) -> WalkResult {
     // Only consider local memory (L1).
     Attribute maybeMemorySpace = oldAlloc.getType().getMemorySpace();
     if (!maybeMemorySpace) return WalkResult::advance();
@@ -357,9 +376,9 @@ LogicalResult distributeLocalMemory(ModuleOp moduleOp) {
     }
 
     return WalkResult::advance();
-  });
-
-  if (allocWalkResult.wasInterrupted()) return failure();
+  };
+  for (memref::AllocOp oldAlloc : allocs)
+    if (distributeAlloc(oldAlloc).wasInterrupted()) return failure();
 
   return success();
 }
