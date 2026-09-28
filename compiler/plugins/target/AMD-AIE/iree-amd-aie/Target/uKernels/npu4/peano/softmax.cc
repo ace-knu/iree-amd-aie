@@ -172,6 +172,9 @@ inline void softmax_i8_impl(int8 *restrict in, int8 *restrict out, int32_t n,
   v32bfloat16 inv_sum_v = broadcast_to_v32bfloat16(inv_sum);
   const v16accfloat half16 = broadcast_to_v16accfloat(0.5f);
   const v32accfloat half_acc = concat(half16, half16);
+  // The int8 range, as bf16 (both exact). See the clamp below.
+  const v32bfloat16 lo_v = broadcast_to_v32bfloat16((bfloat16)-128.0f);
+  const v32bfloat16 hi_v = broadcast_to_v32bfloat16((bfloat16)127.0f);
   {
     const v32bfloat16 *restrict pIn = (const v32bfloat16 *)e_row;
     v32int8 *restrict pOut = (v32int8 *)out;
@@ -182,10 +185,15 @@ inline void softmax_i8_impl(int8 *restrict in, int8 *restrict out, int32_t n,
       // below rounds to nearest.
       v32bfloat16 scaled = to_v32bfloat16(
           mac_elem_32(p, /*sgn_x=*/1, outScale_v, /*sgn_y=*/1, half_acc));
+      // Clamp before the narrowing: `ssrs` only saturates when the core's
+      // saturation mode is on, and it is off by default, so an out-of-range
+      // value wraps. Here that happens whenever the output scale was calibrated
+      // on probabilities below 1 (1 / s_out > 127.5, true in 6 of BERT's 12
+      // layers): a probability near 1 lands above 127 and came out as a large
+      // negative value instead (131 -> -125). The same clamp as layernorm.cc.
+      scaled = min(max(scaled, lo_v), hi_v);
       v16int32 lo = bfloat16_to_int(extract_v16bfloat16(scaled, 0), 0);
       v16int32 hi = bfloat16_to_int(extract_v16bfloat16(scaled, 1), 0);
-      // `ssrs` saturates into int8, which is exactly the clamp the float form
-      // spells out.
       *pOut++ = ssrs((v32acc32)concat(lo, hi), 0, 0);
     }
   }

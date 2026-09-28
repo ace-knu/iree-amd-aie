@@ -196,6 +196,9 @@ inline void layernorm_impl(InT *restrict inBase, int8 *restrict outBase,
   const v32bfloat16 rstd_v = broadcast_to_v32bfloat16((bfloat16)rstd);
   const v16accfloat half16 = broadcast_to_v16accfloat(0.5f);
   const v32accfloat half_acc = concat(half16, half16);
+  // The int8 range, as bf16 (both exact). See the clamp below.
+  const v32bfloat16 lo_v = broadcast_to_v32bfloat16((bfloat16)-128.0f);
+  const v32bfloat16 hi_v = broadcast_to_v32bfloat16((bfloat16)127.0f);
   {
     const v32bfloat16 *restrict pGamma = (const v32bfloat16 *)gammaBeta;
     const v32bfloat16 *restrict pBeta = (const v32bfloat16 *)(gammaBeta + n);
@@ -220,10 +223,16 @@ inline void layernorm_impl(InT *restrict inBase, int8 *restrict outBase,
                                   ups(*pBeta++));
       // Bias by half so the floor below rounds to nearest, for both signs.
       v32bfloat16 biased = to_v32bfloat16(add(y, half_acc));
+      // Clamp here, before the narrowing: `ssrs` only saturates when the core's
+      // saturation mode is on, and it is off by default, so an out-of-range
+      // value wraps instead (BERT layer 5's [CLS] outlier feature, about -132,
+      // came out as +124). Turning the mode on for the kernel is not an option
+      // -- it changes the bf16 conversions above as well. Clamping the biased
+      // value to [-128, 127] leaves the floor giving -128..127 exactly, which
+      // is the clamp the float form spells out.
+      biased = min(max(biased, lo_v), hi_v);
       v16int32 lo = bfloat16_to_int(extract_v16bfloat16(biased, 0), 0);
       v16int32 hi = bfloat16_to_int(extract_v16bfloat16(biased, 1), 0);
-      // `ssrs` saturates into int8, which is the clamp the float form spells
-      // out.
       *pOut++ = ssrs((v32acc32)concat(lo, hi), 0, 0);
     }
   }
