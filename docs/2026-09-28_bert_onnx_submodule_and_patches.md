@@ -86,4 +86,5 @@ git submodule update --init --recursive     # third_party/iree → 4067842 (IREE
   것이었습니다. 이제 정확히 같은 결과를 내는 정수 표현을 더 넓게 찾고(`798bbc4`), 기본값으로는
   실행 안전 조건만 보고 정수화합니다(`d4aadc9`, 12 층 출력 바이트 동일 확인). 이전 동작은
   `--iree-amdaie-force-integer-requantization=false`.
-- 모델 준비 스크립트(i8 경계 추출, 범용 K축 bias 접기, head split)는 정리 전이라 브랜치에 없습니다.
+- ~~모델 준비 스크립트~~ → **같은 날 추가됨**: `models/bert_base/prepare_encoder12_i8.sh` 한 번으로 fp32
+  `bert_base.onnx` 에서 12 층 int8 인코더까지 만듭니다. 사용법은 `models/bert_base/README.md` §6.

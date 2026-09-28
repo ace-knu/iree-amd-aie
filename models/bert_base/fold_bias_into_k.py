@@ -42,6 +42,13 @@ def parse_args():
     )
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--align", type=int, default=64)
+    parser.add_argument(
+        "--pad-rank3", action="store_true",
+        help=("pad the [1, S, K] activation's last axis directly instead of "
+              "flattening it to [S, K] around the Pad. This is the form the "
+              "12-layer encoder was validated with (prepare_encoder12_i8.sh); "
+              "it also names its tensors kpad_* so that "
+              "fold_bias_into_k_general.py, which uses kfold_*, can run after it."))
     return parser.parse_args()
 
 
@@ -121,6 +128,7 @@ def main():
         raise ValueError(f"no eligible MatMul+bias nodes found for: {args.include}")
     print(f"selected {selected} MatMul+bias nodes in {len(groups)} activation groups")
 
+    prefix = "kpad" if args.pad_rank3 else "kfold"
     new_nodes, added_initializers, rewires, dropped = [], [], {}, set()
     seen_constants = set()
     max_error = 0.0
@@ -129,44 +137,59 @@ def main():
         columns = max(args.align, int(np.ceil(np.ceil(max_units / 127) / args.align) * args.align))
         weight = np.asarray(initializers[records[0]["w_dq"].input[0]])
         k = weight.shape[0]
-        pads_name = f"kfold_pads_{columns}"
-        one_name = "kfold_one_i8"
-        shape_2d_name = f"kfold_shape2_{k}"
-        shape_3d_name = f"kfold_shape3_{group_id}"
-        for name, value in (
-            (pads_name, np.array([0, 0, 0, columns], dtype=np.int64)),
-            (one_name, np.array(1, dtype=np.int8)),
-            (shape_2d_name, np.array([-1, k], dtype=np.int64)),
-        ):
-            if name not in seen_constants:
-                added_initializers.append(nh.from_array(value, name))
-                seen_constants.add(name)
-        added_initializers.append(nh.from_array(
-            np.array([1, args.sequence_length, k + columns], dtype=np.int64), shape_3d_name))
-        x2, xp2, x_aug = (f"kfold_x2_{group_id}", f"kfold_xp2_{group_id}", f"kfold_x_{group_id}")
-        new_nodes.extend([
-            helper.make_node("Reshape", [x_i8, shape_2d_name], [x2], name=f"kfold_reshape2_{group_id}"),
-            helper.make_node("Pad", [x2, pads_name, one_name], [xp2], mode="constant", name=f"kfold_pad_{group_id}"),
-            helper.make_node("Reshape", [xp2, shape_3d_name], [x_aug], name=f"kfold_reshape3_{group_id}"),
-        ])
+        pads_name = f"{prefix}_pads_{columns}"
+        one_name = f"{prefix}_one_i8"
+        shape_2d_name = f"{prefix}_shape2_{k}"
+        shape_3d_name = f"{prefix}_shape3_{group_id}"
+        if args.pad_rank3:
+            # [1, S, K] -> [1, S, K + columns] in one Pad on the last axis.
+            pads_name = f"{prefix}_pads3_{columns}"
+            x_aug = f"{prefix}_x_{group_id}"
+            for name, value in (
+                (pads_name, np.array([0, 0, 0, 0, 0, columns], dtype=np.int64)),
+                (one_name, np.array(1, dtype=np.int8)),
+            ):
+                if name not in seen_constants:
+                    added_initializers.append(nh.from_array(value, name))
+                    seen_constants.add(name)
+            new_nodes.append(helper.make_node(
+                "Pad", [x_i8, pads_name, one_name], [x_aug], mode="constant",
+                name=f"{prefix}_pad_{group_id}"))
+        else:
+            for name, value in (
+                (pads_name, np.array([0, 0, 0, columns], dtype=np.int64)),
+                (one_name, np.array(1, dtype=np.int8)),
+                (shape_2d_name, np.array([-1, k], dtype=np.int64)),
+            ):
+                if name not in seen_constants:
+                    added_initializers.append(nh.from_array(value, name))
+                    seen_constants.add(name)
+            added_initializers.append(nh.from_array(
+                np.array([1, args.sequence_length, k + columns], dtype=np.int64), shape_3d_name))
+            x2, xp2, x_aug = (f"{prefix}_x2_{group_id}", f"{prefix}_xp2_{group_id}", f"{prefix}_x_{group_id}")
+            new_nodes.extend([
+                helper.make_node("Reshape", [x_i8, shape_2d_name], [x2], name=f"{prefix}_reshape2_{group_id}"),
+                helper.make_node("Pad", [x2, pads_name, one_name], [xp2], mode="constant", name=f"{prefix}_pad_{group_id}"),
+                helper.make_node("Reshape", [xp2, shape_3d_name], [x_aug], name=f"{prefix}_reshape3_{group_id}"),
+            ])
         x_aug_dq = f"{x_aug}_dq"
         new_nodes.append(helper.make_node(
             "DequantizeLinear", [x_aug] + list(records[0]["x_dq"].input[1:]), [x_aug_dq],
-            name=f"kfold_xdq_{group_id}"))
+            name=f"{prefix}_xdq_{group_id}"))
         for record in records:
             quantized_bias = np.rint(record["bias_units"])
             max_error = max(max_error, float(np.abs(record["bias_units"] - quantized_bias).max()))
             extension = split_int8(quantized_bias, columns)
             old_weight = np.asarray(initializers[record["w_dq"].input[0]])
-            new_weight_name = f"kfold_weight_{group_id}_{record['tag']}"
+            new_weight_name = f"{prefix}_weight_{group_id}_{record['tag']}"
             added_initializers.append(nh.from_array(np.concatenate([old_weight, extension], axis=0), new_weight_name))
             weight_dq = f"{new_weight_name}_dq"
-            matmul_output = f"kfold_matmul_{new_weight_name}"
+            matmul_output = f"{prefix}_matmul_{new_weight_name}"
             new_nodes.append(helper.make_node(
                 "DequantizeLinear", [new_weight_name] + list(record["w_dq"].input[1:]), [weight_dq],
-                name=f"kfold_wdq_{new_weight_name}"))
+                name=f"{prefix}_wdq_{new_weight_name}"))
             new_nodes.append(helper.make_node(
-                "MatMul", [x_aug_dq, weight_dq], [matmul_output], name=f"kfold_matmul_{new_weight_name}"))
+                "MatMul", [x_aug_dq, weight_dq], [matmul_output], name=f"{prefix}_matmul_{new_weight_name}"))
             for node in (record["matmul"], record["quant"], record["dequant"], record["add"], record["w_dq"]):
                 dropped.add(id(node))
             rewires[record["add"].output[0]] = matmul_output

@@ -169,3 +169,63 @@ actually gives correct, reproducible answers. `bert_mlm.onnx`/`.vmfb` (the
 full, compiles-and-runs-but-wrong version) are left in place as a known-bad
 reference for whoever wants to root-cause the non-determinism, not as
 something to build a demo on.
+
+## 6. int8 12-layer encoder with softmax / LayerNorm / GELU on the NPU
+
+§2 runs bert-base in bf16 with only the matmuls on the NPU. This section builds
+the **int8** encoder that also puts softmax, LayerNorm and GELU on the NPU:
+176 dispatches, **123 on the NPU / 53 on the CPU**.
+
+### 6.1 Build the model
+
+```bash
+PYTHONPATH=<deps with onnx, onnxruntime, ml_dtypes> \
+  models/bert_base/prepare_encoder12_i8.sh models/bert_base/bert_base.onnx models/bert_base/out
+```
+
+It chains five steps, each also usable alone:
+
+| Step | Script | What it does |
+|---|---|---|
+| 1 | `quantize_bert_base.py` | per-tensor int8 QDQ on the 96 MatMuls (fixed-seed calibration) |
+| 2 | `fold_bias_into_k.py --pad-rank3` | folds the Q/K/V biases into K, so each projection is a 2-input matmul |
+| 3 | `extract_encoder_i8.py` | keeps only the encoder: int8 `[1,32,768]` in, f32 `[1,32,768]` out |
+| 4 | `fold_bias_into_k_general.py` | folds the output-projection / FC1 / FC2 biases into K where they fit (`--align 64`) |
+| 5 | `head_split.py --k` | per-head Q/K/V weights; K's transpose is left on int8 so IREE folds it into QK^T |
+
+Why the folds: a bias makes a matmul dispatch a 3-input one, and a third input
+forces a DMA pattern that hangs on hardware. Folding it into K keeps two inputs.
+Why head split: it removes the per-head transposes that would otherwise be CPU
+dispatches (36 of them).
+
+Checked 2026-09-28 by running the script from `bert_base.onnx` with
+onnxruntime 1.29.0: step 1 is byte-identical to the reference model, and the
+final model gives byte-identical ORT output, the same 176-dispatch placement,
+and the same NPU output hashes as the build the repo's docs report on.
+
+### 6.2 Compile and run
+
+Needs `third_party/iree` at this branch's pointer and
+`patches/third_party/apply.sh` applied (see
+`docs/2026-09-28_bert_onnx_submodule_and_patches.md`).
+
+```bash
+python3 -m iree.compiler.tools.import_onnx models/bert_base/out/enc12hsk_k_i8.onnx -o enc12.mlir
+iree-compile enc12.mlir -o enc12.vmfb \
+  --iree-hal-target-device=npu=amdxdna --iree-hal-target-device=cpu=local \
+  --iree-hal-local-target-device-backends=llvm-cpu --iree-hal-default-device=npu \
+  --iree-amdaie-target-device=npu4 --iree-amd-aie-peano-install-dir=<llvm-aie> \
+  --iree-flow-enable-executable-deduplication=false \
+  --iree-amd-aie-enable-chess-for-ukernel=false \
+  --iree-amdaie-enable-ukernels=softmax,layernorm
+iree-run-module --device=amdxdna --device=local-task --module=enc12.vmfb \
+  --function=encoder12 --input=@<int8 [1,32,768] .npy>
+```
+
+Accuracy against the same model on onnxruntime: correlation 0.931 (real
+activations). The loss is accumulated over 12 layers of int8 rounding, not a
+compiler defect; see `docs/2026-09-22_twelve_layer_encoder_stack.md`.
+
+What stays on the CPU (53): 35 K-fold `Pad` copies, and 9 LayerNorms (18
+dispatches) -- 8 sit after a projection whose bias did not fit the fold, the
+last one because the final LayerNorm feeds the pooler in f32.
