@@ -1090,6 +1090,35 @@ static Value createBiasFoldedWeightGlobal(
   return foldedGlobalOp.createLoadOp(loc, rewriter)->getResult(0);
 }
 
+/// Returns the constant bias this caller's accumulator broadcasts, if the
+/// accumulator-bias K-column fold applies to `dispatch` on its own: the
+/// accumulator is a host broadcast of a constant [N] bias *and* the weight is
+/// a constant this pass can rewrite at compile time. Null otherwise, including
+/// in the ordinary two-operand case (`info.fill` set). The fold is applied only
+/// to an executable with a single caller, see `runOnOperation`.
+static DenseElementsAttr matchFoldableBias(IREE::Flow::DispatchOp dispatch,
+                                           const MatmulInfo &info,
+                                           ModuleOp module) {
+  if (!info.accArg) return {};
+  Value lhs = dispatch.getArguments()[info.lhsArg.getArgNumber()];
+  Value rhs = dispatch.getArguments()[info.rhsArg.getArgNumber()];
+  if (!isa<FloatType>(getElementTypeOrSelf(lhs.getType())) ||
+      !isa<FloatType>(getElementTypeOrSelf(rhs.getType())))
+    return {};
+  IREE::Util::GlobalOp weightGlobal;
+  DenseElementsAttr weightAttr;
+  if (!matchConstantWeight(rhs, weightGlobal, weightAttr)) return {};
+  DenseElementsAttr biasAttr = matchBroadcastBiasDispatch(
+      dispatch.getArguments()[info.accArg.getArgNumber()], module);
+  if (!biasAttr) return {};
+  linalg::MatmulOp matmul = info.matmul;
+  unsigned rhsNPos =
+      operandDimForLoop(matmul.getIndexingMapsArray()[1], /*N=*/1);
+  int64_t n = cast<RankedTensorType>(rhs.getType()).getShape()[rhsNPos];
+  if (cast<RankedTensorType>(biasAttr.getType()).getDimSize(0) != n) return {};
+  return biasAttr;
+}
+
 /// Rewrites the matmul's accumulator from the incoming bias binding to a plain
 /// zero `fill`, erases the now-unused binding from the executable, and updates
 /// `info` to the fill/empty form (so the padding helpers that follow take
@@ -1295,12 +1324,21 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
   // Executables rewritten already (shared by multiple dispatches): rewrite the
   // executable once, but pad/crop each caller's operands/result.
   DenseSet<Operation *> paddedExecutables;
-  // Executables whose accumulator-bias operand has been folded into K (see the
-  // "Accumulator-bias K-column fold" section above). Tracked separately from
-  // `paddedExecutables` because the fold changes the executable's *signature*:
-  // a second caller of such an executable cannot be handled by padding its
-  // operands alone.
-  DenseSet<Operation *> biasFoldedExecutables;
+  // Executables whose accumulator-bias operand is folded into K (see the
+  // "Accumulator-bias K-column fold" section above): only those with a single
+  // caller that can take the fold. The fold changes the executable's
+  // *signature* (the bias binding goes away, K grows by one), which the
+  // per-caller operand padding below cannot reconcile across callers: a caller
+  // that does not fold would pass an operand the executable no longer has,
+  // and the executable's `MatmulInfo`, recomputed for a later caller after the
+  // rewrite, no longer shows the bias at all. A shared executable therefore
+  // keeps the accumulator form and is padded like any other, which is always
+  // correct. Decided here, before any IR is touched. Only reachable with
+  // executable deduplication on, which this model does not use.
+  DenseMap<Operation *, int> numCallers;
+  for (IREE::Flow::DispatchOp dispatch : dispatches)
+    if (func::FuncOp func = getDispatchFunc(dispatch, module))
+      ++numCallers[func.getOperation()];
 
   for (IREE::Flow::DispatchOp dispatch : dispatches) {
     IREE::HAL::ExecutableTargetAttr target = getDispatchTarget(dispatch, module);
@@ -1355,38 +1393,17 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // long.
     bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
 
-    // Accumulator-bias K-column fold: recognized only when the accumulator is
-    // a host broadcast of a constant bias *and* the weight is a constant this
-    // pass can rewrite at compile time. Both are decided here, before any IR
-    // is touched, so the fold either applies fully or not at all -- there is
-    // no half-folded state to unwind. Null in the ordinary two-operand case
-    // (`info->fill` set), which is every dispatch when the pre-im2col
-    // convolution fold is left on.
+    // Accumulator-bias K-column fold (see `matchFoldableBias`), applied only
+    // when this is the executable's only caller (see `numCallers`). Null in
+    // the ordinary two-operand case (`info->fill` set), which is every
+    // dispatch when the pre-im2col convolution fold is left on.
     DenseElementsAttr biasAttr;
     int64_t accArgNo = -1;
     if (info->accArg) {
       accArgNo = info->accArg.getArgNumber();
-      IREE::Util::GlobalOp weightGlobal;
-      DenseElementsAttr weightAttr;
-      if (matchConstantWeight(dispatch.getArguments()[rhsArgNo], weightGlobal,
-                              weightAttr) &&
-          isa<FloatType>(lhsType.getElementType()) &&
-          isa<FloatType>(rhsType.getElementType())) {
-        biasAttr =
-            matchBroadcastBiasDispatch(dispatch.getArguments()[accArgNo], module);
-        if (biasAttr &&
-            cast<RankedTensorType>(biasAttr.getType()).getDimSize(0) != n)
-          biasAttr = {};
-      }
+      if (numCallers.lookup(func.getOperation()) == 1)
+        biasAttr = matchFoldableBias(dispatch, *info, module);
     }
-    // A shared executable that has already had its bias folded has one fewer
-    // binding than this caller passes operands for. Padding this caller's
-    // operands would not make that consistent, so leave the dispatch alone
-    // and let the divisibility check downstream report it, rather than
-    // producing IR that only looks right. Unreachable while executable
-    // deduplication is off, which this model requires anyway.
-    if (!biasAttr && biasFoldedExecutables.contains(func.getOperation()))
-      continue;
 
     int64_t mPad = isGemv ? m : roundUpToMultiple(m, mult->m);
     int64_t nPad = isGemv ? n : roundUpToMultiple(n, mult->n);
@@ -1427,10 +1444,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       // Before growing anything: turn the bias binding into a zero fill, so
       // the padding below sees the ordinary two-operand form (and `padOut`
       // takes `growMatmulInit`'s fill path).
-      if (biasAttr) {
-        replaceAccWithZeroFill(rewriter, *info, func);
-        biasFoldedExecutables.insert(func.getOperation());
-      }
+      if (biasAttr) replaceAccWithZeroFill(rewriter, *info, func);
       growBinding(rewriter, info->lhsArg, info->lhsLoad, lhsPad);
       growBinding(rewriter, info->rhsArg, info->rhsLoad, rhsPad);
       if (padOut) {
