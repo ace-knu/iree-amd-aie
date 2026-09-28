@@ -300,7 +300,10 @@ FailureOr<ParameterSetting> ParameterSetting::create(
     // equivalent bare matmul would get; a wider-output consumer still
     // benefits partially, bounded at single-buffering (never below 1, since
     // C needs at least one buffer to exist at all).
-    bufferDepthC = std::max(1u, bufferDepthC - bufferDepthAcc);
+    // Unsigned: compare first, `1u - 2u` (AIR pipeline, two-input consumer)
+    // would wrap instead of going below 1.
+    bufferDepthC =
+        bufferDepthC > bufferDepthAcc ? bufferDepthC - bufferDepthAcc : 1;
   } else {
     // For pure matmul, set the buffer depth as 0 for accumulation.
     bufferDepthAcc = 0;

@@ -270,3 +270,91 @@ func.func @unoutlineable_strided_layout(%A: memref<4x8xbf16, strided<[9,1]>>, %B
   }
   return
 }
+
+// -----
+
+// Test that outlined functions are only reused when the whole payload matches,
+// not just the op structure: an elementwise op that captures a different
+// constant (`mulf` by 2.0 vs 3.0), or wires the same payload ops to different
+// block arguments (`subf %in, %out` vs `subf %out, %in`), gets its own
+// function. An identical op (the second `mulf` by 2.0) still reuses one.
+
+// Outlined functions are inserted at the module start, so they appear in
+// reverse order of creation.
+// CHECK:       func.func private @[[SUB_OUT_IN:.+]](%{{.*}}: memref<4xf32>, %{{.*}}: memref<4xf32>)
+// CHECK:         arith.subf %out, %in
+// CHECK:       func.func private @[[SUB_IN_OUT:.+]](%{{.*}}: memref<4xf32>, %{{.*}}: memref<4xf32>)
+// CHECK:         arith.subf %in, %out
+// CHECK:       func.func private @[[MUL3:.+]](%{{.*}}: memref<4xf32>, %{{.*}}: memref<4xf32>)
+// CHECK:         arith.constant 3.000000e+00 : f32
+// CHECK:       func.func private @[[MUL2:.+]](%{{.*}}: memref<4xf32>, %{{.*}}: memref<4xf32>)
+// CHECK:         arith.constant 2.000000e+00 : f32
+// CHECK-NOT:   func.func private
+// CHECK:       func.func @elementwise_payload_differences
+// CHECK-SAME:    (%[[A:.*]]: memref<4xf32>, %[[B:.*]]: memref<4xf32>)
+// CHECK:       amdaie.core
+// CHECK-NEXT:  func.call @[[MUL2]](%[[A]], %[[B]])
+// CHECK-NEXT:  func.call @[[MUL2]](%[[B]], %[[A]])
+// CHECK-NEXT:  func.call @[[MUL3]](%[[A]], %[[B]])
+// CHECK-NEXT:  func.call @[[SUB_IN_OUT]](%[[A]], %[[B]])
+// CHECK-NEXT:  func.call @[[SUB_OUT_IN]](%[[A]], %[[B]])
+// CHECK-NEXT:  amdaie.end
+
+// CHECK-ALL-COUNT-4: func.func private
+// CHECK-ALL-NOT:     func.func private
+// CHECK-ALL:         func.func @elementwise_payload_differences
+// CHECK-ALL-COUNT-5: func.call
+
+// CHECK-NONE:        @elementwise_payload_differences
+// CHECK-NONE-NOT:    func.call
+
+func.func @elementwise_payload_differences(%A: memref<4xf32>, %B: memref<4xf32>) {
+  %c2 = arith.constant 2 : index
+  %tile = amdaie.tile(%c2, %c2)
+  %two = arith.constant 2.0 : f32
+  %three = arith.constant 3.0 : f32
+  %0 = amdaie.core(%tile, in : [], out : []) {
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%A : memref<4xf32>) outs(%B : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.mulf %in, %two : f32
+      linalg.yield %1 : f32
+    }
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%B : memref<4xf32>) outs(%A : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.mulf %in, %two : f32
+      linalg.yield %1 : f32
+    }
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%A : memref<4xf32>) outs(%B : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.mulf %in, %three : f32
+      linalg.yield %1 : f32
+    }
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%A : memref<4xf32>) outs(%B : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.subf %in, %out : f32
+      linalg.yield %1 : f32
+    }
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%A : memref<4xf32>) outs(%B : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.subf %out, %in : f32
+      linalg.yield %1 : f32
+    }
+    amdaie.end
+  }
+  return
+}
