@@ -115,3 +115,66 @@ func.func @distribute_l1_memory_for_1x1_case() {
   memref.dealloc %alloc : memref<2x2x32x32xi32, 2>
   return
 }
+
+// -----
+
+// A whole-buffer init pack (e.g. a real bias loaded into the L1 accumulator)
+// is hoisted into the earliest core forall consuming the buffer -- here the
+// peeled first K step -- and packs that core's slice of the source.
+
+// CHECK-LABEL: @whole_buffer_init_pack_peeled
+// CHECK-SAME:    %[[SRC:.+]]: memref<2x2x32x32xf32, 1>
+// CHECK:         %[[ALLOC:.+]] = memref.alloc() : memref<1x1x8x4x4x8xf32, 2>
+// CHECK-NOT:     linalg.pack
+// CHECK:         scf.forall (%[[Y:.+]], %[[X:.+]]) in (2, 2)
+// CHECK:           %[[SLICE:.+]] = memref.subview %[[SRC]][%[[Y]], %[[X]], 0, 0] [1, 1, 32, 32]
+// CHECK:           linalg.pack %[[SLICE]] {{.*}} into %[[ALLOC]]
+// CHECK:           linalg.fill
+// CHECK:         scf.for
+// CHECK:           scf.forall
+// CHECK-NOT:         linalg.pack
+// CHECK:             linalg.fill
+func.func @whole_buffer_init_pack_peeled(%src: memref<2x2x32x32xf32, 1>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %cst = arith.constant 1.0 : f32
+  %alloc = memref.alloc() : memref<2x2x8x4x4x8xf32, 2>
+  linalg.pack %src inner_dims_pos = [2, 3] inner_tiles = [4, 8] into %alloc : memref<2x2x32x32xf32, 1> -> memref<2x2x8x4x4x8xf32, 2>
+  scf.forall (%arg0, %arg1) in (2, 2) {
+    %subview = memref.subview %alloc[%arg0, %arg1, 0, 0, 0, 0] [1, 1, 8, 4, 4, 8] [1, 1, 1, 1, 1, 1] : memref<2x2x8x4x4x8xf32, 2> to memref<1x1x8x4x4x8xf32, strided<[2048, 1024, 128, 32, 8, 1], offset: ?>, 2>
+    linalg.fill ins(%cst : f32) outs(%subview : memref<1x1x8x4x4x8xf32, strided<[2048, 1024, 128, 32, 8, 1], offset: ?>, 2>)
+  } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
+  scf.for %k = %c1 to %c4 step %c1 {
+    scf.forall (%arg0, %arg1) in (2, 2) {
+      %subview = memref.subview %alloc[%arg0, %arg1, 0, 0, 0, 0] [1, 1, 8, 4, 4, 8] [1, 1, 1, 1, 1, 1] : memref<2x2x8x4x4x8xf32, 2> to memref<1x1x8x4x4x8xf32, strided<[2048, 1024, 128, 32, 8, 1], offset: ?>, 2>
+      linalg.fill ins(%cst : f32) outs(%subview : memref<1x1x8x4x4x8xf32, strided<[2048, 1024, 128, 32, 8, 1], offset: ?>, 2>)
+    } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
+  }
+  memref.dealloc %alloc : memref<2x2x8x4x4x8xf32, 2>
+  return
+}
+
+// -----
+
+// Without peeling, the earliest core forall is inside the K reduction loop:
+// hoisting the init pack there would re-initialize the accumulator on every K
+// step, so it is rejected instead.
+
+func.func @whole_buffer_init_pack_in_reduction_loop(%src: memref<2x2x32x32xf32, 1>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %cst = arith.constant 1.0 : f32
+  %alloc = memref.alloc() : memref<2x2x8x4x4x8xf32, 2>
+  // expected-error @+1 {{needs logic implemented for handling}}
+  linalg.pack %src inner_dims_pos = [2, 3] inner_tiles = [4, 8] into %alloc : memref<2x2x32x32xf32, 1> -> memref<2x2x8x4x4x8xf32, 2>
+  scf.for %k = %c0 to %c4 step %c1 {
+    scf.forall (%arg0, %arg1) in (2, 2) {
+      %subview = memref.subview %alloc[%arg0, %arg1, 0, 0, 0, 0] [1, 1, 8, 4, 4, 8] [1, 1, 1, 1, 1, 1] : memref<2x2x8x4x4x8xf32, 2> to memref<1x1x8x4x4x8xf32, strided<[2048, 1024, 128, 32, 8, 1], offset: ?>, 2>
+      linalg.fill ins(%cst : f32) outs(%subview : memref<1x1x8x4x4x8xf32, strided<[2048, 1024, 128, 32, 8, 1], offset: ?>, 2>)
+    } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
+  }
+  memref.dealloc %alloc : memref<2x2x8x4x4x8xf32, 2>
+  return
+}
