@@ -60,6 +60,16 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1);
 /// they agree on which dispatches are GEMV.
 bool isGemvMExtent(int64_t m);
 
+/// Returns true if `linalgOp` is a contraction the GEMV pipeline takes, when
+/// the target enables it: a static, plain 2-D matmul (optionally transposed,
+/// no batch dim) with M == 1 (see `isGemvMExtent`), with at most a fused
+/// *unary* elementwise consumer (e.g. ReLU) as an epilogue. The single shape
+/// predicate shared by `KernelDispatch` (which then routes the op to the GEMV
+/// pipeline) and the Flow-phase pad/split passes (which then leave its M and N
+/// unpadded and unsplit): the two must agree, or an M == 1 matmul reaches
+/// pack-peel unpadded, which requires M % instr_m == 0.
+bool isGemvContraction(linalg::LinalgOp linalgOp);
+
 /// Whether small-M matmuls take the GEMV pipeline for this target
 /// (`gemv_pipeline` in the executable target config; absent means enabled).
 bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr);

@@ -1391,7 +1391,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // runtime dispatch would otherwise redo on every inference. K keeps its
     // multiple: the pipeline takes any K, but a 32-aligned K keeps the DMA runs
     // long.
-    bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
+    bool isGemv = mult->gemvPipeline && isGemvContraction(info->matmul);
 
     // Accumulator-bias K-column fold (see `matchFoldableBias`), applied only
     // when this is the executable's only caller (see `numCallers`). Null in
@@ -1691,7 +1691,7 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
     // descriptor (dense0: 65 shim DMA programmings for the merged dispatch,
     // fewer than one of these chunks under pack-peel), so the reason to split
     // does not apply to them.
-    if (mult->gemvPipeline && isGemvMExtent(M)) continue;
+    if (mult->gemvPipeline && isGemvContraction(info->matmul)) continue;
     int64_t C = chooseChunkN(N, mult->n, kNChunkMax);
     int64_t nChunks = N / C;
     if (nChunks < 2) continue;

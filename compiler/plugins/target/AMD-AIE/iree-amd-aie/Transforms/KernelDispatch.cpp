@@ -572,43 +572,19 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 constexpr int64_t kGemvKTile = 256;
 
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
-/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim)
-/// with M == 1 (see `isGemvMExtent`), with at most a fused *unary* elementwise
-/// consumer (e.g. ReLU) as an epilogue.
+/// pack-peel; see `isGemvContraction`, which the Flow pad/split passes share.
+///
+/// On the epilogue: peeling and fusing the consumer into the last K step is
+/// identical to pack-peel. `addGemvPassPipeline` ends in the same
+/// `addPeelAndFusePasses`, which fuses a consumer into the peeled last
+/// iteration unconditionally (`tileElementwise` is only turned off at the
+/// earlier per-K-step and per-core tiling stages, so the elementwise op is
+/// never incorrectly repeated per K step). A bias add never reaches here as a
+/// consumer for this pipeline's clients (VGG16 FC1/FC2): their bias is folded
+/// into the contraction's K dimension regardless of any flag (`AMDAIETarget.h`'s
+/// `foldConvBiasIntoContraction` comment).
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
-  if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
-    return false;
-  // A fused consumer with a second operand of its own (e.g. bias add) is
-  // rejected: `setRootConfigForGemvPipeline`'s L1 budget has no term for a
-  // second, separately-DMA'd operand, unlike pack-peel's
-  // `isMatmulWithElementwiseConsumer` handling. This is not a real restriction
-  // for this pipeline's only clients today (VGG16 FC1/FC2, M == 1): their
-  // bias is folded into the contraction's K dimension regardless of any flag
-  // (`AMDAIETarget.h`'s `foldConvBiasIntoContraction` comment), so a fused
-  // ReLU -- one input, the matmul result itself -- is the only consumer shape
-  // that ever reaches here. Peeling and fusing the consumer into the last K
-  // step is otherwise identical to pack-peel: `addGemvPassPipeline` already
-  // ends in the same `addPeelAndFusePasses`, which fuses a consumer into the
-  // peeled last iteration unconditionally (`tileElementwise` is only turned
-  // off at the earlier per-K-step and per-core tiling stages, so the
-  // elementwise op is never incorrectly repeated per K step).
-  for (Operation *userOp : linalgOp->getUsers()) {
-    if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
-      if (isElementwise(linalgUser) &&
-          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser) &&
-          linalgUser.getNumDpsInputs() != 1)
-        return false;
-    }
-  }
-  FailureOr<InputDimsAndSizes> maybeDims = getInputDimsAndSizes(linalgOp);
-  if (failed(maybeDims) || maybeDims->mSizes.size() != 1 ||
-      maybeDims->nSizes.size() != 1 || maybeDims->kSizes.size() != 1)
-    return false;
-  int64_t M = maybeDims->mSizes[0];
-  if (ShapedType::isDynamic(M) || ShapedType::isDynamic(maybeDims->nSizes[0]) ||
-      ShapedType::isDynamic(maybeDims->kSizes[0]))
-    return false;
-  return isGemvMExtent(M);
+  return isGemvContraction(linalgOp);
 }
 
 /// GEMV pipeline root config. M is left untiled (below one row-group of vector
@@ -636,9 +612,21 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t nBytesLhs = bytesOf(linalgOp.getDpsInputOperand(0)->get());
   int64_t nBytesRhs = bytesOf(linalgOp.getDpsInputOperand(1)->get());
   int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
+  // A fused epilogue (see `isGemvContraction`) writes its result to its own L1
+  // tile, next to C, which is what then leaves the core
+  // (`AMDAIEInsertCopyOps`).
+  int64_t nBytesEpilogueOut = 0;
+  for (Operation *userOp : linalgOp->getUsers()) {
+    auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp);
+    if (linalgUser && isElementwise(linalgUser) &&
+        !isa<linalg::FillOp, linalg::CopyOp>(linalgUser)) {
+      nBytesEpilogueOut = bytesOf(linalgUser.getDpsInitOperand(0)->get());
+      break;
+    }
+  }
 
-  // K tile, and the core memory taken by double-buffered A, B and C tiles for
-  // a given per-core N tile. The tile must keep the per-core A/B slices'
+  // K tile, and the core memory taken by double-buffered A, B and C (and
+  // epilogue output) tiles for a given per-core N tile. The tile must keep the per-core A/B slices'
   // byte length a multiple of 4 (`aie.dma_bd`'s transfer-length constraint);
   // otherwise a K with only an odd large prime factor (e.g. 25216 = 2^7*197)
   // picks that odd factor as the tile.
@@ -651,7 +639,7 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
   auto l1Bytes = [&](int64_t n1) {
     return 2 * (M * kTile * nBytesLhs + n1 * kTile * nBytesRhs +
-                M * n1 * nBytesOut);
+                M * n1 * (nBytesOut + nBytesEpilogueOut));
   };
 
   // Per-core N tile and L0 N block. The core code is compute bound, so the
@@ -722,13 +710,12 @@ static bool takesGemvPipeline(mlir::FunctionOpInterface entryPointFn,
                               linalg::LinalgOp linalgOp,
                               TilePassPipeline passPipeline) {
   // TODO(gemv): the Flow pad/split passes (AMDAIEPadContractionDispatches.cpp)
-  // decide "this dispatch is GEMV" from the `gemv_pipeline` target attr and
-  // `isGemvMExtent` alone; they cannot see the global tile pipeline. Any
-  // condition added here (or a new global pipeline that handles matmuls) must
-  // be mirrored there, or M == 1 arrives unpadded at a pipeline that expects
-  // M % instr_m == 0. Consider carrying the decision in one shared predicate
-  // (target attr + shape) used by both sides, or folding the global pipeline
-  // into the target attr, so the two cannot drift.
+  // share the shape predicate (`isGemvContraction`) and the `gemv_pipeline`
+  // target attr with this function, but cannot see the global tile pipeline
+  // checked below. A new global pipeline that handles matmuls must be
+  // mirrored there, or M == 1 arrives unpadded at a pipeline that expects
+  // M % instr_m == 0; folding the global pipeline into the target attr would
+  // close that gap too.
   if (passPipeline != TilePassPipeline::PackPeelPipeline &&
       passPipeline != TilePassPipeline::PackPeel4LevelTilingPipeline)
     return false;

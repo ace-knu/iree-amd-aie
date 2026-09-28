@@ -96,6 +96,35 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
 
 bool isGemvMExtent(int64_t m) { return m == 1; }
 
+bool isGemvContraction(linalg::LinalgOp linalgOp) {
+  if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
+    return false;
+  // A fused consumer with a second operand of its own (e.g. bias add) is
+  // rejected: the GEMV pipeline's L1 budget (`setRootConfigForGemvPipeline`)
+  // has no term for a second, separately-DMA'd operand, unlike pack-peel's
+  // `isMatmulWithElementwiseConsumer` handling. Such a dispatch is padded and
+  // lowered by pack-peel instead, as it is with the GEMV pipeline disabled.
+  for (Operation *userOp : linalgOp->getUsers()) {
+    if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
+      if (isElementwise(linalgUser) &&
+          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser) &&
+          linalgUser.getNumDpsInputs() != 1)
+        return false;
+    }
+  }
+  FailureOr<linalg::ContractionDimensions> dims =
+      linalg::inferContractionDims(linalgOp);
+  if (failed(dims) || !dims->batch.empty() || dims->m.size() != 1 ||
+      dims->n.size() != 1 || dims->k.size() != 1)
+    return false;
+  SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
+  if (ShapedType::isDynamic(ranges[dims->m[0]]) ||
+      ShapedType::isDynamic(ranges[dims->n[0]]) ||
+      ShapedType::isDynamic(ranges[dims->k[0]]))
+    return false;
+  return isGemvMExtent(ranges[dims->m[0]]);
+}
+
 bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<BoolAttr> attr =
       getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");
