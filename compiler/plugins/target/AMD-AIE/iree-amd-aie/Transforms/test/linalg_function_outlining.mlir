@@ -358,3 +358,52 @@ func.func @elementwise_payload_differences(%A: memref<4xf32>, %B: memref<4xf32>)
   }
   return
 }
+
+// -----
+
+// An op whose payload captures a value that cannot be re-materialized inside
+// the outlined function (here a function argument) stays inline, leaves no
+// half-built function behind, and does not stop the ops after it from being
+// outlined.
+
+// CHECK-COUNT-1: func.func private @generic_
+// CHECK-NOT:     func.func private
+// CHECK-LABEL:   func.func @unoutlineable_capture_then_outlineable
+// CHECK:         amdaie.core
+// CHECK:           linalg.generic
+// CHECK:             arith.mulf %{{.*}}, %[[S:.+]] : f32
+// CHECK:           func.call @generic_
+// CHECK-NOT:       func.call
+// CHECK:           amdaie.end
+
+// CHECK-ALL-COUNT-1: func.func private
+// CHECK-ALL-NOT:     func.func private
+// CHECK-ALL:         func.func @unoutlineable_capture_then_outlineable
+// CHECK-ALL-COUNT-1: func.call
+// CHECK-ALL-NOT:     func.call
+
+func.func @unoutlineable_capture_then_outlineable(%A: memref<4xf32>, %B: memref<4xf32>, %s: f32) {
+  %c2 = arith.constant 2 : index
+  %tile = amdaie.tile(%c2, %c2)
+  %two = arith.constant 2.0 : f32
+  %0 = amdaie.core(%tile, in : [], out : []) {
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%A : memref<4xf32>) outs(%B : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.mulf %in, %s : f32
+      linalg.yield %1 : f32
+    }
+    linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]
+    } ins(%B : memref<4xf32>) outs(%A : memref<4xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %1 = arith.mulf %in, %two : f32
+      linalg.yield %1 : f32
+    }
+    amdaie.end
+  }
+  return
+}
