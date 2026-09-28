@@ -224,9 +224,10 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
   // around it at every level, and copy the contraction result into a slice
   // guessed from the induction variables, since the forall inserts the
   // epilogue's result, not the contraction's.
-  bool hasContraction = llvm::any_of(targetOps, [](Operation *op) {
-    return isa<linalg::ContractionOpInterface>(op);
-  });
+  bool hasContraction =
+      stageContractionEpilogue && llvm::any_of(targetOps, [](Operation *op) {
+        return isa<linalg::ContractionOpInterface>(op);
+      });
   auto isEpilogue = [&](Operation *op) {
     auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
     return hasContraction && linalgOp && isa<linalg::GenericOp>(op) &&

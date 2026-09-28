@@ -509,7 +509,13 @@ def AMDAIEInsertCopyOps :
     Option<"useInitAsResultDest", "use-init-as-result-dest", "bool", /*default=*/"false",
       "Copy the result back into the tensor the init was read from, the way an "
       "unpack undoes a pack, instead of into the enclosing forall's output slice. "
-      "Used for a second copy level added inside an existing one.">
+      "Used for a second copy level added inside an existing one.">,
+    Option<"stageContractionEpilogue", "stage-contraction-epilogue", "bool",
+      /*default=*/"false",
+      "Stage an elementwise op fed by the contraction as the contraction's "
+      "epilogue: only its result is copied out, and neither the contraction's "
+      "result nor the epilogue's input gets copies. Set by the GEMV pipeline, "
+      "the only pipeline this staging has been verified for.">
   ];
 }
 

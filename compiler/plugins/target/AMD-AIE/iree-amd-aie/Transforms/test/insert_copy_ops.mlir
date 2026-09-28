@@ -1,5 +1,5 @@
-// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-amdaie-insert-copy-ops))" %s | FileCheck %s
-// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-amdaie-insert-copy-ops{use-init-as-result-dest=true}))" %s | FileCheck %s --check-prefix=INIT-DEST
+// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-amdaie-insert-copy-ops{stage-contraction-epilogue=true}))" %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(func.func(iree-amdaie-insert-copy-ops{use-init-as-result-dest=true stage-contraction-epilogue=true}))" %s | FileCheck %s --check-prefix=INIT-DEST
 
 // CHECK: func.func @softmax_insert_copy_ops
 // CHECK:   %[[FILL:.*]] = linalg.fill {{.*}}) -> tensor<1x32xbf16>
