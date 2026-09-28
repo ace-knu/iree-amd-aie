@@ -174,7 +174,7 @@ something to build a demo on.
 
 §2 runs bert-base in bf16 with only the matmuls on the NPU. This section builds
 the **int8** encoder that also puts softmax, LayerNorm and GELU on the NPU:
-176 dispatches, **123 on the NPU / 53 on the CPU**.
+134 dispatches, **131 on the NPU / 3 on the CPU**.
 
 ### 6.1 Build the model
 
@@ -183,25 +183,32 @@ PYTHONPATH=<deps with onnx, onnxruntime, ml_dtypes> \
   models/bert_base/prepare_encoder12_i8.sh models/bert_base/bert_base.onnx models/bert_base/out
 ```
 
-It chains five steps, each also usable alone:
+It chains six steps, each also usable alone:
 
 | Step | Script | What it does |
 |---|---|---|
 | 1 | `quantize_bert_base.py` | per-tensor int8 QDQ on the 96 MatMuls (fixed-seed calibration) |
 | 2 | `fold_bias_into_k.py --pad-rank3` | folds the Q/K/V biases into K, so each projection is a 2-input matmul |
 | 3 | `extract_encoder_i8.py` | keeps only the encoder: int8 `[1,32,768]` in, f32 `[1,32,768]` out |
-| 4 | `fold_bias_into_k_general.py` | folds the output-projection / FC1 / FC2 biases into K where they fit (`--align 64`) |
+| 4 | `fold_bias_into_k_general.py --pad-value auto --max-bias-lsb 64` | folds every other bias into K |
 | 5 | `head_split.py --k` | per-head Q/K/V weights; K's transpose is left on int8 so IREE folds it into QK^T |
+| 6 | `hoist_kfold_pad.py` | residuals read a slice of the widened activation, so each widening is written in place |
 
 Why the folds: a bias makes a matmul dispatch a 3-input one, and a third input
 forces a DMA pattern that hangs on hardware. Folding it into K keeps two inputs.
+The extra activation columns all carry one value v (it has to be one `Pad`);
+`--pad-value auto` picks the smallest v whose columns fit, which keeps the bias
+rounding under 0.003 requantization LSB. `--max-bias-lsb 64` lets layer 10's FC2
+fold: on real activations it changes 2 of 122,880 elements, both towards the fp32
+value (docs/2026-09-28_all_biases_folded_and_ukernel_int8_wrap.md).
+
 Why head split: it removes the per-head transposes that would otherwise be CPU
-dispatches (36 of them).
+dispatches (36 of them). Why step 6: without it the widening is a copy dispatch
+(35 of them); with it and this branch's IREE, none remain.
 
 Checked 2026-09-28 by running the script from `bert_base.onnx` with
-onnxruntime 1.29.0: step 1 is byte-identical to the reference model, and the
-final model gives byte-identical ORT output, the same 176-dispatch placement,
-and the same NPU output hashes as the build the repo's docs report on.
+onnxruntime 1.29.0: the final model's ORT output is byte-identical to the one
+the docs report on.
 
 ### 6.2 Compile and run
 
@@ -210,7 +217,7 @@ Needs `third_party/iree` at this branch's pointer and
 `docs/2026-09-28_bert_onnx_submodule_and_patches.md`).
 
 ```bash
-python3 -m iree.compiler.tools.import_onnx models/bert_base/out/enc12hsk_k_i8.onnx -o enc12.mlir
+python3 -m iree.compiler.tools.import_onnx models/bert_base/out/enc12x_k_i8.onnx -o enc12.mlir
 iree-compile enc12.mlir -o enc12.vmfb \
   --iree-hal-target-device=npu=amdxdna --iree-hal-target-device=cpu=local \
   --iree-hal-local-target-device-backends=llvm-cpu --iree-hal-default-device=npu \
@@ -222,10 +229,31 @@ iree-run-module --device=amdxdna --device=local-task --module=enc12.vmfb \
   --function=encoder12 --input=@<int8 [1,32,768] .npy>
 ```
 
-Accuracy against the same model on onnxruntime: correlation 0.931 (real
-activations). The loss is accumulated over 12 layers of int8 rounding, not a
-compiler defect; see `docs/2026-09-22_twelve_layer_encoder_stack.md`.
+What stays on the CPU (3): the last LayerNorm (2 dispatches; its output is f32
+and the kernel only produces int8) and layer 0's Q/K/V widening (1; its producer
+is the model input).
 
-What stays on the CPU (53): 35 K-fold `Pad` copies, and 9 LayerNorms (18
-dispatches) -- 8 sit after a projection whose bias did not fit the fold, the
-last one because the final LayerNorm feeds the pooler in f32.
+## 7. Whole BERT: input_ids -> last_hidden_state (embeddings on the CPU)
+
+```bash
+models/bert_base/prepare_bert_i8.sh models/bert_base/bert_base.onnx models/bert_base/out
+python3 -m iree.compiler.tools.import_onnx models/bert_base/out/bertx_int8.onnx -o bert.mlir
+iree-compile bert.mlir -o bert.vmfb <same flags as 6.2>
+iree-run-module --device=amdxdna --device=local-task --module=bert.vmfb \
+  --function=main_graph --input=@<input_ids int64 [1,32] .npy>
+```
+
+The same steps as §6 on the whole model, plus `fold_shape_consts.py`: it pins the
+batch to 1 and folds the position/token-type id and attention-mask subgraphs
+(they depend on the input's shape only) into constants, without which the other
+tools cannot see static shapes. 136 dispatches, **131 on the NPU / 5 on the CPU**
+(the embedding lookup-and-add, and the embedding and last LayerNorms, whose input
+resp. output is f32). No widening copies remain: layer 0's producer is now the
+embedding LayerNorm.
+
+Accuracy (2026-09-28): the NPU output matches the same int8 model run on
+onnxruntime to the same distance from fp32 BERT -- 0.92 / 0.92 / 0.90 on random
+token ids. **On real sentences the int8 model itself reaches only 0.33-0.50**
+against fp32 (NPU and onnxruntime alike): step 1 calibrates on random token ids,
+not on text. Recalibrating on real sentences is the next step; nothing in the
+compiler needs to change for it.

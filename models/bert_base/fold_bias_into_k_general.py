@@ -78,7 +78,12 @@ def parse_args(argv):
     p.add_argument("dst")
     p.add_argument("--align", type=int, default=64)
     p.add_argument("--aug", choices=("pad", "concat"), default="pad")
-    p.add_argument("--pad-value", type=int, default=1)
+    p.add_argument("--pad-value", default="1",
+                   help="constant column value for --aug=pad, or 'auto': per group the "
+                        "smallest value whose columns fit --max-columns")
+    p.add_argument("--max-bias-err-lsb", type=float, default=0.05,
+                   help="with --pad-value auto and the requantization kept: largest bias "
+                        "rounding error allowed, in requantization LSB")
     p.add_argument("--max-columns", type=int, default=None)
     p.add_argument("--pad-in-producer-layout", dest="producer_layout",
                    action=argparse.BooleanOptionalAction, default=True)
@@ -90,6 +95,8 @@ def parse_args(argv):
     a = p.parse_args(argv)
     if a.max_columns is None:
         a.max_columns = a.align
+    if a.pad_value != "auto":
+        a.pad_value = int(a.pad_value)
     return a
 
 
@@ -200,7 +207,7 @@ def find_candidates(G, args):
     return accepted, rejected
 
 
-def solve_columns(Ts, args):
+def solve_columns(Ts, args, pad_value=None, tol=0.5):
     """Column values V and per-matmul coefficients so that sum_i V[i]*b[i] == round(T).
 
     With --aug=pad every V[i] is the same constant, so the range has to be covered by
@@ -208,11 +215,13 @@ def solve_columns(Ts, args):
     `c1*w1 + c2*w2` form and needs far fewer columns."""
     R = [T.copy() for T in Ts]
     V, B = [], [[] for _ in Ts]
-    while max(float(np.abs(r).max()) for r in R) > 0.5:
+    if pad_value is None:
+        pad_value = 1 if args.pad_value == "auto" else args.pad_value
+    while max(float(np.abs(r).max()) for r in R) > tol:
         if len(V) >= args.max_columns:
             return None, None
         if args.aug == "pad":
-            v = args.pad_value
+            v = pad_value
         else:
             worst = max(float(np.abs(r).max()) for r in R)
             v = int(min(127, max(1, np.ceil(worst / 127))))
@@ -222,7 +231,7 @@ def solve_columns(Ts, args):
             B[j].append(b.astype(np.int8))
             R[j] = r - v * b
     if not V:  # bias rounds to zero everywhere; still needs one row to stay well-formed
-        V = [args.pad_value]
+        V = [pad_value]
         for j in range(len(Ts)):
             B[j].append(np.zeros(Ts[j].shape, np.int8))
     worst = max(float(np.abs(r).max()) for r in R)
@@ -281,7 +290,22 @@ def main(argv):
             for c in members:
                 print(f"  - {c['name']}: weight K {c['w'].shape[0]} != activation K {K0}")
             continue
-        solved = solve_columns([c["T"] for c in members], args)
+        if args.aug == "pad" and args.pad_value == "auto":
+            # Every column carries the same value v, so the bias is representable only in
+            # multiples of v: the rounding error is v/2 accumulator LSB. Take the smallest v
+            # whose columns fit; that is v = 1 (the exact form) whenever it fits at all.
+            per_lsb = min((G.scalar(c["q"].input[1]) / (c["xs"] * c["ws"]))
+                          if c["keep_requant"] else 0.0 for c in members)
+            solved = (None, None)
+            for v in range(1, 128):
+                if v > 1 and (per_lsb <= 0 or (v / 2) / per_lsb > args.max_bias_err_lsb):
+                    break
+                solved = solve_columns([c["T"] for c in members], args,
+                                       pad_value=v, tol=max(0.5, v / 2))
+                if solved[0] is not None:
+                    break
+        else:
+            solved = solve_columns([c["T"] for c in members], args)
         if solved[0] is None:
             for c in members:
                 print(f"  - {c['name']}: bias needs more than --max-columns={args.max_columns} columns")
@@ -295,6 +319,9 @@ def main(argv):
         print(f"  group {xi8}")
         print(f"    matmuls {len(members)} ({names}); columns {len(V)} value(s) "
               f"{sorted(set(V))}; K {K0} -> {K_target} (K/32 = {K_target / 32:g})")
+        if members[0]["keep_requant"] and V[0] > 1:
+            per = G.scalar(members[0]["q"].input[1]) / (members[0]["xs"] * members[0]["ws"])
+            print(f"    column value {V[0]}: bias error <= {worst / per:.4f} requantization LSB")
         print(f"    bias error <= {worst:.4f} accumulator LSB; "
               f"requantization {'kept' if members[0]['keep_requant'] else 'dropped'}")
         for c in members:
@@ -402,9 +429,10 @@ def build_augmented_activation(g, G, gi, p, args, new_nodes, add_init):
     if args.aug == "pad":
         pads = f"kfold_pads_{gi}"
         add_init.append(nh.from_array(np.array([0, 0, 0, pad_total], np.int64), pads))
-        val = f"kfold_padval_{args.pad_value}"
+        pv = int(p["V"][0])
+        val = f"kfold_padval_{pv}"
         if not any(i.name == val for i in add_init):
-            add_init.append(nh.from_array(np.array(args.pad_value, np.int8), val))
+            add_init.append(nh.from_array(np.array(pv, np.int8), val))
         new_nodes.append(helper.make_node("Pad", [src, pads, val], [out],
                                           mode="constant", name=f"kfold_pad_{gi}"))
     else:
@@ -434,9 +462,10 @@ def build_in_producer_layout(gi, p, args, new_nodes, add_init, merged, pad_total
     pads[rank + rank - 2] = extra            # high padding of the outer merged axis
     pads_name = f"kfold_pads4_{gi}"
     add_init.append(nh.from_array(np.array(pads, np.int64), pads_name))
-    val = f"kfold_padval_{args.pad_value}"
+    pv = int(p["V"][0])
+    val = f"kfold_padval_{pv}"
     if not any(i.name == val for i in add_init):
-        add_init.append(nh.from_array(np.array(args.pad_value, np.int8), val))
+        add_init.append(nh.from_array(np.array(pv, np.int8), val))
     shape = [d if d is not None else -1 for d in src_shape[:-2]] + [p["K_target"]]
     shape_name = f"kfold_shape4_{gi}"
     add_init.append(nh.from_array(np.array(shape, np.int64), shape_name))
