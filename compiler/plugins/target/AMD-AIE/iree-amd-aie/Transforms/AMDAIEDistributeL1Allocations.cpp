@@ -153,7 +153,9 @@ LogicalResult distributeWholeBufferInitPack(
   scf::ForallOp forallOp =
       findEarliestCoreForallOp(oldAlloc, coreForallOps, packOp);
   if (!forallOp) return failure();
-  ValueRange ivs = forallOp.getInductionVars();
+  // `getInductionVars()` returns a SmallVector by value; a `ValueRange` bound
+  // to it would dangle as soon as this statement ends.
+  SmallVector<Value> ivs = forallOp.getInductionVars();
   if (static_cast<int64_t>(ivs.size()) != numLeadDims) return failure();
 
   Location loc = packOp.getLoc();
