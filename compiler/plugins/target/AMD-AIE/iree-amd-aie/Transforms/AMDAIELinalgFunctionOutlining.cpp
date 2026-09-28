@@ -45,6 +45,32 @@ static FailureOr<func::FuncOp> outline(IRRewriter &rewriter, ModuleOp moduleOp,
       if (!layout.isIdentity()) return failure();
     }
   }
+  // `computeOp`'s region(s) (e.g. a `linalg.generic`'s payload block) may
+  // reference values from its original enclosing scope that are not among
+  // its ins/outs operands above -- for example, a scalar `arith.constant`
+  // an elementwise consumer's payload (like a ReLU's `cmpf`/`select`
+  // against 0.0) captures directly. This must be detected on `computeOp`
+  // itself, *before* cloning: `computeOp` is still properly nested inside
+  // its original function here, so the enclosing scope is a genuine
+  // ancestor and `getUsedValuesDefinedAbove` can find the capture. Doing
+  // this check after cloning (on `clonedComputeOp`, once it has moved into
+  // the new, disconnected function body) does not work -- the captured
+  // value's defining op is then in an unrelated part of the IR tree with no
+  // ancestor relationship to the clone at all, so the same query silently
+  // finds nothing, even though the clone still structurally holds a
+  // (now-dangling) reference to it.
+  llvm::SetVector<Value> capturedValues;
+  mlir::getUsedValuesDefinedAbove(computeOp->getRegions(), capturedValues);
+  // Checked before anything is created, so that a failure leaves no
+  // half-built function behind in the module.
+  for (Value captured : capturedValues) {
+    Operation *definingOp = captured.getDefiningOp();
+    if (!definingOp || definingOp->getNumOperands() != 0 ||
+        definingOp->getNumResults() != 1 || !mlir::isPure(definingOp)) {
+      return failure();
+    }
+  }
+
   auto funcType = FunctionType::get(
       rewriter.getContext(), computeOp->getOperandTypes(), /*outputTypes=*/{});
 
@@ -64,23 +90,6 @@ static FailureOr<func::FuncOp> outline(IRRewriter &rewriter, ModuleOp moduleOp,
   IRMapping operandMap;
   for (Value origOperand : computeOp->getOperands())
     operandMap.map(origOperand, funcArgs[bbArgIndex++]);
-
-  // `computeOp`'s region(s) (e.g. a `linalg.generic`'s payload block) may
-  // reference values from its original enclosing scope that are not among
-  // its ins/outs operands above -- for example, a scalar `arith.constant`
-  // an elementwise consumer's payload (like a ReLU's `cmpf`/`select`
-  // against 0.0) captures directly. This must be detected on `computeOp`
-  // itself, *before* cloning: `computeOp` is still properly nested inside
-  // its original function here, so the enclosing scope is a genuine
-  // ancestor and `getUsedValuesDefinedAbove` can find the capture. Doing
-  // this check after cloning (on `clonedComputeOp`, once it has moved into
-  // the new, disconnected function body) does not work -- the captured
-  // value's defining op is then in an unrelated part of the IR tree with no
-  // ancestor relationship to the clone at all, so the same query silently
-  // finds nothing, even though the clone still structurally holds a
-  // (now-dangling) reference to it.
-  llvm::SetVector<Value> capturedValues;
-  mlir::getUsedValuesDefinedAbove(computeOp->getRegions(), capturedValues);
 
   // Clone the compute op while mapping the operand to the function block
   // arguments.
@@ -103,10 +112,6 @@ static FailureOr<func::FuncOp> outline(IRRewriter &rewriter, ModuleOp moduleOp,
   // elementwise fusion is enabled.
   for (Value captured : capturedValues) {
     Operation *definingOp = captured.getDefiningOp();
-    if (!definingOp || definingOp->getNumOperands() != 0 ||
-        definingOp->getNumResults() != 1 || !mlir::isPure(definingOp)) {
-      return failure();
-    }
     for (Region &region : clonedComputeOp->getRegions()) {
       if (region.empty()) continue;
       rewriter.setInsertionPointToStart(&region.front());
@@ -268,7 +273,10 @@ void AMDAIELinalgFunctionOutliningPass::runOnOperation() {
 
     FailureOr<func::FuncOp> maybeFunc =
         retrieveOrCreate(rewriter, moduleOp, computeOp);
-    if (failed(maybeFunc)) return WalkResult::interrupt();
+    // Outlining is only a code-size optimization: an op that cannot be
+    // outlined (see `outline`) stays inline, and the rest are still
+    // outlined.
+    if (failed(maybeFunc)) return WalkResult::skip();
     func::FuncOp func = maybeFunc.value();
 
     rewriter.setInsertionPoint(computeOp);
