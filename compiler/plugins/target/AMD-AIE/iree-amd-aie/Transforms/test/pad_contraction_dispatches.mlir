@@ -1345,6 +1345,73 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 
 // -----
 
+// The same foldable shape, but one executable shared by two dispatches. The
+// fold rewrites the executable's signature, which per-caller operand padding
+// cannot keep consistent across callers, so a shared executable is not folded:
+// it keeps its bias binding and every caller is padded the ordinary way.
+
+// CHECK-NOT:   @__bias_folded_const_
+// CHECK-LABEL: func.func @matmul_shared
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x64xf32>>
+// CHECK:         %[[ACC:.+]] = iree_tensor_ext.dispatch.tensor.load %arg2
+// CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<32x32xbf16>, tensor<32x64xbf16>) outs(%[[ACC]] : tensor<32x64xf32>)
+// CHECK-LABEL: util.func public @main_shared
+// CHECK-NOT:     @pad_ones_executable_
+// CHECK:         flow.dispatch @dispatch_shared::@matmul_shared(
+// CHECK-SAME:      : (tensor<32x32xbf16>, tensor<32x64xbf16>, tensor<32x64xf32>) -> tensor<32x64xf32>
+// CHECK:         flow.dispatch @dispatch_shared::@matmul_shared(
+// CHECK-SAME:      : (tensor<32x32xbf16>, tensor<32x64xbf16>, tensor<32x64xf32>) -> tensor<32x64xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight3 = dense<[[1.000000e+00], [2.000000e+00], [3.000000e+00]]> : tensor<3x1xbf16>
+  util.global private @bias3 = dense<7.000000e+00> : tensor<1xf32>
+  flow.executable private @dispatch_bcast3 {
+    flow.executable.export public @bcast3 workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @bcast3(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [1], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1xf32>> -> tensor<1xf32>
+        %1 = tensor.empty() : tensor<32x1xf32>
+        %2 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%0 : tensor<1xf32>) outs(%1 : tensor<32x1xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          linalg.yield %in : f32
+        } -> tensor<32x1xf32>
+        iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : tensor<32x1xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>
+        return
+      }
+    }
+  }
+  flow.executable private @dispatch_shared {
+    flow.executable.export public @matmul_shared workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_shared(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x3xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x1xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x1xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [32, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x3xbf16>> -> tensor<32x3xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [3, 1], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x1xbf16>> -> tensor<3x1xbf16>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x1xf32>> -> tensor<32x1xf32>
+        %3 = linalg.matmul ins(%0, %1 : tensor<32x3xbf16>, tensor<3x1xbf16>) outs(%2 : tensor<32x1xf32>) -> tensor<32x1xf32>
+        iree_tensor_ext.dispatch.tensor.store %3, %arg3, offsets = [0, 0], sizes = [32, 1], strides = [1, 1] : tensor<32x1xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_shared(%arg0: tensor<32x3xbf16>, %arg1: tensor<32x3xbf16>) -> (tensor<32x1xf32>, tensor<32x1xf32>) {
+    %w = util.global.load immutable @weight3 : tensor<3x1xbf16>
+    %b = util.global.load immutable @bias3 : tensor<1xf32>
+    %acc = flow.dispatch @dispatch_bcast3::@bcast3(%b) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<1xf32>) -> tensor<32x1xf32>
+    %0 = flow.dispatch @dispatch_shared::@matmul_shared(%arg0, %w, %acc) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<32x3xbf16>, tensor<3x1xbf16>, tensor<32x1xf32>) -> tensor<32x1xf32>
+    %1 = flow.dispatch @dispatch_shared::@matmul_shared(%arg1, %w, %acc) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<32x3xbf16>, tensor<3x1xbf16>, tensor<32x1xf32>) -> tensor<32x1xf32>
+    util.return %0, %1 : tensor<32x1xf32>, tensor<32x1xf32>
+  }
+}
+
+// -----
+
 // Same shapes and the same constant weight as above, but the accumulator is a
 // runtime value rather than a broadcast of a constant bias. The fold needs
 // *both* halves to be constant -- it has to produce the bias row at compile
