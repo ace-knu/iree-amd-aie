@@ -194,10 +194,43 @@ class AMDAIELinalgFunctionOutliningPass
     // Check if the compute op is equivalent to a previously outlined compute
     // op. If it is, retrieve and return the function generated for the previous
     // compute op.
+    //
+    // Only the compute op's own operands may differ between the two -- they
+    // become the outlined function's arguments, so every call site passes its
+    // own. Everything else is baked into the outlined body and must match:
+    //   * values defined inside the regions (block arguments, payload op
+    //     results) must correspond one-to-one, so e.g. `subf %in, %out` and
+    //     `subf %out, %in` are not merged;
+    //   * values captured from above (see `outline`, which re-materializes
+    //     their defining op inside the function) must be defined by
+    //     equivalent ops, so e.g. a `mulf` by 2.0 and a `mulf` by 3.0 are not
+    //     merged.
+    llvm::SetVector<Value> captured;
+    mlir::getUsedValuesDefinedAbove(computeOp->getRegions(), captured);
+    llvm::SmallPtrSet<Value, 8> ownOperands(computeOp->operand_begin(),
+                                            computeOp->operand_end());
     for (auto &[op, func] : computeOpToOutlinedFuncMap) {
+      DenseMap<Value, Value> equivalentValues;
+      auto checkEquivalent = [&](Value lhs, Value rhs) -> LogicalResult {
+        auto it = equivalentValues.find(lhs);
+        if (it != equivalentValues.end()) return success(it->second == rhs);
+        if (captured.contains(lhs)) {
+          Operation *lhsDef = lhs.getDefiningOp();
+          Operation *rhsDef = rhs.getDefiningOp();
+          return success(lhsDef && rhsDef &&
+                         OperationEquivalence::isEquivalentTo(
+                             lhsDef, rhsDef,
+                             OperationEquivalence::exactValueMatch,
+                             /*markEquivalent=*/nullptr,
+                             OperationEquivalence::IgnoreLocations));
+        }
+        return success(ownOperands.contains(lhs));
+      };
+      auto markEquivalent = [&](Value lhs, Value rhs) {
+        equivalentValues[lhs] = rhs;
+      };
       if (OperationEquivalence::isEquivalentTo(
-              computeOp.getOperation(), op,
-              OperationEquivalence::ignoreValueEquivalence, /*flags=*/nullptr,
+              computeOp.getOperation(), op, checkEquivalent, markEquivalent,
               OperationEquivalence::IgnoreLocations)) {
         return func;
       }

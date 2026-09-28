@@ -317,3 +317,96 @@ func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf3
 // KALIGN1-NEXT: tensor.insert_slice {{.*}} into %[[LHS_EMPTY]]
 // KALIGN1: %[[RESULT:.+]] = linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<64x129xf32>, tensor<129x128xf32>)
 // KALIGN1: return %[[RESULT]]
+
+// -----
+
+// Post-add form whose matmul accumulates onto a real value rather than a zero
+// fill: folding would replace that accumulator with zero and drop it from the
+// result, so the IR must be left untouched.
+
+// CHECK-LABEL: @matmul_post_add_bias_nonzero_acc
+// CHECK-NOT: tensor.insert_slice
+// CHECK: %[[MM:.+]] = linalg.matmul
+// CHECK: %[[RESULT:.+]] = linalg.generic
+// CHECK-SAME: ins(%[[MM]],
+// CHECK: return %[[RESULT]]
+func.func @matmul_post_add_bias_nonzero_acc(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
+                                             %acc: tensor<64x128xf32>,
+                                             %bias: tensor<128xf32>) -> tensor<64x128xf32> {
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %mm = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                      outs(%acc : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                        affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%mm, %bias : tensor<64x128xf32>, tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%m: f32, %b: f32, %out: f32):
+      %sum = arith.addf %m, %b : f32
+      linalg.yield %sum : f32
+  } -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
+}
+
+// -----
+
+// Post-add form whose bias is defined *after* the matmul (here by a reshape
+// between the two). The augmented operands must be built at the add, not at
+// the matmul, or the bias would be used before it is defined.
+
+// CHECK-LABEL: @matmul_post_add_bias_defined_late
+// CHECK-SAME:    %[[BIAS2D:[a-zA-Z0-9]+]]: tensor<1x128xf32>
+// CHECK: %[[BIAS:.+]] = tensor.collapse_shape %[[BIAS2D]]
+// CHECK: tensor.expand_shape %[[BIAS]]
+// CHECK: %[[RESULT:.+]] = linalg.matmul
+// CHECK-NOT: linalg.generic
+// CHECK: return %[[RESULT]]
+func.func @matmul_post_add_bias_defined_late(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
+                                              %bias2d: tensor<1x128xf32>) -> tensor<64x128xf32> {
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %zero = arith.constant 0.0 : f32
+  %fill = linalg.fill ins(%zero : f32) outs(%empty : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %mm = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                      outs(%fill : tensor<64x128xf32>) -> tensor<64x128xf32>
+  %bias = tensor.collapse_shape %bias2d [[0, 1]] : tensor<1x128xf32> into tensor<128xf32>
+  %result = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                        affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%mm, %bias : tensor<64x128xf32>, tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%m: f32, %b: f32, %out: f32):
+      %sum = arith.addf %m, %b : f32
+      linalg.yield %sum : f32
+  } -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
+}
+
+// -----
+
+// A broadcast that indexes the bias by loop dim d1 but writes its result
+// through a transposed map puts the bias along the result's *rows*, not its
+// columns. With a square result the shapes alone cannot tell the two apart,
+// so this must be rejected on the map, not folded as a per-column bias.
+
+// CHECK-LABEL: @matmul_bias_transposed_broadcast
+// CHECK: linalg.generic
+// CHECK: %[[RESULT:.+]] = linalg.matmul
+// CHECK-NOT: tensor.insert_slice
+// CHECK: return %[[RESULT]]
+func.func @matmul_bias_transposed_broadcast(%lhs: tensor<128x128xf32>, %rhs: tensor<128x128xf32>,
+                                             %bias: tensor<128xf32>) -> tensor<128x128xf32> {
+  %empty = tensor.empty() : tensor<128x128xf32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d1, d0)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xf32>) outs(%empty : tensor<128x128xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      linalg.yield %in : f32
+  } -> tensor<128x128xf32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<128x128xf32>, tensor<128x128xf32>)
+                          outs(%bias_bcast : tensor<128x128xf32>) -> tensor<128x128xf32>
+  return %result : tensor<128x128xf32>
+}

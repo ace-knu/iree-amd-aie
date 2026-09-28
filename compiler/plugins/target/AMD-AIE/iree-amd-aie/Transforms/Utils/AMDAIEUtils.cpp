@@ -87,23 +87,6 @@ std::optional<int64_t> getConfigNumRows(
   return attr->getInt();
 }
 
-std::pair<uint32_t, uint32_t> getRowColMultipliers(int64_t M, int64_t N,
-                                                   uint32_t numRows,
-                                                   uint32_t numCols) {
-  // Give the larger physical multiplier to whichever of M/N is larger, so an
-  // M>>N (or N>>M) shape doesn't get stuck with the smaller of the two grid
-  // axes. Only swap on a *strict* mismatch in both comparisons: `M == N`
-  // (tied shape) or `numRows == numCols` (tied grid) must never trigger a
-  // swap, since there is then no data-driven reason to move away from the
-  // historical M->numRows/N->numCols assignment -- using `(M > N) !=
-  // (numRows > numCols)` here instead would swap on every tie whenever
-  // `numRows != numCols` (e.g. M == N on an asymmetric grid), silently
-  // flipping tile sizes for callers that never asked for a swap.
-  bool wantSwap = (M > N && numCols > numRows) || (N > M && numRows > numCols);
-  if (!wantSwap) return {numRows, numCols};
-  return {numCols, numRows};
-}
-
 int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
   // The base L2 reduction (K) tile the pack-peel pipeline packs by. Empirically
   // best at 32 for bf16 (device-independent tuning constant); the 4-level

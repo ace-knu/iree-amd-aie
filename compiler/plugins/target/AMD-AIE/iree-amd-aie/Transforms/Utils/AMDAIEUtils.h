@@ -41,26 +41,6 @@ std::optional<int64_t> getConfigNumColumns(
 std::optional<int64_t> getConfigNumRows(
     IREE::HAL::ExecutableTargetAttr targetAttr);
 
-/// Returns the (rowMultiplier, colMultiplier) pair to use when scaling the L1
-/// tile size up to the physical AIE core grid, i.e. the values conventionally
-/// called `numRows`/`numCols` throughout `KernelDispatch.cpp`. On an
-/// asymmetric grid (`numRows != numCols`, e.g. 4x8 on npu4/Strix), naively
-/// always giving `numRows` to M and `numCols` to N under-utilizes whichever
-/// grid axis is larger for a dispatch whose M/N shape is skewed the other way
-/// (M >> N gets the *smaller* multiplier), which forces a smaller M0 tile and
-/// therefore more unrolled tile iterations in the generated core control
-/// program -- large enough to overflow AIE program memory for shapes like
-/// VGG16 conv4 (M=12544, N=128). This gives the larger of the two physical
-/// multipliers to whichever of M/N is larger, so the mismatch is minimized
-/// regardless of which side of the matmul it falls on. Callers that use this
-/// must also route the resulting per-dimension multiplier through
-/// `getGPUMappingAttributes` (`AMDAIETileAndFuse.cpp`) rather than a
-/// fixed M->row/N->col assumption, since that's what actually places the
-/// tiled loop onto the physical row/column axis.
-std::pair<uint32_t, uint32_t> getRowColMultipliers(int64_t M, int64_t N,
-                                                   uint32_t numRows,
-                                                   uint32_t numCols);
-
 /// Returns the pack-peel L2 reduction (K) tile size. A matmul K dimension must
 /// be a multiple of this for the pack-peel codegen to tile it without a partial
 /// reduction tile. Single source of truth shared by `KernelDispatch` (which uses

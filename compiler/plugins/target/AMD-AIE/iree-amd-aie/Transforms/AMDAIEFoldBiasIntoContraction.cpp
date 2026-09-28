@@ -50,6 +50,7 @@
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 
 #define DEBUG_TYPE "iree-amdaie-fold-bias-into-contraction"
@@ -108,6 +109,13 @@ static Value matchBiasBroadcast(linalg::GenericOp generic,
   auto biasType = dyn_cast<RankedTensorType>(bias.getType());
   if (!biasType || biasType.getRank() != 1) return nullptr;
 
+  // The bias map yields a *loop* dim, which callers read as a position in
+  // the broadcast's result tensor -- the same thing only when the result is
+  // written through the identity map. A permuted output would turn a per-row
+  // bias into what looks like a per-column one.
+  if (!generic.getMatchingIndexingMap(generic.getDpsInitOperand(0))
+           .isIdentity())
+    return nullptr;
   AffineMap biasMap = generic.getMatchingIndexingMap(biasOperand);
   if (biasMap.getNumResults() != 1) return nullptr;
   auto dimExpr = dyn_cast<AffineDimExpr>(biasMap.getResult(0));
@@ -131,6 +139,15 @@ static LogicalResult matchPostAddBias(linalg::MatmulOp matmul,
                                       linalg::GenericOp &genericOp, Value &bias,
                                       unsigned &biasResultDim) {
   if (!matmul->hasOneUse()) return failure();
+  // The rewrite replaces the matmul's accumulator with a zero fill, so it must
+  // already be one: a matmul accumulating onto a real value (a partial sum, a
+  // residual) would silently lose that value.
+  auto accFill = matmul.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+  if (!accFill) return failure();
+  Value accInit = accFill.getInputs()[0];
+  if (!matchPattern(accInit, m_AnyZeroFloat()) &&
+      !matchPattern(accInit, m_Zero()))
+    return failure();
   auto generic = dyn_cast<linalg::GenericOp>(*matmul->getUsers().begin());
   if (!generic || !generic.hasPureTensorSemantics()) return failure();
   if (generic.getNumDpsInputs() != 2 || generic.getNumDpsInits() != 1)
@@ -147,7 +164,12 @@ static LogicalResult matchPostAddBias(linalg::MatmulOp matmul,
       biasOperand = operand;
   }
   if (!matmulOperand || !biasOperand) return failure();
-  if (!generic.getMatchingIndexingMap(matmulOperand).isIdentity())
+  // Both the matmul result and the generic's own result must be indexed
+  // through the identity map, so that the generic's result has the matmul's
+  // shape and the bias's loop dim is also its result-tensor dim.
+  if (!generic.getMatchingIndexingMap(matmulOperand).isIdentity() ||
+      !generic.getMatchingIndexingMap(generic.getDpsInitOperand(0))
+           .isIdentity())
     return failure();
 
   auto biasType = dyn_cast<RankedTensorType>(biasOperand->get().getType());
@@ -522,6 +544,11 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
             matchPostAddBias(matmul, postAddGeneric, bias, biasResultDim))) {
       resultOp = postAddGeneric.getOperation();
       postAdd = true;
+      // The bias is an operand of the add, which need not be defined before
+      // the matmul (e.g. a reshape between the two). Everything else the
+      // rewrite reads (lhs, rhs, a folded transpose) dominates the matmul and
+      // hence the add, so building at the add is always legal.
+      rewriter.setInsertionPoint(postAddGeneric);
     }
   }
   if (!bias) return failure();
