@@ -13,18 +13,30 @@
 #                                      activations
 #
 # Usage: models/bert_base/prepare_bert_i8.sh [fp32.onnx] [out-dir]
+#
+# Default calibration is random tokens (reproducible, but real-sentence corr vs
+# fp32 ~0.40). For the accuracy baseline (0.66) calibrate on real sentences:
+#   CALIB=real models/bert_base/prepare_bert_i8.sh
+# which quantizes with quant/calib_ids.npy + Percentile 99.999 and folds with
+# --max-bias-lsb 128 (two output-projection biases exceed 64 under this
+# calibration; folding them is the more accurate side). Same 136 dispatches.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 src=${1:-$here/bert_base.onnx}
 out=${2:-$here/out}
 mkdir -p "$out"
+quant_args=(); max_bias_lsb=64
+if [[ ${CALIB:-random} == real ]]; then
+  quant_args=(--calib-ids "$here/quant/calib_ids.npy" --method percentile --percentile 99.999)
+  max_bias_lsb=128
+fi
 
-python3 "$here/quantize_bert_base.py" "$src" "$out/bert_base_int8.onnx"
+python3 "$here/quantize_bert_base.py" "$src" "$out/bert_base_int8.onnx" "${quant_args[@]}"
 python3 "$here/fold_bias_into_k.py" "$out/bert_base_int8.onnx" "$out/bert_base_kpadq_int8.onnx" \
   --include attention/self/query,attention/self/key,attention/self/value --pad-rank3
 python3 "$here/fold_shape_consts.py" "$out/bert_base_kpadq_int8.onnx" "$out/bert_s_int8.onnx"
 python3 "$here/fold_bias_into_k_general.py" "$out/bert_s_int8.onnx" "$out/bert_f_int8.onnx" \
-  --pad-value auto --max-bias-lsb 64
+  --pad-value auto --max-bias-lsb "$max_bias_lsb"
 python3 "$here/head_split.py" "$out/bert_f_int8.onnx" "$out/bert_hs_int8.onnx" --k
 python3 "$here/hoist_kfold_pad.py" "$out/bert_hs_int8.onnx" "$out/bertx_int8.onnx"
 

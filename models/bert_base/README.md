@@ -251,9 +251,53 @@ tools cannot see static shapes. 136 dispatches, **131 on the NPU / 5 on the CPU*
 resp. output is f32). No widening copies remain: layer 0's producer is now the
 embedding LayerNorm.
 
-Accuracy (2026-09-28): the NPU output matches the same int8 model run on
-onnxruntime to the same distance from fp32 BERT -- 0.92 / 0.92 / 0.90 on random
-token ids. **On real sentences the int8 model itself reaches only 0.33-0.50**
-against fp32 (NPU and onnxruntime alike): step 1 calibrates on random token ids,
-not on text. Recalibrating on real sentences is the next step; nothing in the
-compiler needs to change for it.
+Accuracy: the NPU output matches the same int8 model run on onnxruntime (to the
+same distance from fp32 BERT), so the backend loses nothing. The int8 model
+itself is the limit -- see §8. The default step 1 calibrates on random token ids
+(0.92 vs fp32 on random ids, **0.40 on real sentences**); for real text build with
+
+```bash
+CALIB=real models/bert_base/prepare_bert_i8.sh models/bert_base/bert_base.onnx models/bert_base/out
+```
+
+(90 real sentences + Percentile 99.999, `--max-bias-lsb 128`): **0.667** on the 64
+held-out sentences, same 136 dispatches. Checked 2026-09-29: byte-identical to the
+model validated on the NPU (0.663 NPU = 0.663 ORT on the first 16).
+
+## 8. int8 accuracy tools (`quant/`)
+
+Everything here runs on onnxruntime only (no NPU, no IREE); the NPU reproduces
+onnxruntime, so an improvement measured here carries over once the backend
+supports it. Needs `onnx`, `onnxruntime` (1.29.0), `ml_dtypes`; the fp32
+reference is `../bert_base.onnx` (override with `BERT_FP32=`).
+
+| File | What |
+|---|---|
+| `calib_sentences.txt` -> `calib_ids.npy` | 90 calibration sentences (bert-base-uncased, length 32) |
+| `eval_sentences.txt` -> `eval_ids.npy` | 64 held-out sentences, disjoint from calibration |
+| `tokenize_sentences.py` | regenerates the `*_ids.npy` (needs `transformers<5`; checked identical) |
+| `eval.py <models...>` | corr vs fp32 over real-token positions, mean and min over the 64 sentences |
+| `deploy_eval.sh <models...>` | the same before and after the deployment folds (the folds change numerics) |
+| `loo.py <int8 model> [--combos]` | leave-one-out: keep one tensor kind fp32, measure what it costs |
+| `smooth.py <fp32> <out> <calib_ids> [alpha] [all\|ln\|gelu]` | SmoothQuant on the LayerNorm and GELU outputs (fp32-equivalent to 6.8e-6) |
+| `fc2_int16.py <int8> <out>` | simulates FC2's output requantized to int16 |
+
+Measure against fp32 only. Two int8 variants that differ by 0.003 LSB of bias
+already correlate only ~0.95 with each other -- the 12-layer int8 chain amplifies
+small differences, so int8-vs-int8 corr says nothing about accuracy.
+
+Results (64 sentences, `docs/2026-09-29_quantization_sensitivity_and_fixes.md`):
+
+```bash
+python3 quantize_bert_base.py bert_base.onnx q.onnx --calib-ids quant/calib_ids.npy --method percentile  # 0.595
+quant/deploy_eval.sh q.onnx                                                                             # + folds 0.667
+python3 quant/fc2_int16.py q.onnx a.onnx                                                                # A 0.701
+python3 quant/smooth.py bert_base.onnx s.onnx quant/calib_ids.npy 0.6
+python3 quantize_bert_base.py s.onnx sq.onnx --calib-ids quant/calib_ids.npy --method percentile        # B 0.716
+python3 quant/fc2_int16.py sq.onnx c.onnx                                                               # A+B 0.837
+```
+
+A and B need backend work before the NPU can run them (FC2 int16 output,
+per-channel residual multipliers, a per-channel constant in the FC1 dispatch);
+`docs/2026-09-29_handoff_int8_accuracy.md` has the plan. (The dated docs'
+reproduction steps call this directory `_local/calib/`.)
