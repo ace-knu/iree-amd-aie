@@ -8,10 +8,21 @@ namespace {
 
 constexpr int kVecLanes = 32;
 
-// The chunk scratch is filled one bfloat16 at a time (the int8->float
-// conversion is scalar on aie2p) and read back as one 32-lane vector, which is
-// a genuine reinterpretation.
-typedef v32bfloat16 v32bfloat16_alias __attribute__((may_alias));
+// Scratch filled through one type and read back through another -- widened
+// samples written as scalars and read as a vector, accumulators stored and read
+// back as float or int lanes -- is a genuine reinterpretation.
+typedef v16float v16float_alias __attribute__((may_alias));
+typedef v16int32 v16int32_alias __attribute__((may_alias));
+
+// `x + kRoundingMagic` for |x| < 2^22 lands in [2^23, 2^24), where an f32 has
+// a spacing of exactly one: the addition itself rounds x to an integer (to
+// nearest, ties to even, on aie2p's float accumulator), and
+// the sum's bit pattern is `kMagicBits + that integer`. That is the only way
+// to get an f32 lane to an integer here -- the one vector float-to-int
+// conversion aie2p has is `bfloat16_to_int`, and bf16 cannot hold an int8
+// value's neighbourhood: its spacing between 64 and 128 is 0.5.
+constexpr float kRoundingMagic = 12582912.0f;  // 1.5 * 2^23
+constexpr int32_t kMagicBits = 0x4B400000;
 
 // Horizontal add of a v32accfloat, with the total left in lane 0 and never
 // narrowed on the way out.
@@ -52,6 +63,17 @@ INTRINSIC(float) lane0(v16accfloat r, float *tmp) {
   float v;
   __builtin_memcpy(&v, tmp, sizeof(v));
   return v;
+}
+
+// All sixteen lanes of an accumulator as floats, or as the bits of those
+// floats, through 64 bytes of scratch -- the same way out as `lane0`.
+INTRINSIC(v16float) toFloat(v16accfloat r, float *scratch) {
+  *(v16accfloat *)scratch = r;
+  return *(const v16float_alias *)scratch;
+}
+INTRINSIC(v16int32) toBits(v16accfloat r, float *scratch) {
+  *(v16accfloat *)scratch = r;
+  return *(const v16int32_alias *)scratch;
 }
 
 /// Sum and sum of squares of one int8 row, both exact.
@@ -137,14 +159,14 @@ inline void rowStats(int16 *restrict in, int32_t n, int32_t *lanes, float &sum,
 //
 // aie2p has no scalar float arithmetic -- a single multiply becomes a
 // `__mulsf3` libcall -- so every arithmetic step below happens in a vector,
-// including the per-row mean and variance, which run in f32 lanes
-// (`mul_elem_16_accuracy_safe`) rather than through bf16. Scalars are only ever
-// splatted into vectors or extracted from them, and the one transcendental is
-// `invsqrt`, a single aie2p NLF instruction.
+// in f32 lanes (`mul_elem_16_accuracy_safe`), from the statistics to the
+// requantization. Scalars are only ever splatted into vectors or extracted
+// from them, and the one transcendental is `invsqrt`, a single aie2p NLF
+// instruction, refined by a Newton step. Nothing goes through bf16 except
+// gamma and beta, which arrive in it.
 //
-// The int8 inputs are whole numbers of magnitude <= 128, which bf16 represents
-// exactly, so widening the row costs nothing in accuracy. What bf16 does cost
-// is documented at each rounding below.
+// Against an exact reference the result is exact but for values within f32's
+// resolution of a rounding boundary (1 in 24,576 on a BERT-base LayerNorm).
 //
 // Kept deliberately small on the stack. Both mlir-aie (`aie.core`'s
 // `stack_size`) and IREE (`--iree-amdaie-stack-size`) default to 0x400 = 1 KB,
@@ -188,52 +210,77 @@ inline void layernorm_impl(InT *restrict inBase, int8 *restrict outBase,
       sub(mul_elem_16_accuracy_safe(broadcast_to_v16float(rowSumSq), invN_v),
           mul_elem_16_accuracy_safe(mean_v, mean_v));
   var_a = add(var_a, broadcast_to_v16accfloat(epsilonScaled));
-  const float rstd = invsqrt(lane0(var_a, tmp));
-
-  // ---- Pass 2: normalize, scale, shift and requantize -------------------
-  const v16accfloat mean16 = broadcast_to_v16accfloat(mean);
-  const v32accfloat mean_acc = concat(mean16, mean16);
-  const v32bfloat16 rstd_v = broadcast_to_v32bfloat16((bfloat16)rstd);
-  const v16accfloat half16 = broadcast_to_v16accfloat(0.5f);
-  const v32accfloat half_acc = concat(half16, half16);
-  // The int8 range, as bf16 (both exact). See the clamp below.
-  const v32bfloat16 lo_v = broadcast_to_v32bfloat16((bfloat16)-128.0f);
-  const v32bfloat16 hi_v = broadcast_to_v32bfloat16((bfloat16)127.0f);
+  const float var = lane0(var_a, tmp);
+  // `invsqrt` is an aie2p NLF instruction of its own accuracy. One Newton step,
+  // r * (1.5 - 0.5 * var * r^2), in accurate f32 lanes, brings it to f32's
+  // whatever that is: the result multiplies the whole row.
+  float rstd = invsqrt(var);
   {
-    const v32bfloat16 *restrict pGamma = (const v32bfloat16 *)gammaBeta;
-    const v32bfloat16 *restrict pBeta = (const v32bfloat16 *)(gammaBeta + n);
+    const v16float r_v = broadcast_to_v16float(rstd);
+    const float r2 = lane0(mul_elem_16_accuracy_safe(r_v, r_v), tmp);
+    const float halfVarR2 = lane0(
+        mul_elem_16_accuracy_safe(broadcast_to_v16float(0.5f * var),
+                                  broadcast_to_v16float(r2)),
+        tmp);
+    const float step = lane0(sub(broadcast_to_v16accfloat(1.5f),
+                                 broadcast_to_v16accfloat(halfVarR2)),
+                             tmp);
+    rstd = lane0(mul_elem_16_accuracy_safe(r_v, broadcast_to_v16float(step)),
+                 tmp);
+  }
+
+  // ---- Pass 2: normalize, scale, shift and requantize, in f32 lanes -----
+  // Nothing on the way from the samples to the int8 result goes through bf16.
+  // It used to, and every one of those narrowings rounds toward -infinity on
+  // aie2p; the row came out with a gain of 0.9947 and a -0.048 LSB offset
+  // against an exact reference, which SmoothQuant made visible: it flattens a
+  // LayerNorm's output, so one normalized unit spans three times as many
+  // output steps.
+  //
+  // 16 lanes at a time, since that is what the accurate f32 multiply takes.
+  // `lanes` is free once the statistics are in, and gives the four 64-byte
+  // scratch areas the accumulators leave through.
+  const v16accfloat mean16 = broadcast_to_v16accfloat(mean);
+  const v16float rstd16 = broadcast_to_v16float(rstd);
+  const v16accfloat magic16 = broadcast_to_v16accfloat(kRoundingMagic);
+  const v16int32 lo16 = broadcast_to_v16int32(kMagicBits - 128);
+  const v16int32 hi16 = broadcast_to_v16int32(kMagicBits + 127);
+  float *restrict wide = (float *)chunk;
+  float *restrict scratch = (float *)lanes;
+  {
+    const v16bfloat16 *restrict pGamma = (const v16bfloat16 *)gammaBeta;
+    const v16bfloat16 *restrict pBeta = (const v16bfloat16 *)(gammaBeta + n);
     v32int8 *restrict pOut = (v32int8 *)out;
     for (int32_t i = 0; i < iters; ++i) {
-      // Widen this chunk only. There is no vector int-to-float conversion on
-      // aie2p, but the scalar one is a single `fx2flt`, and since the
-      // statistics above read the int8 row directly there is no reason to keep
-      // a whole widened row around -- 32 lanes of scratch instead of 768 keeps
-      // the frame under the 1 KB core stack every backend defaults to.
-      for (int32_t j = 0; j < kVecLanes; ++j)
-        chunk[j] = (bfloat16)fix2float((int32_t)in[i * kVecLanes + j], 0);
-      v32bfloat16 x = *(const v32bfloat16_alias *)chunk;
-      // Centring stays in accfloat, so the mean keeps its f32 mantissa; only
-      // the (small) centred value is narrowed for the multiply below.
-      v32bfloat16 centred = to_v32bfloat16(sub(ups(x), mean_acc));
-      // gamma/s_out scaled by 1/sqrt(var): one rounding on a per-feature
-      // constant, in the same class as gamma arriving as bf16 to begin with.
-      v32bfloat16 scale = to_v32bfloat16(mul_elem_32(rstd_v, /*sgn_x=*/1,
-                                                     *pGamma++, /*sgn_y=*/1));
-      v32accfloat y = mac_elem_32(centred, /*sgn_x=*/1, scale, /*sgn_y=*/1,
-                                  ups(*pBeta++));
-      // Bias by half so the floor below rounds to nearest, for both signs.
-      v32bfloat16 biased = to_v32bfloat16(add(y, half_acc));
-      // Clamp here, before the narrowing: `ssrs` only saturates when the core's
-      // saturation mode is on, and it is off by default, so an out-of-range
-      // value wraps instead (BERT layer 5's [CLS] outlier feature, about -132,
-      // came out as +124). Turning the mode on for the kernel is not an option
-      // -- it changes the bf16 conversions above as well. Clamping the biased
-      // value to [-128, 127] leaves the floor giving -128..127 exactly, which
-      // is the clamp the float form spells out.
-      biased = min(max(biased, lo_v), hi_v);
-      v16int32 lo = bfloat16_to_int(extract_v16bfloat16(biased, 0), 0);
-      v16int32 hi = bfloat16_to_int(extract_v16bfloat16(biased, 1), 0);
-      *pOut++ = ssrs((v32acc32)concat(lo, hi), 0, 0);
+      v16int32 halves[2];
+      for (int32_t h = 0; h < 2; ++h) {
+        // There is no vector int-to-float conversion on aie2p, but the scalar
+        // one is a single `fx2flt` and exact.
+        const int32_t base = i * kVecLanes + h * 16;
+        for (int32_t j = 0; j < 16; ++j)
+          wide[j] = fix2float((int32_t)in[base + j], 0);
+        const v16float x = *(const v16float_alias *)wide;
+        const v16float centred =
+            toFloat(sub((v16accfloat)x, mean16), scratch);
+        const v16float gamma = toFloat(ups(*pGamma++), scratch + 16);
+        const v16float scale =
+            toFloat(mul_elem_16_accuracy_safe(rstd16, gamma), scratch + 32);
+        // The accumulator's own addition rounds to nearest, ties to even --
+        // unlike the conversions to bf16, which round toward -infinity -- so
+        // adding the magic number rounds y the way ORT's QuantizeLinear does,
+        // with no bias by a half. It goes in last: added any earlier it would
+        // round beta to an integer.
+        const v16accfloat y = mac_elem_16_accuracy_safe(
+            centred, scale, ups(*pBeta++), /*zero_acc=*/0, /*sub_mul=*/0,
+            /*sub_acc1=*/0);
+        // Clamp as integers: -128..127 around the magic number.
+        halves[h] =
+            min(max(toBits(add(y, magic16), scratch + 48), lo16), hi16);
+      }
+      // `ssrs` wraps rather than saturates (the core's saturation mode is off),
+      // so it keeps each lane's low byte, which after the clamp is exactly the
+      // int8 value: the magic number's low byte is zero.
+      *pOut++ = ssrs((v32acc32)concat(halves[0], halves[1]), 0, 0);
     }
   }
   }
