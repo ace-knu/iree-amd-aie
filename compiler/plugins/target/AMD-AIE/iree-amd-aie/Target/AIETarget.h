@@ -116,6 +116,10 @@ struct AMDAIEOptions {
   // of the host. Stage 1 of the NPU pooling work; default off.
   bool enablePooling{false};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
+
+  // How the pool pipeline lays max pooling out on the core array (see
+  // `PoolCoreSplit`). Only matters with `--iree-amdaie-enable-pooling`.
+  PoolCoreSplit poolCoreSplit{PoolCoreSplit::SpatialChannel};
   bool enableCtrlPkt{false};
 
   enum class DeviceHAL { XRT, AMDXDNA };
@@ -365,6 +369,17 @@ struct AMDAIEOptions {
             "columns. However, some workloads (like convolution) currently "
             "ignore this flag, and use a hardcoded number of cols."));
 
+    binder.opt<PoolCoreSplit>(
+        "iree-amdaie-pool-core-split", poolCoreSplit, llvm::cl::cat(category),
+        llvm::cl::desc("How the pool pipeline spreads a max pooling over the "
+                       "core array (with --iree-amdaie-enable-pooling)"),
+        llvm::cl::values(
+            clEnumValN(PoolCoreSplit::SpatialChannel, "spatial-channel",
+                       "Columns take the leading spatial output dim (its odd "
+                       "factor, 7 for VGG-16), rows take the channel dim."),
+            clEnumValN(PoolCoreSplit::Search, "search",
+                       "Search one distributed output dim, ranked by core "
+                       "count, channel tile and L1 bytes.")));
     binder.opt<PacketFlowStrategy>(
         "iree-amdaie-packet-flow-strategy", packetFlowStrategy,
         llvm::cl::cat(category),

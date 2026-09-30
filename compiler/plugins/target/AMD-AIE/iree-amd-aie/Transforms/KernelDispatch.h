@@ -44,6 +44,19 @@ enum class BufferizeOperand {
 /// Enum for hardware mapping attributes.
 enum class HardwareMapping { Core, Block, None };
 
+/// How the pool pipeline spreads a max-pooling dispatch over the core array
+/// (see `setRootConfigForPoolPipeline`).
+enum class PoolCoreSplit {
+  // Array columns take the leading spatial output dim (its odd factor: the
+  // extent the last layer of a halving pooling chain is left with, 7 for every
+  // VGG-16 pooling layer), array rows take the channel dim. The core forall is
+  // 2-D and every layer uses the same cols x rows cores.
+  SpatialChannel,
+  // Exhaustive search over one distributed output dim (1-D core forall),
+  // ranked by core count, then channel tile, then L1 bytes.
+  Search
+};
+
 enum class OutliningStrategy {
   // No outlining.
   None,
@@ -83,7 +96,8 @@ LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
                                   LowerToAIEPassPipeline useLowerToAIEPipeline,
                                   AMDAIEDevice targetDevice, uint32_t numRows,
                                   uint32_t numCols, uint32_t stackSize,
-                                  std::string enableAMDAIEUkernels);
+                                  std::string enableAMDAIEUkernels,
+                                  PoolCoreSplit poolCoreSplit);
 
 }  // namespace mlir::iree_compiler::AMDAIE
 

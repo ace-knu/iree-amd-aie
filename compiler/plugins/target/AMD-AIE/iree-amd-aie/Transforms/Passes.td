@@ -667,6 +667,16 @@ def AMDAIELoweringStrategy :
       "Stack size reserved in each AIE core">,
     Option<"enableAMDAIEUkernels", "enable-ukernels", "std::string", /*default=*/"",
       "Enables microkernels in the amdaie backend. May be `none`, `all`, or a comma-separated list of specific unprefixed microkernels to enable, e.g. `matmul`.">,
+    Option<"poolCoreSplit", "pool-core-split",
+      "mlir::iree_compiler::AMDAIE::PoolCoreSplit",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolCoreSplit::SpatialChannel",
+      "How the pool pipeline spreads a max pooling over the core array.",
+      [{::llvm::cl::values(
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolCoreSplit::SpatialChannel, "spatial-channel",
+                   "Columns take the leading spatial output dim (its odd factor), rows take the channel dim."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolCoreSplit::Search, "search",
+                   "Search one distributed output dim, ranked by core count, channel tile and L1 bytes.")
+      )}]>,
   ];
 }
 
@@ -996,6 +1006,8 @@ def AMDAIETileAndFuse :
       "Use default tiling level used to retrieve the configuration from lowering_config">,
     Option<"tileElementwise", "tile-elementwise", "bool", /*default=*/"true",
       "Option to whether tile and fuse the elementwise op">,
+    Option<"swapThreadXY", "swap-thread-xy", "bool", /*default=*/"false",
+      "Map the first tiled dim of a thread-level (core) forall to DimX (array column) and the second to DimY (row), instead of DimY then DimX. Only affects foralls with two or more tiled dims.">,
     Option<"hardwareMapping", "hardware-mapping",
       "mlir::iree_compiler::AMDAIE::HardwareMapping",
       /*default=*/"mlir::iree_compiler::AMDAIE::HardwareMapping::None",

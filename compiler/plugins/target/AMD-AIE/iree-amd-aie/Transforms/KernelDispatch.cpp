@@ -1094,7 +1094,7 @@ static LogicalResult setRootConfigForElementwiseCopyPipeline(
 static LogicalResult setRootConfigForPoolPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
-    uint32_t numRows, uint32_t numCols);
+    uint32_t numRows, uint32_t numCols, PoolCoreSplit poolCoreSplit);
 
 static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    linalg::GenericOp genericOp,
@@ -1102,7 +1102,8 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    LowerToAIEPassPipeline useLowerToAIEPipeline,
                                    AMDAIEDevice targetDevice, uint32_t numRows,
                                    uint32_t numCols,
-                                   std::string enableAMDAIEUkernels) {
+                                   std::string enableAMDAIEUkernels,
+                                   PoolCoreSplit poolCoreSplit) {
   assert(!getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(genericOp) &&
          "expected lowering_config is not set");
 
@@ -1113,7 +1114,7 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
       succeeded(pool)) {
     return setRootConfigForPoolPipeline(entryPointFn, genericOp, *pool,
                                         getDeviceModel(targetDevice), numRows,
-                                        numCols);
+                                        numCols, poolCoreSplit);
   }
 
   if (isMatmul(genericOp) || isMatmulTransposeA(genericOp) ||
@@ -1178,61 +1179,96 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
 /// Ranking: more cores, then a larger tile along the innermost (channel) dim
 /// (longer contiguous DMA bursts), then a larger L1 tile, then larger block
 /// extents from the innermost dim outwards.
-static LogicalResult setRootConfigForPoolPipeline(
-    mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
-    const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
-    uint32_t numRows, uint32_t numCols) {
-  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
-  if (llvm::any_of(bounds, ShapedType::isDynamic))
-    return linalgOp.emitOpError("pool pipeline expects static shapes");
-  unsigned numLoops = bounds.size();
-  unsigned numOut = linalgOp.getNumParallelLoops();
-  int64_t bytesIn =
-      getElementTypeOrSelf(linalgOp.getDpsInputOperand(0)->get().getType())
-          .getIntOrFloatBitWidth() /
-      8;
-  int64_t bytesOut =
-      getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get().getType())
-          .getIntOrFloatBitWidth() /
-      8;
-  SmallVector<int64_t> window(numOut, 1), stride(numOut, 1);
-  for (auto [i, o] : llvm::enumerate(pool.spatialDims)) {
-    window[o] = bounds[pool.windowDims[i]];
-    stride[o] = pool.strides[i];
-  }
-  auto inExtent = [&](unsigned d, int64_t t) {
-    return (t - 1) * stride[d] + window[d];
-  };
-  auto divisorsOf = [](int64_t n) {
-    SmallVector<int64_t> r;
-    for (int64_t i = 1; i <= n; ++i)
-      if (n % i == 0) r.push_back(i);
-    return r;
-  };
-  auto prodIn = [&](ArrayRef<int64_t> t) {
-    int64_t p = 1;
-    for (unsigned d = 0; d < numOut; ++d) p *= inExtent(d, t[d]);
-    return p;
-  };
-  auto prodOut = [&](ArrayRef<int64_t> t) {
-    int64_t p = 1;
-    for (unsigned d = 0; d < numOut; ++d) p *= t[d];
-    return p;
-  };
-  auto l1Bytes = [&](ArrayRef<int64_t> t) {
-    return 2 * (prodIn(t) * bytesIn + prodOut(t) * bytesOut);
-  };
-  int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize();
-  int64_t l2Limit = deviceModel.getMemTileSizeInBytes();
-  int64_t numCores = static_cast<int64_t>(numRows) * numCols;
+namespace {
 
+/// Output-dim geometry of a max pooling shared by the pool tiling strategies.
+/// `bounds`, `window` and `stride` are indexed by output (parallel) dim; a
+/// non-spatial dim has window = stride = 1.
+struct PoolGeometry {
+  SmallVector<int64_t> bounds;
+  SmallVector<int64_t> window;
+  SmallVector<int64_t> stride;
+  int64_t bytesIn;
+  int64_t bytesOut;
+  int64_t l1Limit;
+  int64_t l2Limit;
+
+  unsigned numOut() const { return bounds.size(); }
+  /// Input extent needed for `t` outputs along `d` (the bounding box of their
+  /// windows; unit stride).
+  int64_t inExtent(unsigned d, int64_t t) const {
+    return (t - 1) * stride[d] + window[d];
+  }
+  int64_t prodIn(ArrayRef<int64_t> t) const {
+    int64_t p = 1;
+    for (unsigned d = 0; d < numOut(); ++d) p *= inExtent(d, t[d]);
+    return p;
+  }
+  int64_t prodOut(ArrayRef<int64_t> t) const {
+    int64_t p = 1;
+    for (unsigned d = 0; d < numOut(); ++d) p *= t[d];
+    return p;
+  }
+  /// Double-buffered input bounding box + output tile.
+  int64_t l1Bytes(ArrayRef<int64_t> t) const {
+    return 2 * (prodIn(t) * bytesIn + prodOut(t) * bytesOut);
+  }
+  /// Double-buffered block, spread over `cols` memtiles.
+  int64_t l2BytesPerCol(ArrayRef<int64_t> block, int64_t cols) const {
+    return 2 * (prodIn(block) * bytesIn + prodOut(block) * bytesOut) / cols;
+  }
+  /// Dims the block forall iterates more than once (TileAndFuse maps at most
+  /// two of them).
+  int nonUnitBlocks(ArrayRef<int64_t> block) const {
+    int n = 0;
+    for (unsigned d = 0; d < numOut(); ++d)
+      if (bounds[d] / block[d] > 1) ++n;
+    return n;
+  }
+};
+
+/// A pool tiling: the core (L1) tile and block (L2) tile over the output dims,
+/// the dims the core forall iterates (`coreDims`, each tiled at both levels)
+/// and the dim that always keeps a level-0 tile so a block forall exists.
+struct PoolTiling {
+  SmallVector<int64_t> tile;
+  SmallVector<int64_t> block;
+  SmallVector<unsigned> coreDims;
+  unsigned blockDim;
+};
+
+SmallVector<int64_t> divisorsOf(int64_t n) {
+  SmallVector<int64_t> r;
+  for (int64_t i = 1; i <= n; ++i)
+    if (n % i == 0) r.push_back(i);
+  return r;
+}
+
+int64_t largestDivisorUpTo(int64_t n, int64_t limit) {
+  int64_t best = 1;
+  for (int64_t d : divisorsOf(n))
+    if (d <= limit) best = d;
+  return best;
+}
+
+/// `PoolCoreSplit::Search`: every divisor combination of the output dims is an
+/// L1 tile candidate; cores are spread along exactly one output dim, filling
+/// whole columns; when more than one column is used the L2 block must be
+/// splittable across the columns' memtiles along that dim (first non-unit
+/// dim, even split, non-overlapping windows). Ranked by core count, then the
+/// innermost (channel) tile, then L1 bytes, then block extents innermost
+/// first.
+FailureOr<PoolTiling> searchPoolTiling(const PoolGeometry &g, int64_t numRows,
+                                       int64_t numCols) {
+  unsigned numOut = g.numOut();
+  int64_t numCores = numRows * numCols;
   SmallVector<int64_t> bestKey, bestTile, bestBlock;
   int bestDim = -1;
   auto consider = [&](ArrayRef<int64_t> t) {
-    int64_t l1 = l1Bytes(t);
-    if (l1 > l1Limit) return;
+    int64_t l1 = g.l1Bytes(t);
+    if (l1 > g.l1Limit) return;
     for (unsigned d = 0; d < numOut; ++d) {
-      for (int64_t n : divisorsOf(bounds[d] / t[d])) {
+      for (int64_t n : divisorsOf(g.bounds[d] / t[d])) {
         int64_t cores = n;
         if (cores > numCores) continue;
         int64_t cols = 1;
@@ -1246,22 +1282,17 @@ static LogicalResult setRootConfigForPoolPipeline(
         if (cols > 1) {
           int fin = -1, fout = -1;
           for (unsigned i = 0; i < numOut && fin < 0; ++i)
-            if (inExtent(i, block[i]) > 1) fin = i;
+            if (g.inExtent(i, block[i]) > 1) fin = i;
           for (unsigned i = 0; i < numOut && fout < 0; ++i)
             if (block[i] > 1) fout = i;
           if (fin != static_cast<int>(d) || fout != static_cast<int>(d))
             continue;
-          if (inExtent(d, block[d]) % cols != 0 || block[d] % cols != 0)
+          if (g.inExtent(d, block[d]) % cols != 0 || block[d] % cols != 0)
             continue;
-          if (window[d] != stride[d]) continue;
+          if (g.window[d] != g.stride[d]) continue;
         }
-        int nonUnitBlocks = 0;
-        for (unsigned i = 0; i < numOut; ++i)
-          if (bounds[i] / block[i] > 1) ++nonUnitBlocks;
-        if (nonUnitBlocks > 2) continue;
-        int64_t l2 =
-            2 * (prodIn(block) * bytesIn + prodOut(block) * bytesOut) / cols;
-        if (l2 > l2Limit) continue;
+        if (g.nonUnitBlocks(block) > 2) continue;
+        if (g.l2BytesPerCol(block, cols) > g.l2Limit) continue;
         SmallVector<int64_t> key = {cores, t[numOut - 1], l1};
         for (int i = numOut - 1; i >= 0; --i) key.push_back(block[i]);
         if (bestKey.empty() ||
@@ -1276,7 +1307,7 @@ static LogicalResult setRootConfigForPoolPipeline(
     }
   };
   SmallVector<SmallVector<int64_t>> divs;
-  for (unsigned d = 0; d < numOut; ++d) divs.push_back(divisorsOf(bounds[d]));
+  for (unsigned d = 0; d < numOut; ++d) divs.push_back(divisorsOf(g.bounds[d]));
   SmallVector<int64_t> tile(numOut, 1);
   std::function<void(unsigned)> enumerateTiles = [&](unsigned d) {
     if (d == numOut) {
@@ -1289,26 +1320,141 @@ static LogicalResult setRootConfigForPoolPipeline(
     }
   };
   enumerateTiles(0);
-  if (bestKey.empty()) {
+  if (bestKey.empty()) return failure();
+  return PoolTiling{bestTile, bestBlock, {static_cast<unsigned>(bestDim)},
+                    static_cast<unsigned>(bestDim)};
+}
+
+/// `PoolCoreSplit::SpatialChannel`: a fixed 2-D core grid.
+///   * columns <- the leading spatial output dim (OH), `cols` = its odd factor
+///     when 1 < odd <= numCols (a halving pooling chain keeps that factor down
+///     to its last layer, so every layer gets the same column count), else the
+///     largest divisor of OH that fits the array;
+///   * rows <- the channel dim, `rows` = the largest divisor of C <= numRows,
+///     each row taking C / rows channels.
+/// The L1 tile is then [tOh, tOw, C / rows] with the largest L1 footprint,
+/// preferring a wide OW tile (longer contiguous DMA runs) over a tall OH tile;
+/// the block is [cols * tOh, tOw, C]. Remaining OH / OW blocks iterate in time.
+/// Fails (caller falls back to the search) when the grid degenerates to one
+/// core, the memtile pieces would overlap (window != stride along OH), or no
+/// tile fits.
+FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
+                                               const MaxPoolingDims &pool,
+                                               int64_t numRows,
+                                               int64_t numCols) {
+  unsigned numOut = g.numOut();
+  if (pool.spatialDims.size() != 2) return failure();
+  unsigned dS = pool.spatialDims[0];
+  unsigned dW = pool.spatialDims[1];
+  unsigned dC = numOut - 1;
+  if (dC == dS || dC == dW) return failure();
+  int64_t OH = g.bounds[dS], OW = g.bounds[dW], C = g.bounds[dC];
+  int64_t odd = OH;
+  while (odd % 2 == 0) odd /= 2;
+  int64_t cols =
+      (odd > 1 && odd <= numCols) ? odd : largestDivisorUpTo(OH, numCols);
+  int64_t rows = largestDivisorUpTo(C, numRows);
+  if (cols * rows <= 1) return failure();
+  // The L2 block is split along OH across the columns' memtiles: pieces must
+  // not overlap.
+  if (cols > 1 && g.window[dS] != g.stride[dS]) return failure();
+  int64_t tC = C / rows;
+
+  SmallVector<int64_t> bestKey, bestTile;
+  for (int64_t tOh : divisorsOf(OH / cols)) {
+    for (int64_t tOw : divisorsOf(OW)) {
+      SmallVector<int64_t> tile(numOut, 1);
+      tile[dS] = tOh;
+      tile[dW] = tOw;
+      tile[dC] = tC;
+      int64_t l1 = g.l1Bytes(tile);
+      if (l1 > g.l1Limit) continue;
+      SmallVector<int64_t> block = tile;
+      block[dS] = cols * tOh;
+      block[dC] = C;
+      if (g.nonUnitBlocks(block) > 2) continue;
+      if (g.l2BytesPerCol(block, cols) > g.l2Limit) continue;
+      // Largest L1 footprint first, then the wider OW tile, then OH.
+      SmallVector<int64_t> key = {l1, tOw, tOh};
+      if (bestKey.empty() ||
+          std::lexicographical_compare(bestKey.begin(), bestKey.end(),
+                                       key.begin(), key.end())) {
+        bestKey = key;
+        bestTile = tile;
+      }
+    }
+  }
+  if (bestKey.empty()) return failure();
+  SmallVector<int64_t> block = bestTile;
+  block[dS] = cols * bestTile[dS];
+  block[dC] = C;
+  return PoolTiling{bestTile, block, {dS, dC}, dS};
+}
+
+}  // namespace
+
+/// Sets the lowering configuration for a 2-D max pooling: two tile levels over
+/// the output dims only (block -> L2, core -> L1), the window untiled, and the
+/// `"pool"` tile-pipeline override. `poolCoreSplit` picks how cores are laid
+/// out (see `PoolCoreSplit`); the spatial-channel grid falls back to the search
+/// when the shape does not admit it.
+static LogicalResult setRootConfigForPoolPipeline(
+    mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
+    const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
+    uint32_t numRows, uint32_t numCols, PoolCoreSplit poolCoreSplit) {
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  if (llvm::any_of(bounds, ShapedType::isDynamic))
+    return linalgOp.emitOpError("pool pipeline expects static shapes");
+  unsigned numLoops = bounds.size();
+  unsigned numOut = linalgOp.getNumParallelLoops();
+
+  PoolGeometry g;
+  g.bounds.assign(bounds.begin(), bounds.begin() + numOut);
+  g.window.assign(numOut, 1);
+  g.stride.assign(numOut, 1);
+  for (auto [i, o] : llvm::enumerate(pool.spatialDims)) {
+    g.window[o] = bounds[pool.windowDims[i]];
+    g.stride[o] = pool.strides[i];
+  }
+  g.bytesIn =
+      getElementTypeOrSelf(linalgOp.getDpsInputOperand(0)->get().getType())
+          .getIntOrFloatBitWidth() /
+      8;
+  g.bytesOut =
+      getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get().getType())
+          .getIntOrFloatBitWidth() /
+      8;
+  g.l1Limit = deviceModel.getCoreTileLocalMemorySize();
+  g.l2Limit = deviceModel.getMemTileSizeInBytes();
+
+  FailureOr<PoolTiling> tiling = failure();
+  if (poolCoreSplit == PoolCoreSplit::SpatialChannel)
+    tiling = spatialChannelPoolTiling(g, pool, numRows, numCols);
+  if (failed(tiling)) tiling = searchPoolTiling(g, numRows, numCols);
+  if (failed(tiling)) {
     return linalgOp.emitOpError("pool tiles do not fit in core memory (")
-           << l1Limit << " bytes).";
+           << g.l1Limit << " bytes).";
   }
 
   // A dim whose tile equals its extent at a level is left untiled there (0),
-  // so each forall only carries the dims that actually iterate: the core
-  // forall is then 1-D over the distributed dim, which is what
+  // so each forall only carries the dims that actually iterate: with the
+  // search the core forall is 1-D over the distributed dim, which is what
   // `distributeCoresToMultiColumns` (row = iv % numRows, col = iv / numRows)
-  // recognises; a forall with extra unit dims would keep every core in column
-  // 0 and run past the last row. The distributed dim is always tiled so a
-  // forall exists at both levels even when it has a single iteration.
+  // recognises; with the spatial-channel grid it is 2-D (OH, C) and the pool
+  // pipeline maps OH to columns and C to rows. A forall with extra unit dims
+  // would keep every core in column 0 and run past the last row. The core
+  // dims are always tiled so a forall exists at both levels even when a dim
+  // has a single iteration.
   SmallVector<int64_t> tileSizeLevel0(numLoops, 0);
   SmallVector<int64_t> tileSizeLevel1(numLoops, 0);
   for (unsigned d = 0; d < numOut; ++d) {
-    bool distributed = static_cast<int>(d) == bestDim;
+    bool coreDim = llvm::is_contained(tiling->coreDims, d);
     tileSizeLevel0[d] =
-        (distributed || bestBlock[d] != bounds[d]) ? bestBlock[d] : 0;
+        (d == tiling->blockDim || tiling->block[d] != bounds[d])
+            ? tiling->block[d]
+            : 0;
     tileSizeLevel1[d] =
-        (distributed || bestTile[d] != bestBlock[d]) ? bestTile[d] : 0;
+        (coreDim || tiling->tile[d] != tiling->block[d]) ? tiling->tile[d] : 0;
   }
   MLIRContext *context = entryPointFn.getContext();
   auto pipelineConfig = DictionaryAttr::get(
@@ -1395,7 +1541,8 @@ static LogicalResult setRootConfigImpl(
     mlir::FunctionOpInterface entryPointFn, Operation *op,
     TilePassPipeline passPipeline, LowerToAIEPassPipeline useLowerToAIEPipeline,
     AMDAIEDevice targetDevice, uint32_t numRows, uint32_t numCols,
-    uint32_t stackSize, std::string enableAMDAIEUkernels) {
+    uint32_t stackSize, std::string enableAMDAIEUkernels,
+    PoolCoreSplit poolCoreSplit) {
   auto setRootConfigFn = [&](Operation *op) -> LogicalResult {
     return TypeSwitch<Operation *, LogicalResult>(op)
         // TODO (nmeshram): This is very limited for now, plan is to
@@ -1410,7 +1557,7 @@ static LogicalResult setRootConfigImpl(
         .Case<linalg::GenericOp>([&](auto op) {
           return setRootConfig(entryPointFn, op, passPipeline,
                                useLowerToAIEPipeline, targetDevice, numRows,
-                               numCols, enableAMDAIEUkernels);
+                               numCols, enableAMDAIEUkernels, poolCoreSplit);
         })
         .Case<linalg::ContractionOpInterface>([&](auto op) {
           return setRootConfig(entryPointFn, op, passPipeline,
@@ -1432,7 +1579,8 @@ static LogicalResult setTranslationInfoAndRootConfig(
     mlir::FunctionOpInterface entryPointFn, ArrayRef<Operation *> computeOps,
     TilePassPipeline passPipeline, LowerToAIEPassPipeline useLowerToAIEPipeline,
     AMDAIEDevice targetDevice, uint32_t numRows, uint32_t numCols,
-    uint32_t stackSize, std::string enableAMDAIEUkernels) {
+    uint32_t stackSize, std::string enableAMDAIEUkernels,
+    PoolCoreSplit poolCoreSplit) {
   // Make sure that lowering_config is not preset on any compute ops.
   for (auto computeOp : computeOps) {
     if (getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(computeOp))
@@ -1449,7 +1597,8 @@ static LogicalResult setTranslationInfoAndRootConfig(
 
   if (failed(setRootConfigImpl(entryPointFn, rootOperation, passPipeline,
                                useLowerToAIEPipeline, targetDevice, numRows,
-                               numCols, stackSize, enableAMDAIEUkernels)))
+                               numCols, stackSize, enableAMDAIEUkernels,
+                               poolCoreSplit)))
     return failure();
   return success();
 }
@@ -1463,7 +1612,8 @@ LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
                                   LowerToAIEPassPipeline useLowerToAIEPipeline,
                                   AMDAIEDevice targetDevice, uint32_t numRows,
                                   uint32_t numCols, uint32_t stackSize,
-                                  std::string enableAMDAIEUkernels) {
+                                  std::string enableAMDAIEUkernels,
+                                  PoolCoreSplit poolCoreSplit) {
   if (getTranslationInfo(funcOp)) return success();
 
   // TODO (nmeshram): Need a default pipeline for control flow cases.
@@ -1473,7 +1623,7 @@ LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
   SmallVector<Operation *> computeOps = getComputeOps(funcOp);
   if (failed(setTranslationInfoAndRootConfig(
           funcOp, computeOps, passPipeline, useLowerToAIEPipeline, targetDevice,
-          numRows, numCols, stackSize, enableAMDAIEUkernels)))
+          numRows, numCols, stackSize, enableAMDAIEUkernels, poolCoreSplit)))
     return failure();
 
   // The root configuration setting introduces `tensor.dim` operations.

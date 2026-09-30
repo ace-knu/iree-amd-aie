@@ -470,12 +470,18 @@ void addPoolPassPipeline(OpPassManager &funcPassManager) {
         createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
   }
 
-  // Second level tiling (core) using scf.forall.
+  // Second level tiling (core) using scf.forall. With the spatial-channel
+  // core split the core forall is 2-D (OH, C): its first dim must land on
+  // array columns (the L2 block is split along OH across the columns'
+  // memtiles) and its second on rows, the reverse of TileAndFuse's default
+  // (first -> DimY/row), hence `swapThreadXY`. A 1-D core forall (search
+  // split) is unaffected.
   {
     AMDAIETileAndFuseOptions tileFuseOptions;
     tileFuseOptions.hardwareMapping = HardwareMapping::Core;
     tileFuseOptions.tilingLevel = 1;
     tileFuseOptions.useSCFFor = false;
+    tileFuseOptions.swapThreadXY = true;
     funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
   }
   funcPassManager.addPass(createAMDAIEInsertCopyOpsPass());
@@ -868,7 +874,7 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int callReplication, bool insertLoopAroundCoreBlock, bool enableCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas) {
+    uint32_t coreStackSize, bool reprogramDmas, PoolCoreSplit poolCoreSplit) {
   OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
   {
     FunctionLikeNest funcPassManager(modulePassManager);
@@ -886,6 +892,7 @@ void buildAMDAIETransformPassPipeline(
     options.numCols = numCols;
     options.enableAMDAIEUkernels = enableAMDAIEUkernels;
     options.stackSize = coreStackSize;
+    options.poolCoreSplit = poolCoreSplit;
     modulePassManager.addPass(createAMDAIELoweringStrategyPass(options));
   }
   modulePassManager.addPass(createLowerExecutableUsingTransformDialectPass());

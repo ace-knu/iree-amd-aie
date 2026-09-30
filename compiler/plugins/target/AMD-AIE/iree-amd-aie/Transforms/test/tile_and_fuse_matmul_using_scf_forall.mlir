@@ -1,5 +1,6 @@
 // RUN: iree-opt --pass-pipeline='builtin.module(func.func(iree-amdaie-tile-and-fuse{tiling-level=0 hardware-mapping=block}))' --split-input-file %s                        | FileCheck %s --check-prefix=TILE-LEVEL-0
 // RUN: iree-opt --pass-pipeline='builtin.module(func.func(iree-amdaie-tile-and-fuse{tiling-level=1 hardware-mapping=core}))' --split-input-file --verify-diagnostics %s   | FileCheck %s --check-prefix=TILE-LEVEL-1
+// RUN: iree-opt --pass-pipeline='builtin.module(func.func(iree-amdaie-tile-and-fuse{tiling-level=1 hardware-mapping=core swap-thread-xy=true}))' --split-input-file --verify-diagnostics %s   | FileCheck %s --check-prefix=TILE-LEVEL-1-SWAP
 // RUN: iree-opt --pass-pipeline='builtin.module(func.func(iree-amdaie-tile-and-fuse{tiling-level=0 hardware-mapping=block tile-elementwise=false}))' --split-input-file %s | FileCheck %s --check-prefix=TILE-MATMUL-ONLY
 
 func.func @matmul_static(%arg0: tensor<8x16xi32>, %arg1 : tensor<16x8xi32>) -> tensor<8x8xi32> {
@@ -59,6 +60,12 @@ func.func @matmul_static(%arg0: tensor<8x16xi32>, %arg1 : tensor<16x8xi32>) -> t
 //      TILE-LEVEL-1:           linalg.fill
 //      TILE-LEVEL-1:           linalg.matmul
 //      TILE-LEVEL-1:       } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
+// swap-thread-xy: the first tiled dim goes to DimX (array column), the second
+// to DimY (row).
+// TILE-LEVEL-1-SWAP: @matmul_static
+// TILE-LEVEL-1-SWAP:   scf.forall
+// TILE-LEVEL-1-SWAP:       scf.forall
+// TILE-LEVEL-1-SWAP:       } {mapping = [#gpu.thread<x>, #gpu.thread<y>]}
 //      TILE-LEVEL-1:   } {mapping = [#gpu.block<y>, #gpu.block<x>]}
 
 // -----

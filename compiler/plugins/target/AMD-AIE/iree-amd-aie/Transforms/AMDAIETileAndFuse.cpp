@@ -41,7 +41,7 @@ enum class GPUGroupType { Block, Thread };
 ///                          Required only to emit useful errors.
 FailureOr<SmallVector<Attribute>> getGPUMappingAttributes(
     ArrayRef<int64_t> nbTiles, GPUGroupType groupType,
-    TilingInterface tilingInterfaceOp) {
+    TilingInterface tilingInterfaceOp, bool swapXY) {
   MLIRContext *context = tilingInterfaceOp.getContext();
 
   const uint64_t nbDims = nbTiles.size();
@@ -108,11 +108,17 @@ FailureOr<SmallVector<Attribute>> getGPUMappingAttributes(
   //
   // Note that 0 and 1 are effectively swapped, because for AIE we want to
   // map the first dimension to AIE array columns (or something like that).
+  //
+  // With `swapXY` (and at least two tiled dimensions) the first dimension goes
+  // to DimX and the second to DimY instead: on the core level that puts the
+  // first dimension on array columns and the second on rows (the pool pipeline
+  // uses this for its spatial x channel core grid).
+  const bool swap = swapXY && nbDims >= 2;
   auto getAttribute = [&](uint32_t i) -> Attribute {
     if (i == 0)
-      return getMappingAttributeForDimension(1);
+      return getMappingAttributeForDimension(swap ? 0 : 1);
     else if (i == 1)
-      return getMappingAttributeForDimension(0);
+      return getMappingAttributeForDimension(swap ? 1 : 0);
     else
       return getMappingAttributeForDimension(i);
   };
@@ -227,7 +233,7 @@ class AMDAIETileAndFusePass
 /// iterations in each dimension.
 static LogicalResult setGpuAttributeOnForall(
     GPUGroupType groupType, scf::ForallOp loopForAll,
-    TilingInterface tilingInterfaceOp) {
+    TilingInterface tilingInterfaceOp, bool swapXY) {
   MLIRContext *context = tilingInterfaceOp.getContext();
 
   std::optional<SmallVector<OpFoldResult>> maybeUbs =
@@ -266,7 +272,7 @@ static LogicalResult setGpuAttributeOnForall(
   }
 
   auto maybeMapping =
-      getGPUMappingAttributes(nbIters, groupType, tilingInterfaceOp);
+      getGPUMappingAttributes(nbIters, groupType, tilingInterfaceOp, swapXY);
   if (failed(maybeMapping)) return failure();
   ArrayAttr mappingArrayAttr = ArrayAttr::get(context, maybeMapping.value());
   loopForAll.setMappingAttr(mappingArrayAttr);
@@ -407,7 +413,9 @@ void AMDAIETileAndFusePass::runOnOperation() {
       auto groupType = hardwareMapping == HardwareMapping::Core
                            ? GPUGroupType::Thread
                            : GPUGroupType::Block;
-      if (failed(setGpuAttributeOnForall(groupType, loopForAll, consumerOp))) {
+      bool swapXY = swapThreadXY && groupType == GPUGroupType::Thread;
+      if (failed(setGpuAttributeOnForall(groupType, loopForAll, consumerOp,
+                                         swapXY))) {
         return signalPassFailure();
       }
     }
