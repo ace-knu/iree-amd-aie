@@ -1352,6 +1352,23 @@ LogicalResult generateUnifiedObject(
       inputLLStr.erase(pos, kUnparsableAttr.size());
     }
   }
+  // Nor can it parse a wrap flag inside a constant-expression GEP
+  // (`getelementptr inbounds nuw (i8, ptr @g, i64 224)`). The instruction
+  // form is handled at the MLIR level by createAMDAIERemoveWrapFlagFromGepPass,
+  // but a GEP whose operands are all constant -- a core-local constant read at
+  // a non-zero offset -- is folded into a constant expression by the
+  // translation itself, and the flag reappears there. Dropping `nuw` only
+  // drops an optimization hint.
+  {
+    const std::string kFlaggedConstantGep = "getelementptr inbounds nuw (";
+    const std::string kPlainConstantGep = "getelementptr inbounds (";
+    size_t pos = 0;
+    while ((pos = inputLLStr.find(kFlaggedConstantGep, pos)) !=
+           std::string::npos) {
+      inputLLStr.replace(pos, kFlaggedConstantGep.size(), kPlainConstantGep);
+      pos += kPlainConstantGep.size();
+    }
+  }
 
   if (useChess) {
     FailureOr<Path> maybeVitisDir = findVitis(vitisDir, npuVersion);
