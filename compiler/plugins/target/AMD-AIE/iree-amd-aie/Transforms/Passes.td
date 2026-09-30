@@ -460,6 +460,31 @@ def AMDAIEFoldBroadcastAddIntoDest :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBroadcastAddIntoDestPass()";
 }
 
+def AMDAIEFoldPerChannelDequantIntoMatmul :
+  Pass<"iree-amdaie-fold-per-channel-dequant-into-matmul", ""> {
+  let summary = "Turn a float matmul of dequantized int8 operands with a "
+                "per-channel weight scale into an int8 matmul and a scaled "
+                "tail.";
+  let description = [{
+    The ONNX importer lowers a per-tensor QDQ matmul to
+    `linalg.quantized_matmul`, but that named op takes scalar zero points, so
+    a per-channel weight falls back to
+
+      %a = dequantize(%x : i8)       -- scale sx
+      %b = dequantize(%w : i8)       -- scale sw[n], zero point 0
+      %y = linalg.matmul ins(%a, %b) outs(fill 0.0) -> f32
+
+    which puts two dequantizations and a float matmul in one dispatch. This
+    rewrites it to
+
+      %acc = linalg.matmul ins(%x, %w) outs(fill 0) -> i32
+      %y   = sitofp(%acc) * (sx * sw[n])
+
+    exactly: the scales factor out of the sum over K.
+  }];
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldPerChannelDequantIntoMatmulPass()";
+}
+
 def AMDAIEFuseConsumerIntoLoop :
     InterfacePass<"iree-amdaie-fuse-consumer-into-loop", "mlir::FunctionOpInterface"> {
   let summary = "Fuse the consumer operation into the innermost last scf loop.";

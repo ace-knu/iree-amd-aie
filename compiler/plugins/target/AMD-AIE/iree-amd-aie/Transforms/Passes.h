@@ -270,6 +270,10 @@ std::unique_ptr<Pass> createAMDAIEFoldDmaWaitsPass();
 /// eliminating the separate elementwise op.
 std::unique_ptr<Pass> createAMDAIEFoldBroadcastAddIntoDestPass();
 
+/// Create a pass to fold a per-channel weight dequantization out of a float
+/// matmul, leaving an int8 matmul and a per-channel scaled tail.
+std::unique_ptr<Pass> createAMDAIEFoldPerChannelDequantIntoMatmulPass();
+
 /// Create a pass to fuse the producer operations into the scf loops.
 std::unique_ptr<Pass> createAMDAIEFuseProducerIntoLoopPass(
     AMDAIEFuseProducerIntoLoopOptions options = {});

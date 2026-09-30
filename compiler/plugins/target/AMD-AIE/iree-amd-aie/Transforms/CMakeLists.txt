@@ -79,6 +79,7 @@ iree_cc_library(
     "AMDAIEFlattenLogicalObjectFifo.cpp"
     "AMDAIELinalgFunctionOutlining.cpp"
     "AMDAIEFoldBroadcastAddIntoDest.cpp"
+    "AMDAIEFoldPerChannelDequantIntoMatmul.cpp"
     "AMDAIEFoldDmaWaits.cpp"
     "AMDAIEFuseConsumerIntoLoop.cpp"
     "AMDAIEFuseFillIntoForall.cpp"

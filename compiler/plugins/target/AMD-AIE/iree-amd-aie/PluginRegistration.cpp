@@ -63,6 +63,10 @@ struct AMDAIESession
     // fusion machinery (separate elementwise consumer, its own DMA/tile
     // placement) that a detached bias-add would otherwise require.
     passManager.addPass(AMDAIE::createAMDAIEFoldBroadcastAddIntoDestPass());
+    // A matmul with a per-channel weight scale arrives as a float matmul of
+    // two dequantized operands; take the scales out of it so that it lowers
+    // like a per-tensor one, an int8 matmul with a scaled tail.
+    passManager.addPass(AMDAIE::createAMDAIEFoldPerChannelDequantIntoMatmulPass());
     // Raise a decomposed LayerNorm to a single op before dispatch regions are
     // formed, for the same reason as the fold above: left as thirteen
     // generics, dispatch formation splits the normalization at its second
