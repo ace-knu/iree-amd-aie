@@ -165,6 +165,43 @@ accumulator" 만 이분 탐색으로 비교하면 전 구간 동치가 나온다
 
 ---
 
+## 6. BERT-base int8 정확도 — SmoothQuant 와 int16 residual 을 NPU 에서
+
+**브랜치** `bert-int8-accuracy` (`origin/bert-onnx` 의 `1549c7f6` 위, 로컬 전용) ·
+커밋 `986577fc`, `9a94c4c0`, `e2dc08da`, `769e9f74`, `a738f27c` ·
+**문서** 인계 `docs/2026-09-29_handoff_int8_accuracy.md`, 작업 기록 `docs/2026-09-29_int8_accuracy_work_log.md`
+
+NPU 는 같은 int8 모델의 ORT 와 같은 답을 냈지만, 그 int8 모델 자체가 fp32 BERT 대비 corr 0.667
+이었다. 오차는 FFN·residual 경로(FC2 출력, LayerNorm 출력, GELU 출력)의 양자화에 몰려 있고,
+ORT 에서 SmoothQuant + FC2 출력 int16 이 0.837 까지 올린다는 것이 확인돼 있었다. 그 둘을 NPU 가
+받아들이게 한 것이 이 항목이다.
+
+| 커밋 | 내용 |
+|---|---|
+| `986577fc` | GELU 쪽 SmoothQuant 가 FC1 디스패치에 붙이는 **채널별 상수를 스트리밍 대신 코어 메모리에서** 읽는다. shim MM2S 가 2 개뿐이라 세 번째 스트림을 둘 곳이 없다 |
+| `9a94c4c0` | LayerNorm 쪽 SmoothQuant 가 residual 가지에 남기는 **채널별 배수**를 raise 된 LayerNorm 의 정수 producer 가 받는다 |
+| `e2dc08da` | residual 가지의 재양자화를 **int16 격자로 넓힌다** (기본 켜짐, `--iree-amdaie-widen-residual-requantization`). producer 를 `custom_op` 영역 안에 만들고 새 패스 `AMDAIEUnfoldLayerNormResidual` 이 코드젠에서 꺼낸다 — 밖에 두면 IREE 가 FC2 matmul 에 융합해 스트림이 셋이 된다 |
+| `769e9f74` | LayerNorm ukernel 의 원소별 정규화에서 **bf16 을 없앴다.** aie2p 의 bf16 변환은 전부 -inf 방향이라 오차가 한쪽으로 쌓였고(이득 0.9947), SmoothQuant 가 LN 출력을 평평하게 만들어 3 배로 드러났다. f32 -> int8 은 `+1.5·2^23` 비트 트릭으로 반올림한다 |
+| `a738f27c` | 넓힌 residual 배수의 범위를 **정수로 정확히 검사**한다. double 비교가 4 곳을 거절하고 있었고, 음수 끝(-128, -32768)에서 합이 int16 을 넘어 wrap 할 수 있었다 |
+
+**효과** — 16 문장, fp32 BERT 대비 corr:
+
+| | ORT | NPU |
+|---|---:|---:|
+| 이전 (int8 그대로) | 0.6627 | 0.6633 |
+| **이후** | 0.8434 | **0.8415** |
+
+평가 64 문장 전부로는 **NPU 0.8400** (ORT 0.8414) — 인계 목표(ORT 시뮬레이션 0.837)를 넘었다.
+떼어 낸 LayerNorm 하나는 정확한 기준값과 99.996 % 일치(이전 93.38 %). 136 디스패치(NPU 131 / CPU 5)는
+그대로다.
+
+**쓰는 법** — 모델 쪽 SmoothQuant 는 `models/bert_base/quant/` 도구로 만든다. 컴파일 플래그는 추가할
+것이 없다(넓히기는 기본 켜짐). `=false` 로 끄면 `9a94c4c0` 과 같은 IR 이 나온다.
+
+⚠️ 속도는 재지 않았다. LayerNorm ukernel 은 16 레인 f32 로 바뀌어 느려졌을 수 있다.
+
+---
+
 ## 실행 규칙 (공유 호스트)
 
 `ace-amd01` 은 NPU 1개·Docker 1개를 여러 사용자가 공유한다. **NPU 실행과 전체 빌드는
