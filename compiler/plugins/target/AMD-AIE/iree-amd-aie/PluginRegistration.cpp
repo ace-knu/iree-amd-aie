@@ -69,9 +69,11 @@ struct AMDAIESession
     // multiple of the row count here (channels are independent under max, the
     // extra ones are sliced off the result).
     if (options.poolingChannelsLast) {
+      AMDAIE::AMDAIEDeviceModel deviceModel =
+          AMDAIE::getDeviceModel(options.AMDAIETargetDevice);
       AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
-      poolOptions.channelMultiple = options.getNumRows(
-          AMDAIE::getDeviceModel(options.AMDAIETargetDevice));
+      poolOptions.channelMultiple = options.getNumRows(deviceModel);
+      poolOptions.haloSplitColumns = options.getNumCols(deviceModel);
       passManager.addPass(
           AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass(poolOptions));
     }

@@ -97,6 +97,17 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
 
 bool isGemvMExtent(int64_t m) { return m == 1; }
 
+int64_t choosePoolColumns(int64_t oh, int64_t numCols) {
+  if (oh <= 0 || numCols <= 0) return 1;
+  int64_t odd = oh;
+  while (odd % 2 == 0) odd /= 2;
+  if (odd > 1 && odd <= numCols) return odd;
+  int64_t best = 1;
+  for (int64_t d = 1; d <= std::min(oh, numCols); ++d)
+    if (oh % d == 0) best = d;
+  return best;
+}
+
 bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<BoolAttr> attr =
       getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");

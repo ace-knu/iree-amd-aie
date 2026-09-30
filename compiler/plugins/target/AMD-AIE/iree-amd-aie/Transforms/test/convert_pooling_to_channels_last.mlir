@@ -1,4 +1,4 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(func.func(iree-amdaie-convert-pooling-to-channels-last{channel-multiple=4}))' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(func.func(iree-amdaie-convert-pooling-to-channels-last{channel-multiple=4 halo-split-columns=8}))' %s | FileCheck %s
 
 // VGG-16 pool1: NCHW 1x64x224x224 -> 1x64x112x112, 2x2 window, stride 2.
 // The input is transposed to NHWC, the -inf fill init is rebuilt in NHWC, the
@@ -86,4 +86,37 @@ func.func @pool_nchw_max_pad_channels(%in: tensor<1x6x16x16xf32>) -> tensor<1x6x
   %r = linalg.pooling_nchw_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
          ins(%in, %win : tensor<1x6x16x16xf32>, tensor<2x2xf32>) outs(%f : tensor<1x6x8x8xf32>) -> tensor<1x6x8x8xf32>
   return %r : tensor<1x6x8x8xf32>
+}
+
+
+// -----
+
+// Overlapping window (3x3/2, the ResNet stem pool on its padded 114x114
+// input -> 56x56): OH 56 has odd factor 7 <= 8 columns, so the NHWC pooling is
+// pre-split into 7 chunks of 8 output rows; chunk i gathers input rows
+// [16i, 16i + 17) (its 8 windows' bounding box, 1 halo row shared with the
+// next chunk), the chunks are stacked on a leading dim, the pooling runs
+// batched over them and the result is reshaped back to [1, 56, 56, 64] before
+// the NCHW transpose.
+// CHECK-LABEL: func.func @pool_nchw_max_3x3s2_halo
+// CHECK:         %[[IN_T:.+]] = linalg.transpose ins(%{{.+}} : tensor<1x64x114x114xf32>) {{.*}} permutation = [0, 2, 3, 1]
+// CHECK-DAG:     %[[C0:.+]] = tensor.extract_slice %[[IN_T]][0, 0, 0, 0] [1, 17, 114, 64] [1, 1, 1, 1] : tensor<1x114x114x64xf32> to tensor<1x17x114x64xf32>
+// CHECK-DAG:     %[[C1:.+]] = tensor.extract_slice %[[IN_T]][0, 16, 0, 0] [1, 17, 114, 64] [1, 1, 1, 1]
+// CHECK-DAG:     %[[C6:.+]] = tensor.extract_slice %[[IN_T]][0, 96, 0, 0] [1, 17, 114, 64] [1, 1, 1, 1]
+// CHECK:         %[[STACK:.+]] = tensor.concat dim(0) %[[C0]], %[[C1]], %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}}, %[[C6]] : {{.*}} -> tensor<7x17x114x64xf32>
+// CHECK:         %[[INIT:.+]] = linalg.fill {{.*}} -> tensor<7x8x56x64xf32>
+// CHECK:         %[[POOL:.+]] = linalg.pooling_nhwc_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+// CHECK-SAME:      ins(%[[STACK]], %{{.+}} : tensor<7x17x114x64xf32>, tensor<3x3xf32>) outs(%[[INIT]] : tensor<7x8x56x64xf32>)
+// CHECK:         %[[FLAT:.+]] = tensor.collapse_shape %[[POOL]] {{\[}}[0, 1], [2], [3]] : tensor<7x8x56x64xf32> into tensor<56x56x64xf32>
+// CHECK:         %[[RES:.+]] = tensor.expand_shape %[[FLAT]] {{\[}}[0, 1], [2], [3]] output_shape [1, 56, 56, 64] : tensor<56x56x64xf32> into tensor<1x56x56x64xf32>
+// CHECK:         linalg.transpose ins(%[[RES]] : tensor<1x56x56x64xf32>) {{.*}} permutation = [0, 3, 1, 2]
+// CHECK-NOT:     linalg.pooling_nchw_max
+func.func @pool_nchw_max_3x3s2_halo(%in: tensor<1x64x114x114xf32>) -> tensor<1x64x56x56xf32> {
+  %ninf = arith.constant 0xFF800000 : f32
+  %win = tensor.empty() : tensor<3x3xf32>
+  %e = tensor.empty() : tensor<1x64x56x56xf32>
+  %f = linalg.fill ins(%ninf : f32) outs(%e : tensor<1x64x56x56xf32>) -> tensor<1x64x56x56xf32>
+  %r = linalg.pooling_nchw_max {dilations = dense<1> : vector<2xi64>, strides = dense<2> : vector<2xi64>}
+         ins(%in, %win : tensor<1x64x114x114xf32>, tensor<3x3xf32>) outs(%f : tensor<1x64x56x56xf32>) -> tensor<1x64x56x56xf32>
+  return %r : tensor<1x64x56x56xf32>
 }

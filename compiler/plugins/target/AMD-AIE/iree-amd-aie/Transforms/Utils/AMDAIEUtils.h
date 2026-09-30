@@ -138,6 +138,14 @@ FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp);
 /// Utility to identify a 2-D max pooling generic (see `getMaxPoolingDims`).
 bool isMaxPoolingOp(linalg::LinalgOp linalgOp);
 
+/// Number of array columns the pool pipeline spreads a pooling's leading
+/// spatial output dim `oh` over: its odd factor when 1 < odd <= numCols (a
+/// halving pooling chain keeps that factor down to its last layer, so every
+/// layer gets the same column count), else the largest divisor of `oh` that is
+/// <= numCols. Shared by the root config and the preprocessing halo split so
+/// both agree on the chunk count.
+int64_t choosePoolColumns(int64_t oh, int64_t numCols);
+
 /// Returns true if `v` has no defined contents: it is a `tensor.empty`, or a
 /// slice of one. Such an operand (e.g. a pooling window that only sizes the
 /// reduction loops) never needs to be copied between memory levels.

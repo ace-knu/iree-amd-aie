@@ -30,8 +30,22 @@
 // (`PoolCoreSplit::SpatialChannel`), so the multiple is the row count: every
 // core row then gets the same channel count. Max pooling never mixes channels,
 // so the pad value is irrelevant to the kept channels.
+//
+// With `halo-split-columns` > 0 an NHWC max pooling whose window overlaps
+// along H (effective window != stride, e.g. 3x3/2) is pre-split on the host:
+// the output rows are cut into `choosePoolColumns(OH, columns)` chunks, each
+// chunk's input rows (its windows' bounding box, so neighbouring chunks share
+// `window - stride` halo rows, which are duplicated) are gathered with
+// `tensor.extract_slice` + `tensor.concat` onto a leading chunk dim, the
+// pooling runs as a batched NHWC pooling over the chunks and the result is
+// reshaped back. The pool pipeline then puts the chunk dim on array columns
+// (its memtile split needs disjoint pieces, which a leading chunk dim gives
+// for free), where OH itself could not be split for an overlapping window.
+// Costs one host gather dispatch and `(window - stride) / (stride * t)` extra
+// input bytes.
 
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -170,6 +184,94 @@ struct PoolingNchwMaxToNhwc : OpRewritePattern<linalg::PoolingNchwMaxOp> {
   int64_t channelMultiple;
 };
 
+/// Pre-split an NHWC max pooling with an overlapping window along H into
+/// disjoint-per-chunk batched pooling (see the file comment).
+struct PoolingNhwcMaxHaloSplit : OpRewritePattern<linalg::PoolingNhwcMaxOp> {
+  PoolingNhwcMaxHaloSplit(MLIRContext *ctx, int64_t columns)
+      : OpRewritePattern(ctx), columns(columns) {}
+
+  LogicalResult matchAndRewrite(linalg::PoolingNhwcMaxOp op,
+                                PatternRewriter &rewriter) const override {
+    if (columns <= 1) return failure();
+    if (!op.hasPureTensorSemantics())
+      return rewriter.notifyMatchFailure(op, "expected tensor semantics");
+    Value input = op.getInputs()[0];
+    Value window = op.getInputs()[1];
+    Value init = op.getOutputs()[0];
+    auto inType = dyn_cast<RankedTensorType>(input.getType());
+    auto outType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+    auto winType = dyn_cast<RankedTensorType>(window.getType());
+    if (!inType || !outType || !winType || !inType.hasStaticShape() ||
+        !outType.hasStaticShape() || !winType.hasStaticShape() ||
+        inType.getRank() != 4 || winType.getRank() != 2)
+      return rewriter.notifyMatchFailure(op, "expected static 4-D NHWC");
+    // Already chunked (or a real batch): the chunk dim would collide with N.
+    if (inType.getDimSize(0) != 1)
+      return rewriter.notifyMatchFailure(op, "expected N == 1");
+    int64_t strideH = op.getStrides().getValues<int64_t>()[0];
+    int64_t dilH = op.getDilations().getValues<int64_t>()[0];
+    int64_t winH = (winType.getDimSize(0) - 1) * dilH + 1;
+    if (winH == strideH)
+      return rewriter.notifyMatchFailure(op, "windows do not overlap along H");
+    int64_t OH = outType.getDimSize(1);
+    int64_t cols = choosePoolColumns(OH, columns);
+    if (cols <= 1 || OH % cols != 0)
+      return rewriter.notifyMatchFailure(op, "no column split for OH");
+    int64_t t = OH / cols;                     // output rows per chunk
+    int64_t rows = (t - 1) * strideH + winH;   // input rows per chunk (halo incl.)
+    int64_t IW = inType.getDimSize(2), C = inType.getDimSize(3);
+    int64_t OW = outType.getDimSize(2);
+    Type elemType = inType.getElementType();
+    Location loc = op.getLoc();
+
+    // Gather the chunks: chunk i takes input rows [i*t*strideH, +rows).
+    SmallVector<Value> chunks;
+    SmallVector<OpFoldResult> sizes = {
+        rewriter.getIndexAttr(1), rewriter.getIndexAttr(rows),
+        rewriter.getIndexAttr(IW), rewriter.getIndexAttr(C)};
+    SmallVector<OpFoldResult> strides(4, rewriter.getIndexAttr(1));
+    auto chunkType = RankedTensorType::get({1, rows, IW, C}, elemType);
+    for (int64_t i = 0; i < cols; ++i) {
+      SmallVector<OpFoldResult> offsets = {
+          rewriter.getIndexAttr(0), rewriter.getIndexAttr(i * t * strideH),
+          rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
+      chunks.push_back(tensor::ExtractSliceOp::create(
+          rewriter, loc, chunkType, input, offsets, sizes, strides));
+    }
+    Value stacked = tensor::ConcatOp::create(rewriter, loc, /*dim=*/0, chunks);
+
+    // Init: a plain fill is rebuilt at the chunked shape, anything else is
+    // reshaped [1, OH, OW, C] -> [OH, OW, C] -> [cols, t, OW, C].
+    SmallVector<ReassociationIndices> collapseN = {{0, 1}, {2}, {3}};
+    auto chunkedOutType = RankedTensorType::get({cols, t, OW, C}, elemType);
+    Value initChunked;
+    if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
+      Value empty = tensor::EmptyOp::create(rewriter, loc,
+                                            chunkedOutType.getShape(), elemType);
+      initChunked =
+          linalg::FillOp::create(rewriter, loc, fill.getInputs()[0], empty)
+              .getResult(0);
+    } else {
+      Value flat = tensor::CollapseShapeOp::create(rewriter, loc, init, collapseN);
+      initChunked = tensor::ExpandShapeOp::create(rewriter, loc, chunkedOutType,
+                                                  flat, collapseN);
+    }
+    auto pool = linalg::PoolingNhwcMaxOp::create(
+        rewriter, loc, TypeRange{chunkedOutType}, ValueRange{stacked, window},
+        initChunked, op.getStrides(), op.getDilations());
+    // [cols, t, OW, C] -> [OH, OW, C] -> [1, OH, OW, C].
+    Value flat =
+        tensor::CollapseShapeOp::create(rewriter, loc, pool.getResult(0), collapseN);
+    Value result =
+        tensor::ExpandShapeOp::create(rewriter, loc, outType, flat, collapseN);
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+ private:
+  int64_t columns;
+};
+
 class AMDAIEConvertPoolingToChannelsLastPass
     : public impl::AMDAIEConvertPoolingToChannelsLastBase<
           AMDAIEConvertPoolingToChannelsLastPass> {
@@ -188,6 +290,7 @@ class AMDAIEConvertPoolingToChannelsLastPass
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<PoolingNchwMaxToNhwc>(ctx, channelMultiple);
+    patterns.add<PoolingNhwcMaxHaloSplit>(ctx, haloSplitColumns);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
   }

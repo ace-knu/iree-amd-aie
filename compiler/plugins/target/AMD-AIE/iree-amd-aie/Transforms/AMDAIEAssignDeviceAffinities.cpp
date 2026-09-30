@@ -114,17 +114,26 @@ static bool executableIsContractionOrConv(IREE::Flow::ExecutableOp exe,
   ModuleOp innerModule = exe.getInnerModule();
   if (!innerModule) return false;
   bool found = false;
+  // A max pooling is admitted only when the dispatch holds nothing else but
+  // its init fill: the pool pipeline has no fused-consumer support, so a
+  // pooling fused with e.g. a layout transpose (which happens when no NHWC conv
+  // follows to absorb the transpose) must stay on the host.
+  bool foundPooling = false, poolingOnly = true;
   innerModule.walk([&](linalg::LinalgOp linalgOp) {
     if (linalg::isaContractionOpInterface(linalgOp) ||
         (linalg::isaConvolutionOpInterface(linalgOp) &&
-         hasMultiplyAccumulateBody(linalgOp)) ||
-        (allowPooling && isMaxPoolingOp(linalgOp))) {
+         hasMultiplyAccumulateBody(linalgOp))) {
       found = true;
       return WalkResult::interrupt();
     }
+    if (allowPooling && isMaxPoolingOp(linalgOp)) {
+      foundPooling = true;
+    } else if (!isa<linalg::FillOp>(linalgOp)) {
+      poolingOnly = false;
+    }
     return WalkResult::advance();
   });
-  return found;
+  return found || (foundPooling && poolingOnly);
 }
 
 class AMDAIEAssignDeviceAffinitiesPass

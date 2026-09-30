@@ -324,3 +324,48 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
     util.return %0 : tensor<8x8x16xf32>
   }
 }
+
+// -----
+
+// A max pooling fused with another compute op (here the NHWC -> NCHW transpose
+// that dispatch formation attaches when no channels-last conv follows) stays
+// on the host even with `pooling = true`: the pool pipeline handles a dispatch
+// of fill + pooling only.
+// CHECK-LABEL: util.func public @pool_fused_transpose
+// CHECK:         flow.dispatch @dispatch_pool_t::@pool_t
+// CHECK-SAME:      stream.affinity = #hal.device.affinity<@cpu>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pooling = true, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  flow.executable private @dispatch_pool_t {
+    flow.executable.export public @pool_t workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @pool_t(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x8x8xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x4x4xf32>>) {
+        %cst = arith.constant 0xFF800000 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0, 0], sizes = [8, 8, 8], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x8x8xf32>> -> tensor<8x8x8xf32>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>> -> tensor<2x2xf32>
+        %2 = tensor.empty() : tensor<4x4x8xf32>
+        %f = linalg.fill ins(%cst : f32) outs(%2 : tensor<4x4x8xf32>) -> tensor<4x4x8xf32>
+        %3 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0 * 2 + d3, d1 * 2 + d4, d2)>, affine_map<(d0, d1, d2, d3, d4) -> (d3, d4)>, affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%0, %1 : tensor<8x8x8xf32>, tensor<2x2xf32>) outs(%f : tensor<4x4x8xf32>) {
+        ^bb0(%in: f32, %win: f32, %out: f32):
+          %4 = arith.maximumf %out, %in : f32
+          linalg.yield %4 : f32
+        } -> tensor<4x4x8xf32>
+        %5 = tensor.empty() : tensor<8x4x4xf32>
+        %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2) -> (d1, d2, d0)>, affine_map<(d0, d1, d2) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel"]} ins(%3 : tensor<4x4x8xf32>) outs(%5 : tensor<8x4x4xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          linalg.yield %in : f32
+        } -> tensor<8x4x4xf32>
+        iree_tensor_ext.dispatch.tensor.store %6, %arg2, offsets = [0, 0, 0], sizes = [8, 4, 4], strides = [1, 1, 1] : tensor<8x4x4xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x4x4xf32>>
+        return
+      }
+    }
+  }
+  util.func public @pool_fused_transpose(%a: tensor<8x8x8xf32>, %w: tensor<2x2xf32>) -> tensor<8x4x4xf32> {
+    %r = flow.dispatch @dispatch_pool_t::@pool_t(%a, %w) : (tensor<8x8x8xf32>, tensor<2x2xf32>) -> tensor<8x4x4xf32>
+    util.return %r : tensor<8x4x4xf32>
+  }
+}

@@ -139,3 +139,44 @@ module {
     return
   }
 }
+
+
+// -----
+
+// Halo pre-split pooling (ResNet stem 3x3/2 after the preprocessing split):
+// 7 chunks x 17 input rows -> 7 x 8 output rows, C 64. The leading chunk dim
+// takes the columns (7), C the rows (16 channels each); with the whole OH of a
+// chunk free for the tile the largest L1 footprint is [1, 56, 16]: input
+// 3x113x16 + output 1x56x16, x2 buffers = 49 KB. Block [7, 1, 56, 64], 8 OH
+// blocks in time. Level 0 keeps N (block dim) and OH (1 != 8); level 1 keeps
+// the two core dims N and C.
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
+// CHECK-SAME:      [7, 1, 0, 0, 0, 0], [1, 0, 0, 16, 0, 0]
+// CHECK-SAME:  ]>
+// CHECK:       func.func @pool_halo_chunks
+// search: one distributed dim only; N = 7 fills 7 columns? No: 7 is not a
+// multiple of the row count, so the search spreads C over one column.
+// SEARCH:       func.func @pool_halo_chunks
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @pool_halo_chunks() {
+    %cst = arith.constant 0xFF800000 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<7x17x114x64xf32>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<7x8x56x64xf32>>
+    %2 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0, 0, 0], sizes = [7, 17, 114, 64], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<7x17x114x64xf32>> -> tensor<7x17x114x64xf32>
+    %3 = tensor.empty() : tensor<7x8x56x64xf32>
+    %4 = tensor.empty() : tensor<3x3xf32>
+    %5 = linalg.fill ins(%cst : f32) outs(%3 : tensor<7x8x56x64xf32>) -> tensor<7x8x56x64xf32>
+    %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1 * 2 + d4, d2 * 2 + d5, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d4, d5)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%2, %4 : tensor<7x17x114x64xf32>, tensor<3x3xf32>) outs(%5 : tensor<7x8x56x64xf32>) {
+    ^bb0(%in: f32, %in_0: f32, %out: f32):
+      %7 = arith.maximumf %out, %in : f32
+      linalg.yield %7 : f32
+    } -> tensor<7x8x56x64xf32>
+    iree_tensor_ext.dispatch.tensor.store %6, %1, offsets = [0, 0, 0, 0], sizes = [7, 8, 56, 64], strides = [1, 1, 1, 1] : tensor<7x8x56x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<7x8x56x64xf32>>
+    return
+  }
+}

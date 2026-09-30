@@ -102,6 +102,8 @@ def AMDAIEConvertPoolingToChannelsLast :
   let options = [
     Option<"channelMultiple", "channel-multiple", "int64_t", /*default=*/"1",
       "Pad the channel dim of the NHWC pooling up to a multiple of this value (the pool pipeline splits C over the array rows, so it is the row count); the padded channels are sliced off the result. 1 disables.">,
+    Option<"haloSplitColumns", "halo-split-columns", "int64_t", /*default=*/"0",
+      "Array column count. An NHWC max pooling whose window overlaps along H (window != stride) is pre-split on the host into `choosePoolColumns(OH, columns)` row chunks (each with its halo rows duplicated) stacked on a leading dim, so the pool pipeline can spread the chunks over the columns' memtiles. 0 disables.">,
   ];
 }
 

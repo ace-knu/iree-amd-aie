@@ -1326,17 +1326,19 @@ FailureOr<PoolTiling> searchPoolTiling(const PoolGeometry &g, int64_t numRows,
 }
 
 /// `PoolCoreSplit::SpatialChannel`: a fixed 2-D core grid.
-///   * columns <- the leading spatial output dim (OH), `cols` = its odd factor
-///     when 1 < odd <= numCols (a halving pooling chain keeps that factor down
-///     to its last layer, so every layer gets the same column count), else the
-///     largest divisor of OH that fits the array;
+///   * columns <- the leading spatial output dim (OH) split by
+///     `choosePoolColumns` (its odd factor, else the largest divisor that
+///     fits), or, when the pooling carries a leading chunk dim N > 1 (the
+///     preprocessing halo split of an overlapping-window pooling), that dim
+///     with cols = N;
 ///   * rows <- the channel dim, `rows` = the largest divisor of C <= numRows,
 ///     each row taking C / rows channels.
 /// The L1 tile is then [tOh, tOw, C / rows] with the largest L1 footprint,
 /// preferring a wide OW tile (longer contiguous DMA runs) over a tall OH tile;
-/// the block is [cols * tOh, tOw, C]. Remaining OH / OW blocks iterate in time.
-/// Fails (caller falls back to the search) when the grid degenerates to one
-/// core, the memtile pieces would overlap (window != stride along OH), or no
+/// the block is [cols * tOh, tOw, C] (or [N, tOh, tOw, C]). Remaining OH / OW
+/// blocks iterate in time. Fails (caller falls back to the search) when the
+/// grid degenerates to one core, the memtile pieces would overlap (window !=
+/// stride along OH with OH on the columns), N exceeds the column count, or no
 /// tile fits.
 FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
                                                const MaxPoolingDims &pool,
@@ -1349,19 +1351,41 @@ FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
   unsigned dC = numOut - 1;
   if (dC == dS || dC == dW) return failure();
   int64_t OH = g.bounds[dS], OW = g.bounds[dW], C = g.bounds[dC];
-  int64_t odd = OH;
-  while (odd % 2 == 0) odd /= 2;
-  int64_t cols =
-      (odd > 1 && odd <= numCols) ? odd : largestDivisorUpTo(OH, numCols);
+  // Column dim: a leading non-unit plain dim (halo chunks) if present, else OH.
+  int dCol = -1;
+  int64_t cols = 1;
+  for (unsigned d = 0; d < dS; ++d) {
+    if (d != dC && g.bounds[d] > 1) {
+      dCol = d;
+      break;
+    }
+  }
+  if (dCol >= 0) {
+    cols = g.bounds[dCol];
+    if (cols > numCols) return failure();
+  } else {
+    dCol = dS;
+    cols = choosePoolColumns(OH, numCols);
+    // The L2 block is split along OH across the columns' memtiles: pieces must
+    // not overlap.
+    if (cols > 1 && g.window[dS] != g.stride[dS]) return failure();
+  }
   int64_t rows = largestDivisorUpTo(C, numRows);
   if (cols * rows <= 1) return failure();
-  // The L2 block is split along OH across the columns' memtiles: pieces must
-  // not overlap.
-  if (cols > 1 && g.window[dS] != g.stride[dS]) return failure();
   int64_t tC = C / rows;
 
+  const bool colsOnOh = static_cast<unsigned>(dCol) == dS;
+  auto makeBlock = [&](ArrayRef<int64_t> tile) {
+    SmallVector<int64_t> block(tile.begin(), tile.end());
+    block[dC] = C;
+    if (colsOnOh)
+      block[dS] = cols * tile[dS];
+    else
+      block[dCol] = cols;
+    return block;
+  };
   SmallVector<int64_t> bestKey, bestTile;
-  for (int64_t tOh : divisorsOf(OH / cols)) {
+  for (int64_t tOh : divisorsOf(colsOnOh ? OH / cols : OH)) {
     for (int64_t tOw : divisorsOf(OW)) {
       SmallVector<int64_t> tile(numOut, 1);
       tile[dS] = tOh;
@@ -1369,9 +1393,7 @@ FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
       tile[dC] = tC;
       int64_t l1 = g.l1Bytes(tile);
       if (l1 > g.l1Limit) continue;
-      SmallVector<int64_t> block = tile;
-      block[dS] = cols * tOh;
-      block[dC] = C;
+      SmallVector<int64_t> block = makeBlock(tile);
       if (g.nonUnitBlocks(block) > 2) continue;
       if (g.l2BytesPerCol(block, cols) > g.l2Limit) continue;
       // Largest L1 footprint first, then the wider OW tile, then OH.
@@ -1385,10 +1407,9 @@ FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
     }
   }
   if (bestKey.empty()) return failure();
-  SmallVector<int64_t> block = bestTile;
-  block[dS] = cols * bestTile[dS];
-  block[dC] = C;
-  return PoolTiling{bestTile, block, {dS, dC}, dS};
+  return PoolTiling{bestTile, makeBlock(bestTile),
+                    {static_cast<unsigned>(dCol), dC},
+                    static_cast<unsigned>(dCol)};
 }
 
 }  // namespace
