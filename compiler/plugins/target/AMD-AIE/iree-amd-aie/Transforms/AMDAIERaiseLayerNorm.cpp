@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <limits>
+
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIELayerNormUtils.h"
@@ -142,6 +144,7 @@ FailureOr<ResidualMultipliers> computeResidualMultipliers(
     double scaleA, int64_t maxA, double scaleB, int64_t maxB,
     ArrayRef<double> channelScale) {
   constexpr int64_t kMaxI16 = 32767;
+  constexpr double kMaxI32 = 2147483647.0;
   double widestB = scaleB;
   if (!channelScale.empty()) {
     double widest = 0.0;
@@ -162,47 +165,82 @@ FailureOr<ResidualMultipliers> computeResidualMultipliers(
   while (extra < 256 && span / (finer / (extra * 2)) <= static_cast<double>(kMaxI16))
     extra *= 2;
   double commonStep = finer / static_cast<double>(extra);
-  // A widened branch has a step far finer than the sum can carry; then the
-  // range is what sets the step.
-  if (commonStep < minStep) commonStep = minStep;
-  if (span / commonStep > static_cast<double>(kMaxI16)) return failure();
 
-  // How many fractional bits the multipliers get. The products are summed in
-  // int32, and by construction `span / commonStep <= 32767`, so the sum plus
-  // the rounding term is at most `32767 * 2^shift + 2^(shift-1)`. Raising the
-  // shift is only worth it for a widened branch: int16 samples make each
+  auto multipliersAt = [&](double step, int shift) {
+    ResidualMultipliers result;
+    result.commonStep = step;
+    result.shift = shift;
+    result.ma = std::llround(scaleA / step * (1LL << shift));
+    if (channelScale.empty()) {
+      result.mb.push_back(std::llround(scaleB / step * (1LL << shift)));
+    } else {
+      result.mb.reserve(channelScale.size());
+      for (double c : channelScale)
+        result.mb.push_back(std::llround(scaleB * c / step * (1LL << shift)));
+    }
+    return result;
+  };
+
+  if (maxA <= 127 && maxB <= 127) {
+    // Two int8 branches: the arithmetic from before widening existed, exactly.
+    if (commonStep < minStep) commonStep = minStep;
+    if (span / commonStep > static_cast<double>(kMaxI16)) return failure();
+    ResidualMultipliers result = multipliersAt(commonStep, kResidualShift);
+    // Every multiplier has to survive the int32 product with its sample.
+    if (result.ma <= 0 || static_cast<double>(result.ma) * maxA > kMaxI32)
+      return failure();
+    for (int64_t m : result.mb)
+      if (m <= 0 || static_cast<double>(m) * maxB > kMaxI32) return failure();
+    return result;
+  }
+
+  // A widened branch has a step far finer than the sum can carry, so the range
+  // sets the step, and a widened range is tight enough that it has to be
+  // checked in the integers the producer computes in, not estimated in
+  // doubles. Two things the estimate above gets wrong here:
+  //  - the range is not symmetric. Each branch reaches one step further down
+  //    than up, and one int8 step of the residual branch is some 200 steps of
+  //    the sum, so `-128` alone takes it about 0.5% past `-32768`, where the
+  //    int16 truncation wraps it to a large positive value;
+  //  - `span / (span / 32767)` need not come back as 32767. On BERT-base it
+  //    came out a hair above for 4 of the 23 branches, which then stayed int8.
+  // So the step is set by the negative end, the multipliers are rounded, and
+  // the worst case of both ends is evaluated exactly: the largest shift whose
+  // sum stays inside int32 and whose result stays inside int16. Rounding the
+  // multipliers can still push an end over by a step; then the step grows a
+  // little and the search runs again.
+  //
+  // The shift is raised as far as it goes because int16 samples make each
   // multiplier 258x smaller, and at the old shift the multiplier's own
   // rounding (up to 2.5% on this model) would undo the precision the wider
-  // samples bought. Two int8 branches keep the shift they had.
-  int shift = kResidualShift;
-  if (maxA > 127 || maxB > 127) {
-    constexpr double kMaxI32 = 2147483647.0;
-    while (shift < 16 &&
-           span / commonStep * static_cast<double>(1LL << (shift + 1)) +
-                   static_cast<double>(1LL << shift) <=
-               kMaxI32)
-      ++shift;
+  // samples bought.
+  const int64_t minA = -(maxA + 1), minB = -(maxB + 1);
+  auto fits = [&](const ResidualMultipliers &r) {
+    if (r.ma <= 0) return false;
+    int64_t widestMb = 0;
+    for (int64_t m : r.mb) {
+      if (m <= 0) return false;
+      widestMb = std::max(widestMb, m);
+    }
+    const int64_t half = int64_t{1} << (r.shift - 1);
+    const int64_t top = maxA * r.ma + maxB * widestMb + half;
+    const int64_t bottom = minA * r.ma + minB * widestMb + half;
+    constexpr int64_t kI32Max = std::numeric_limits<int32_t>::max();
+    constexpr int64_t kI32Min = std::numeric_limits<int32_t>::min();
+    return top <= kI32Max && bottom >= kI32Min &&
+           (top >> r.shift) <= kMaxI16 && (bottom >> r.shift) >= -kMaxI16 - 1;
+  };
+  double negativeSpan = -minA * scaleA - minB * widestB;
+  commonStep = std::max(
+      commonStep, negativeSpan / static_cast<double>(kMaxI16 + 1));
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    for (int shift = 16; shift >= kResidualShift; --shift) {
+      ResidualMultipliers result = multipliersAt(commonStep, shift);
+      if (fits(result)) return result;
+    }
+    commonStep *= 1.0 + 1.0 / 4096.0;
   }
-
-  ResidualMultipliers result;
-  result.commonStep = commonStep;
-  result.shift = shift;
-  result.ma = std::llround(scaleA / commonStep * (1LL << shift));
-  if (channelScale.empty()) {
-    result.mb.push_back(std::llround(scaleB / commonStep * (1LL << shift)));
-  } else {
-    result.mb.reserve(channelScale.size());
-    for (double c : channelScale)
-      result.mb.push_back(
-          std::llround(scaleB * c / commonStep * (1LL << shift)));
-  }
-  // Every multiplier has to survive the int32 product with its sample.
-  constexpr double kMaxI32 = 2147483647.0;
-  if (result.ma <= 0 || static_cast<double>(result.ma) * maxA > kMaxI32)
-    return failure();
-  for (int64_t m : result.mb)
-    if (m <= 0 || static_cast<double>(m) * maxB > kMaxI32) return failure();
-  return result;
+  return failure();
 }
 
 /// Whether to put the residual branch's requantization on the int16 grid.
