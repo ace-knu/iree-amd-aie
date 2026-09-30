@@ -42,6 +42,11 @@ struct QuantizedLayerNormDAG {
   /// kernel's int16 variant takes.
   Value residual;
   double residualScale = 0.0;
+  /// A per-channel rescale sitting between the residual dequantize and the add,
+  /// as an `[N]`-shaped f32 constant. SmoothQuant puts one there: the previous
+  /// LayerNorm divides its output by `s` (folded into gamma and beta for free),
+  /// so the residual branch has to multiply it back. Null when there is none.
+  Value residualChannelScale;
   /// The `[N]`-shaped gamma and beta the chain multiplies and adds.
   Value gamma;
   Value beta;

@@ -120,16 +120,34 @@ constexpr int kResidualShift = 8;
 /// decision can be made before anything is rewritten.
 struct ResidualMultipliers {
   int64_t ma;
-  int64_t mb;
+  /// One entry when the residual branch has a plain scale, `N` when SmoothQuant
+  /// left a per-channel rescale on it.
+  SmallVector<int64_t> mb;
   double commonStep;
 };
 
-FailureOr<ResidualMultipliers> computeResidualMultipliers(double scaleA,
-                                                          double scaleB) {
+/// `channelScale` is empty for a plain residual, or holds the `[N]` factors the
+/// residual branch has to multiply back in.
+///
+/// The common step has to keep the widest channel inside int16, so a wide
+/// spread of factors costs fractional bits for every channel. That is
+/// affordable at the LayerNorm sites, whose factors span about 3x to 17x; it
+/// would not be at the GELU site, where they span four orders of magnitude.
+FailureOr<ResidualMultipliers> computeResidualMultipliers(
+    double scaleA, double scaleB, ArrayRef<double> channelScale) {
   constexpr int64_t kMaxI16 = 32767;
-  double finer = std::min(scaleA, scaleB);
+  double widestB = scaleB;
+  if (!channelScale.empty()) {
+    double widest = 0.0;
+    for (double c : channelScale) {
+      if (!(c > 0.0)) return failure();
+      widest = std::max(widest, c);
+    }
+    widestB = scaleB * widest;
+  }
+  double finer = std::min(scaleA, widestB);
   if (!(finer > 0.0)) return failure();
-  double ratio = std::max(scaleA, scaleB) / finer;
+  double ratio = std::max(scaleA, widestB) / finer;
   // As many extra fractional bits as the int16 range allows.
   int64_t extra = 1;
   while (extra < 256 &&
@@ -138,21 +156,32 @@ FailureOr<ResidualMultipliers> computeResidualMultipliers(double scaleA,
   if (127.0 * extra * (1.0 + ratio) > static_cast<double>(kMaxI16))
     return failure();
   double commonStep = finer / static_cast<double>(extra);
-  return ResidualMultipliers{
-      std::llround(scaleA / commonStep * (1 << kResidualShift)),
-      std::llround(scaleB / commonStep * (1 << kResidualShift)), commonStep};
+
+  ResidualMultipliers result;
+  result.commonStep = commonStep;
+  result.ma = std::llround(scaleA / commonStep * (1 << kResidualShift));
+  if (channelScale.empty()) {
+    result.mb.push_back(
+        std::llround(scaleB / commonStep * (1 << kResidualShift)));
+  } else {
+    result.mb.reserve(channelScale.size());
+    for (double c : channelScale)
+      result.mb.push_back(
+          std::llround(scaleB * c / commonStep * (1 << kResidualShift)));
+  }
+  return result;
 }
 
 Value buildResidualProducer(OpBuilder &b, Location loc, Value a, Value b8,
                             const ResidualMultipliers &m) {
   constexpr int kShift = kResidualShift;
-  int64_t ma = m.ma;
-  int64_t mb = m.mb;
+  bool perChannel = m.mb.size() > 1;
 
   MLIRContext *ctx = b.getContext();
   AffineExpr e0, e1;
   bindDims(ctx, e0, e1);
   AffineMap map2d = AffineMap::get(2, 0, {e0, e1}, ctx);
+  AffineMap mapCol = AffineMap::get(2, 0, {e1}, ctx);
   const SmallVector<utils::IteratorType> pp = {utils::IteratorType::parallel,
                                                utils::IteratorType::parallel};
   auto aType = cast<RankedTensorType>(a.getType());
@@ -161,19 +190,41 @@ Value buildResidualProducer(OpBuilder &b, Location loc, Value a, Value b8,
   Value init = b.create<tensor::EmptyOp>(loc, outType.getShape(),
                                          outType.getElementType());
   Type i32 = b.getI32Type();
-  Value cMa = b.create<arith::ConstantOp>(loc, i32, b.getI32IntegerAttr(ma));
-  Value cMb = b.create<arith::ConstantOp>(loc, i32, b.getI32IntegerAttr(mb));
+  Value cMa = b.create<arith::ConstantOp>(loc, i32, b.getI32IntegerAttr(m.ma));
   Value cHalf = b.create<arith::ConstantOp>(
       loc, i32, b.getI32IntegerAttr(1 << (kShift - 1)));
   Value cShift =
       b.create<arith::ConstantOp>(loc, i32, b.getI32IntegerAttr(kShift));
+
+  // The per-channel multipliers ride along as an operand. They are a small
+  // constant, so the backend ends up reading them out of the core's own data
+  // memory rather than streaming them in -- which it has to, because the two
+  // incoming DMA channels are already spoken for by `a` and `b8`.
+  SmallVector<Value> inputs{a, b8};
+  SmallVector<AffineMap> maps{map2d, map2d};
+  Value cMb;
+  if (perChannel) {
+    SmallVector<int32_t> values;
+    values.reserve(m.mb.size());
+    for (int64_t v : m.mb) values.push_back(static_cast<int32_t>(v));
+    auto vecType = RankedTensorType::get(
+        {static_cast<int64_t>(values.size())}, i32);
+    inputs.push_back(b.create<arith::ConstantOp>(
+        loc, DenseElementsAttr::get(vecType, ArrayRef<int32_t>(values))));
+    maps.push_back(mapCol);
+  } else {
+    cMb = b.create<arith::ConstantOp>(loc, i32,
+                                      b.getI32IntegerAttr(m.mb.front()));
+  }
+  maps.push_back(map2d);
+
   return buildGeneric(
-      b, loc, outType, ValueRange{a, b8}, init, {map2d, map2d, map2d}, pp,
+      b, loc, outType, inputs, init, maps, pp,
       [&](OpBuilder &nb, ValueRange args) -> Value {
         Value ai = nb.create<arith::ExtSIOp>(loc, i32, args[0]);
         Value bi = nb.create<arith::ExtSIOp>(loc, i32, args[1]);
         Value pa = nb.create<arith::MulIOp>(loc, ai, cMa);
-        Value pb = nb.create<arith::MulIOp>(loc, bi, cMb);
+        Value pb = nb.create<arith::MulIOp>(loc, bi, perChannel ? args[2] : cMb);
         Value sum = nb.create<arith::AddIOp>(loc, pa, pb);
         Value biased = nb.create<arith::AddIOp>(loc, sum, cHalf);
         Value shifted = nb.create<arith::ShRSIOp>(loc, biased, cShift);
@@ -351,10 +402,17 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
     FailureOr<DenseElementsAttr> maybeGammaBeta = foldPackedGammaBeta(
         rewriter, dag.gamma, dag.beta, dag.outputScale, dag.featureSize);
     if (failed(maybeGammaBeta)) return failure();
-    ResidualMultipliers multipliers{0, 0, dag.inputScale};
+    ResidualMultipliers multipliers;
+    multipliers.commonStep = dag.inputScale;
     if (dag.residual) {
+      SmallVector<double> channelScale;
+      if (dag.residualChannelScale &&
+          !readF32Constant(dag.residualChannelScale, dag.featureSize,
+                           channelScale))
+        return failure();
       FailureOr<ResidualMultipliers> maybeMultipliers =
-          computeResidualMultipliers(dag.inputScale, dag.residualScale);
+          computeResidualMultipliers(dag.inputScale, dag.residualScale,
+                                     channelScale);
       if (failed(maybeMultipliers)) return failure();
       multipliers = *maybeMultipliers;
     }

@@ -329,13 +329,38 @@ FailureOr<QuantizedLayerNormDAG> matchQuantizedLayerNorm(
     return true;
   };
 
+  /// A per-channel rescale, `x * c[j]`, broadcast over the feature dimension.
+  /// On success `op` is advanced to the producer underneath it and the constant
+  /// is reported. SmoothQuant leaves exactly one of these on the residual
+  /// branch; anything else keeps the plain shape and this does nothing.
+  auto peelChannelScale = [&](linalg::GenericOp &op, Value &channelScale) {
+    if (channelScale) return;
+    if (op.getNumDpsInputs() != 2) return;
+    if (!hasMaps(op, ppp, {mapAll, mapCol, mapAll})) return;
+    if (!isBinary<arith::MulFOp>(op)) return;
+    Value constant = op.getDpsInputs()[1];
+    if (!matchPattern(constant, m_Constant())) return;
+    linalg::GenericOp inner = singleUseProducer(op.getDpsInputs()[0]);
+    if (!inner) return;
+    channelScale = constant;
+    dag.chain.insert(op.getOperation());
+    op = inner;
+  };
+
   if (isBinary<arith::AddFOp>(headOp)) {
     // A residual add. Both sides have to be plain int8 dequantizes, and each
     // must feed nothing but this add -- the add itself is what has two uses.
+    // Either side may carry a per-channel rescale on top of its dequantize.
     if (!hasMaps(headOp, ppp, {mapAll, mapAll, mapAll})) return failure();
     linalg::GenericOp lhs = singleUseProducer(headOp.getDpsInputs()[0]);
     linalg::GenericOp rhs = singleUseProducer(headOp.getDpsInputs()[1]);
     if (!lhs || !rhs) return failure();
+    Value inputChannelScale;
+    peelChannelScale(rhs, dag.residualChannelScale);
+    peelChannelScale(lhs, inputChannelScale);
+    // The rewrite folds the rescale into the residual branch's multiplier, so
+    // it has to be the residual branch that carries it.
+    if (inputChannelScale) return failure();
     if (!matchDequantize(lhs, dag.input, dag.inputScale)) return failure();
     if (!matchDequantize(rhs, dag.residual, dag.residualScale)) return failure();
     dag.chain.insert(lhs.getOperation());

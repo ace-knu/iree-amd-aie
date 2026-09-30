@@ -618,7 +618,7 @@ matchLayerNormDAGForUKernel(RewriterBase &rewriter, Operation *op,
   int64_t m = outType.getDimSize(0);
   int64_t n = outType.getDimSize(1);
   // The shapes the kernel is instantiated for: a full tile and its tail.
-  if (n != 768 || (m != 16 && m != 8))
+  if (n != 768 || (m != 16 && m != 8 && m != 4))
     return rewriter.notifyMatchFailure(op, "no kernel for this tile shape");
   if (gammaBetaType.getDimSize(0) != 2 || gammaBetaType.getDimSize(1) != n)
     return rewriter.notifyMatchFailure(op, "gamma/beta are not packed [2, N]");

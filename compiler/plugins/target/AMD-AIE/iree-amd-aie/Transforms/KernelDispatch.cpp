@@ -14,6 +14,7 @@
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -918,32 +919,51 @@ static LogicalResult setRootConfigForLayerNormCopyPipeline(
   // What one core holds for a tile of rows. Operands that arrive or leave over
   // a DMA are double-buffered; what a fused producer writes stays on the core
   // and is not.
-  int64_t bytesPerRow = features * (nBytesIn + nBytesOut) * 2;
-  int64_t flatBytes = stackSize;
+  // Every L1 buffer a tile of rows needs, as bytes per row, in the order the
+  // buffer allocator will see them. Operands that arrive or leave over a DMA
+  // are double-buffered; what a fused producer writes stays on the core and is
+  // not.
+  SmallVector<int64_t> bufferBytesPerRow;
+  // Read out of the core's own data memory rather than streamed in: gamma and
+  // beta, and a per-channel table on a fused residual add. They cost space but
+  // no channel, and they are not per row.
+  int64_t constantBytes = 0;
   // The streamed operands: the normalization's own input, or, when a residual
-  // add was fused in front of it, that add's two activations instead.
+  // add was fused in front of it, that add's activations instead.
   int64_t streamedInputs = 1;
   if (auto producer =
           customOp.getInputs()[0].getDefiningOp<linalg::GenericOp>()) {
     streamedInputs = 0;
+    // The producer's result is the normalization's input. It never crosses a
+    // DMA, so it is a single buffer.
+    bufferBytesPerRow.push_back(features * nBytesIn);
     for (Value in : producer.getDpsInputs()) {
       auto operandType = dyn_cast<ShapedType>(in.getType());
       if (!operandType) continue;
+      int64_t elementBytes = operandType.getElementTypeBitWidth() / 8;
+      if (matchPattern(in, m_Constant())) {
+        constantBytes += operandType.getNumElements() * elementBytes;
+        continue;
+      }
       ++streamedInputs;
-      bytesPerRow += features * (operandType.getElementTypeBitWidth() / 8) * 2;
+      bufferBytesPerRow.push_back(features * elementBytes);
+      bufferBytesPerRow.push_back(features * elementBytes);
     }
-    // The producer's result is the normalization's input, counted as streamed
-    // above though it never crosses a DMA: take back its second buffer.
-    bytesPerRow -= features * nBytesIn;
+  } else {
+    bufferBytesPerRow.push_back(features * nBytesIn);
+    bufferBytesPerRow.push_back(features * nBytesIn);
   }
-  // Gamma and beta are placed in the core's own memory rather than streamed, so
-  // they cost space but no channel.
+  bufferBytesPerRow.push_back(features * nBytesOut);
+  bufferBytesPerRow.push_back(features * nBytesOut);
   if (auto gammaBeta =
           customOp->getAttrOfType<DenseElementsAttr>(kLayerNormGammaBeta)) {
     auto packedType = cast<ShapedType>(gammaBeta.getType());
-    flatBytes +=
+    constantBytes +=
         packedType.getNumElements() * (packedType.getElementTypeBitWidth() / 8);
   }
+  int64_t bytesPerRow = 0;
+  for (int64_t perRow : bufferBytesPerRow) bytesPerRow += perRow;
+  int64_t flatBytes = stackSize + constantBytes;
   int64_t maxRowsPerCore =
       (deviceModel.getCoreTileLocalMemorySize() - flatBytes) / bytesPerRow;
   if (maxRowsPerCore <= 0)
@@ -952,6 +972,28 @@ static LogicalResult setRootConfigForLayerNormCopyPipeline(
         "not fit in local memory");
   int64_t rowsPerCore =
       std::min<int64_t>(findLargestFactor(rows, maxRowsPerCore), 32);
+  // The flat estimate above is not the whole story. The buffers are handed out
+  // a bank at a time, so one that does not fit in what is left of a bank starts
+  // the next one, and the core-local constants get only what sits above the
+  // last bank used -- not `local memory - stack - buffers`. Replay that
+  // allocation and step the tile down until the constants fit.
+  int64_t localMemory = deviceModel.getCoreTileLocalMemorySize();
+  uint32_t numBanks = deviceModel.getNumBanks(/*col=*/0, /*row=*/2);
+  int64_t bankSize = numBanks > 0 ? localMemory / numBanks : localMemory;
+  auto constantsFit = [&](int64_t candidate) {
+    int64_t address = stackSize;
+    for (int64_t perRow : bufferBytesPerRow) {
+      int64_t size = perRow * candidate;
+      if (size > bankSize) return false;
+      if (address % bankSize + size > bankSize)
+        address = llvm::alignTo(address, bankSize);
+      address += size;
+      if (address > localMemory) return false;
+    }
+    return localMemory - address >= constantBytes;
+  };
+  while (rowsPerCore > 1 && !constantsFit(rowsPerCore))
+    rowsPerCore = findLargestFactor(rows, rowsPerCore - 1);
 
   // How many cores one block may spread over. Every core takes its own memtile
   // connection for each operand it is fed, so `k` streamed inputs across `c`
