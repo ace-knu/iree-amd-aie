@@ -65,9 +65,15 @@ struct AMDAIESession
     // Move NCHW max pooling to NHWC so it matches the channels-last convs
     // (the upstream channels-last pass skips pooling); the transposes this
     // inserts cancel against the conv-side ones downstream.
+    // The pool pipeline splits C over the array rows, so C is padded up to a
+    // multiple of the row count here (channels are independent under max, the
+    // extra ones are sliced off the result).
     if (options.poolingChannelsLast) {
+      AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
+      poolOptions.channelMultiple = options.getNumRows(
+          AMDAIE::getDeviceModel(options.AMDAIETargetDevice));
       passManager.addPass(
-          AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass());
+          AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass(poolOptions));
     }
     // Inject the device topology now, while both device globals still exist
     // (an unused CPU device global would otherwise be DCE'd before the Flow

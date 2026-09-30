@@ -99,6 +99,10 @@ def AMDAIEConvertPoolingToChannelsLast :
   let summary = "Rewrite NCHW max pooling (`linalg.pooling_nchw_max`) as NHWC max pooling wrapped in `linalg.transpose` ops, so pooling follows the channels-last layout of the surrounding convolutions.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass()";
+  let options = [
+    Option<"channelMultiple", "channel-multiple", "int64_t", /*default=*/"1",
+      "Pad the channel dim of the NHWC pooling up to a multiple of this value (the pool pipeline splits C over the array rows, so it is the row count); the padded channels are sliced off the result. 1 disables.">,
+  ];
 }
 
 def AMDAIESplitLargeContractionDispatches :

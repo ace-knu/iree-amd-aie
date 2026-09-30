@@ -102,7 +102,8 @@ std::unique_ptr<Pass> createAMDAIEPadContractionDispatchesPass();
 
 /// Create a preprocessing pass that rewrites NCHW max pooling as NHWC max
 /// pooling wrapped in transposes (channels-last, matching the convs).
-std::unique_ptr<Pass> createAMDAIEConvertPoolingToChannelsLastPass();
+std::unique_ptr<Pass> createAMDAIEConvertPoolingToChannelsLastPass(
+    AMDAIEConvertPoolingToChannelsLastOptions options = {});
 
 /// Create a pass that splits a large-(K,N) transpose_b NPU matmul dispatch into
 /// N-chunk sub-dispatches (weight sliced along N) concatenated on the host, to
