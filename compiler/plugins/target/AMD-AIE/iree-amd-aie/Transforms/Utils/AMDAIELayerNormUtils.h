@@ -89,6 +89,23 @@ constexpr StringLiteral kLayerNormEpsilonScaled =
 /// in the core's own data memory, so it costs no channel and no transfer.
 constexpr StringLiteral kLayerNormGammaBeta = "amdaie.layernorm_gamma_beta";
 
+/// Marks a LayerNorm whose residual producer sits inside its own region, with
+/// the two activations the producer adds as the op's two inputs.
+///
+/// Dispatch formation decides where the producer goes, and it decides by type:
+/// IREE takes a generic whose widest full-rank input is narrower than its
+/// result for a dequantization and clones it into its consumer, which is how a
+/// producer adding two int8 activations into int16 ends up beside the
+/// LayerNorm. Widen one of those activations to int16 and the same producer
+/// becomes an ordinary elementwise op that fuses into the matmul in front of
+/// it -- whose dispatch then wants a third incoming stream, one more than a
+/// shim column has. Inside the region nothing can move it.
+///
+/// Codegen takes it back out first thing (`AMDAIEUnfoldLayerNormResidual`), so
+/// from then on the dispatch looks exactly like the int8 one.
+constexpr StringLiteral kLayerNormResidualInRegion =
+    "amdaie.layernorm_residual_in_region";
+
 /// Whether `op` is an executable holding nothing but one marked LayerNorm.
 bool isQuantizedLayerNormOnly(Operation *op);
 

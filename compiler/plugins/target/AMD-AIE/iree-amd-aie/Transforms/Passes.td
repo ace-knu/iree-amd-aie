@@ -626,6 +626,20 @@ def AMDAIEIntegerRequantization :
     }];
 }
 
+def AMDAIEUnfoldLayerNormResidual :
+    InterfacePass<"iree-amdaie-unfold-layernorm-residual", "mlir::FunctionOpInterface"> {
+    let summary = "Take a LayerNorm's residual producer back out of its region.";
+    let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEUnfoldLayerNormResidualPass()";
+    let description = [{
+      When one of the two activations a residual add sums is int16, the raise
+      builds the add inside the LayerNorm's `custom_op`, because otherwise
+      dispatch formation would fuse it into the matmul in front and ask that
+      dispatch for a third incoming stream. Inside a dispatch it can go back:
+      this puts it in front of the op again, as a `linalg.generic` feeding the
+      samples, which is the form everything after this pass already handles.
+    }];
+}
+
 def AMDAIERaiseLayerNorm :
     Pass<"iree-amdaie-raise-layernorm", ""> {
     let summary = "Raise a quantized row-wise LayerNorm chain to one tiling root.";

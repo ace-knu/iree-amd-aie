@@ -96,6 +96,7 @@ iree_cc_library(
     "AMDAIELocalizeLogicalObjectFifo.cpp"
     "AMDAIEApproximateMathFunctions.cpp"
     "AMDAIERaiseLayerNorm.cpp"
+    "AMDAIEUnfoldLayerNormResidual.cpp"
     "AMDAIEExpandRoundEven.cpp"
     "AMDAIEIntegerRequantization.cpp"
     "AMDAIELoadStoreAlignmentReset.cpp"

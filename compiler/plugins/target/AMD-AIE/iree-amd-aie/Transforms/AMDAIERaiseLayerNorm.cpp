@@ -9,6 +9,7 @@
 #include "iree-amd-aie/Transforms/Utils/AMDAIELayerNormUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "llvm/Support/CommandLine.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -120,12 +121,16 @@ constexpr int kResidualShift = 8;
 /// decision can be made before anything is rewritten.
 struct ResidualMultipliers {
   int64_t ma;
+  /// Fractional bits the multipliers carry.
+  int shift = kResidualShift;
   /// One entry when the residual branch has a plain scale, `N` when SmoothQuant
   /// left a per-channel rescale on it.
   SmallVector<int64_t> mb;
   double commonStep;
 };
 
+/// `maxA` and `maxB` are the largest magnitudes the two branches can carry --
+/// 127 for an int8 branch, 32767 for one that was widened to int16.
 /// `channelScale` is empty for a plain residual, or holds the `[N]` factors the
 /// residual branch has to multiply back in.
 ///
@@ -134,7 +139,8 @@ struct ResidualMultipliers {
 /// affordable at the LayerNorm sites, whose factors span about 3x to 17x; it
 /// would not be at the GELU site, where they span four orders of magnitude.
 FailureOr<ResidualMultipliers> computeResidualMultipliers(
-    double scaleA, double scaleB, ArrayRef<double> channelScale) {
+    double scaleA, int64_t maxA, double scaleB, int64_t maxB,
+    ArrayRef<double> channelScale) {
   constexpr int64_t kMaxI16 = 32767;
   double widestB = scaleB;
   if (!channelScale.empty()) {
@@ -147,34 +153,175 @@ FailureOr<ResidualMultipliers> computeResidualMultipliers(
   }
   double finer = std::min(scaleA, widestB);
   if (!(finer > 0.0)) return failure();
-  double ratio = std::max(scaleA, widestB) / finer;
-  // As many extra fractional bits as the int16 range allows.
+  // The physical range the sum has to hold, and therefore the coarsest step.
+  double span = maxA * scaleA + maxB * widestB;
+  double minStep = span / static_cast<double>(kMaxI16);
+  // As many extra fractional bits as the int16 range allows. For two int8
+  // branches this is exactly the old `127 * extra * (1 + ratio) <= 32767`.
   int64_t extra = 1;
-  while (extra < 256 &&
-         127.0 * (extra * 2) * (1.0 + ratio) <= static_cast<double>(kMaxI16))
+  while (extra < 256 && span / (finer / (extra * 2)) <= static_cast<double>(kMaxI16))
     extra *= 2;
-  if (127.0 * extra * (1.0 + ratio) > static_cast<double>(kMaxI16))
-    return failure();
   double commonStep = finer / static_cast<double>(extra);
+  // A widened branch has a step far finer than the sum can carry; then the
+  // range is what sets the step.
+  if (commonStep < minStep) commonStep = minStep;
+  if (span / commonStep > static_cast<double>(kMaxI16)) return failure();
+
+  // How many fractional bits the multipliers get. The products are summed in
+  // int32, and by construction `span / commonStep <= 32767`, so the sum plus
+  // the rounding term is at most `32767 * 2^shift + 2^(shift-1)`. Raising the
+  // shift is only worth it for a widened branch: int16 samples make each
+  // multiplier 258x smaller, and at the old shift the multiplier's own
+  // rounding (up to 2.5% on this model) would undo the precision the wider
+  // samples bought. Two int8 branches keep the shift they had.
+  int shift = kResidualShift;
+  if (maxA > 127 || maxB > 127) {
+    constexpr double kMaxI32 = 2147483647.0;
+    while (shift < 16 &&
+           span / commonStep * static_cast<double>(1LL << (shift + 1)) +
+                   static_cast<double>(1LL << shift) <=
+               kMaxI32)
+      ++shift;
+  }
 
   ResidualMultipliers result;
   result.commonStep = commonStep;
-  result.ma = std::llround(scaleA / commonStep * (1 << kResidualShift));
+  result.shift = shift;
+  result.ma = std::llround(scaleA / commonStep * (1LL << shift));
   if (channelScale.empty()) {
-    result.mb.push_back(
-        std::llround(scaleB / commonStep * (1 << kResidualShift)));
+    result.mb.push_back(std::llround(scaleB / commonStep * (1LL << shift)));
   } else {
     result.mb.reserve(channelScale.size());
     for (double c : channelScale)
       result.mb.push_back(
-          std::llround(scaleB * c / commonStep * (1 << kResidualShift)));
+          std::llround(scaleB * c / commonStep * (1LL << shift)));
   }
+  // Every multiplier has to survive the int32 product with its sample.
+  constexpr double kMaxI32 = 2147483647.0;
+  if (result.ma <= 0 || static_cast<double>(result.ma) * maxA > kMaxI32)
+    return failure();
+  for (int64_t m : result.mb)
+    if (m <= 0 || static_cast<double>(m) * maxB > kMaxI32) return failure();
   return result;
+}
+
+/// Whether to put the residual branch's requantization on the int16 grid.
+///
+/// On by default. On BERT-base it takes the NPU from 0.778 to 0.829 against
+/// fp32. Off, the compile is byte for byte what it was before the widening
+/// existed, which is what the flag is kept for.
+///
+/// A widened branch moves the residual producer inside the LayerNorm's region
+/// (`kLayerNormResidualInRegion`): left in front of it, dispatch formation would
+/// fuse it into the matmul and ask that dispatch for a third stream.
+static llvm::cl::opt<bool> clWidenResidualRequantization(
+    "iree-amdaie-widen-residual-requantization",
+    llvm::cl::desc(
+        "Requantize the branch feeding a raised LayerNorm's residual add to "
+        "int16 rather than int8, keeping 258x more of the matmul's "
+        "accumulator."),
+    llvm::cl::init(true));
+
+/// Read a scalar f32 constant. (`AMDAIELayerNormUtils.cpp` has the same helper,
+/// but keeps it to itself.)
+bool matchScalarF32(Value v, double &out) {
+  APFloat value(0.0f);
+  if (!matchPattern(v, m_ConstantFloat(&value))) return false;
+  bool lost = false;
+  value.convert(APFloat::IEEEdouble(), APFloat::rmNearestTiesToEven, &lost);
+  out = value.convertToDouble();
+  return true;
+}
+
+struct WidenableRequantization {
+  linalg::GenericOp op;
+  arith::DivFOp divide;
+  arith::MaximumFOp lowerClamp;
+  arith::MinimumFOp upperClamp;
+  arith::FPToSIOp narrow;
+};
+
+/// The int8 requantization tail that produced `value`, when widening it is
+/// safe. Reports nothing and touches no IR otherwise.
+///
+/// `divf s ; roundeven ; addf 0 ; clamp [-128, 127] ; fptosi -> i8`, with one
+/// use. That narrowing is in the graph only because the exported model says
+/// every activation is int8. Its one consumer is the residual add this rewrite
+/// folds into an integer producer, which takes int16 samples anyway, so the
+/// same calibrated range can be put on the int16 grid instead -- 258x finer,
+/// for free, and nothing else in the program can tell.
+FailureOr<WidenableRequantization> matchWidenableRequantization(Value value,
+                                                                double scale) {
+  auto op = value.getDefiningOp<linalg::GenericOp>();
+  if (!op || !op->hasOneUse() || op.getNumDpsInputs() != 1) return failure();
+  auto resultType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+  if (!resultType || !resultType.getElementType().isInteger(8)) return failure();
+  Region &region = op.getRegion();
+  if (!region.hasOneBlock()) return failure();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(region.front().getTerminator());
+  if (!yieldOp || yieldOp.getValues().size() != 1) return failure();
+  auto narrow = yieldOp.getValues()[0].getDefiningOp<arith::FPToSIOp>();
+  if (!narrow) return failure();
+  auto upper = narrow.getIn().getDefiningOp<arith::MinimumFOp>();
+  if (!upper) return failure();
+  auto lower = upper.getLhs().getDefiningOp<arith::MaximumFOp>();
+  if (!lower) return failure();
+  double lo = 0.0, hi = 0.0;
+  if (!matchScalarF32(lower.getRhs(), lo) ||
+      !matchScalarF32(upper.getRhs(), hi))
+    return failure();
+  if (lo != -128.0 || hi != 127.0) return failure();
+  // The scale the tail divides by has to be the one the dequantize multiplies
+  // back, or the two sides are not describing the same grid.
+  arith::DivFOp divide;
+  for (Operation &inner : region.front().without_terminator()) {
+    if (auto candidate = dyn_cast<arith::DivFOp>(&inner)) {
+      double divisor = 0.0;
+      if (!matchScalarF32(candidate.getRhs(), divisor)) continue;
+      if (std::abs(divisor - scale) <= 1e-12 * std::abs(scale)) divide = candidate;
+    }
+  }
+  if (!divide) return failure();
+  return WidenableRequantization{op, divide, lower, upper, narrow};
+}
+
+/// Rebuild `match` on the int16 grid and return the wider tensor.
+Value widenRequantization(PatternRewriter &rewriter,
+                          const WidenableRequantization &match,
+                          double wideScale) {
+  linalg::GenericOp op = match.op;
+  Location loc = op.getLoc();
+  auto resultType = cast<RankedTensorType>(op.getResult(0).getType());
+  Type i16 = rewriter.getIntegerType(16);
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(op);
+  Value init = rewriter.create<tensor::EmptyOp>(loc, resultType.getShape(), i16);
+  auto wideType = RankedTensorType::get(resultType.getShape(), i16);
+  Type f32 = rewriter.getF32Type();
+  Value newScale = rewriter.create<arith::ConstantOp>(
+      loc, f32, rewriter.getF32FloatAttr(static_cast<float>(wideScale)));
+  Value lo = rewriter.create<arith::ConstantOp>(
+      loc, f32, rewriter.getF32FloatAttr(-32768.0f));
+  Value hi = rewriter.create<arith::ConstantOp>(
+      loc, f32, rewriter.getF32FloatAttr(32767.0f));
+  SmallVector<AffineMap> maps(2, rewriter.getMultiDimIdentityMap(
+                                     resultType.getRank()));
+  SmallVector<utils::IteratorType> iterators(resultType.getRank(),
+                                             utils::IteratorType::parallel);
+  return buildGeneric(
+      rewriter, loc, wideType, ValueRange{op.getDpsInputs()[0]}, init, maps,
+      iterators, [&](OpBuilder &nb, ValueRange args) -> Value {
+        Value scaled = nb.create<arith::DivFOp>(loc, args[0], newScale);
+        Value rounded = nb.create<math::RoundEvenOp>(loc, scaled);
+        Value clamped = nb.create<arith::MaximumFOp>(loc, rounded, lo);
+        clamped = nb.create<arith::MinimumFOp>(loc, clamped, hi);
+        return nb.create<arith::FPToSIOp>(loc, nb.getIntegerType(16), clamped);
+      });
 }
 
 Value buildResidualProducer(OpBuilder &b, Location loc, Value a, Value b8,
                             const ResidualMultipliers &m) {
-  constexpr int kShift = kResidualShift;
+  const int kShift = m.shift;
   bool perChannel = m.mb.size() > 1;
 
   MLIRContext *ctx = b.getContext();
@@ -187,8 +334,10 @@ Value buildResidualProducer(OpBuilder &b, Location loc, Value a, Value b8,
   auto aType = cast<RankedTensorType>(a.getType());
   auto outType =
       RankedTensorType::get(aType.getShape(), b.getIntegerType(16));
-  Value init = b.create<tensor::EmptyOp>(loc, outType.getShape(),
-                                         outType.getElementType());
+  // Sized from `a` itself, so that the producer can also be built on the
+  // dynamically shaped slices a `custom_op` region sees.
+  Value init = b.create<tensor::EmptyOp>(
+      loc, tensor::getMixedSizes(b, loc, a), outType.getElementType());
   Type i32 = b.getI32Type();
   Value cMa = b.create<arith::ConstantOp>(loc, i32, b.getI32IntegerAttr(m.ma));
   Value cHalf = b.create<arith::ConstantOp>(
@@ -404,15 +553,37 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
     if (failed(maybeGammaBeta)) return failure();
     ResidualMultipliers multipliers;
     multipliers.commonStep = dag.inputScale;
+    // Decided here, applied after every other refusal has had its say.
+    FailureOr<WidenableRequantization> widenable = failure();
+    double inputScale = dag.inputScale;
+    int64_t inputMax = 127;
     if (dag.residual) {
       SmallVector<double> channelScale;
       if (dag.residualChannelScale &&
           !readF32Constant(dag.residualChannelScale, dag.featureSize,
                            channelScale))
         return failure();
+      // The int8 grid on this branch is the graph's choice, not a constraint.
+      // The residual producer takes int16 samples either way, so putting the
+      // same range on the int16 grid costs nothing and keeps 258x more of the
+      // matmul's accumulator. Refuse to widen and the branch stays as it was.
+      if (clWidenResidualRequantization)
+        widenable = matchWidenableRequantization(dag.input, dag.inputScale);
+      if (succeeded(widenable)) {
+        inputScale = dag.inputScale * 127.0 / 32767.0;
+        inputMax = 32767;
+      }
       FailureOr<ResidualMultipliers> maybeMultipliers =
-          computeResidualMultipliers(dag.inputScale, dag.residualScale,
-                                     channelScale);
+          computeResidualMultipliers(inputScale, inputMax, dag.residualScale,
+                                     /*maxB=*/127, channelScale);
+      if (failed(maybeMultipliers) && inputMax != 127) {
+        // The wider branch did not fit; the narrow one still might.
+        widenable = failure();
+        inputScale = dag.inputScale;
+        inputMax = 127;
+        maybeMultipliers = computeResidualMultipliers(
+            inputScale, inputMax, dag.residualScale, /*maxB=*/127, channelScale);
+      }
       if (failed(maybeMultipliers)) return failure();
       multipliers = *maybeMultipliers;
     }
@@ -420,30 +591,49 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
     Location loc = quantizeOp.getLoc();
     MLIRContext *ctx = rewriter.getContext();
     auto outType = cast<RankedTensorType>(quantizeOp.getResultTypes()[0]);
-    auto inType = cast<RankedTensorType>(dag.input.getType());
-
     // The chain arrives as `1 x rows x features`. Drop the unit batch
     // dimension around the new op so that the op itself, and the tiling that
     // follows it, only ever deal with rows and features.
     SmallVector<ReassociationIndices> reassoc = {{0, 1}, {2}};
-    RankedTensorType flatInType = RankedTensorType::get(
-        {dag.numRows, dag.featureSize}, inType.getElementType());
     auto flatOutType = RankedTensorType::get({dag.numRows, dag.featureSize},
                                              outType.getElementType());
     rewriter.setInsertionPoint(quantizeOp);
+    // Nothing can refuse from here on, so the branch may be widened now. The
+    // narrow requantization it replaces has one use, the dequantize this
+    // rewrite is about to drop, and goes with it.
+    Value inputTensor = dag.input;
+    if (succeeded(widenable))
+      inputTensor = widenRequantization(rewriter, *widenable, inputScale);
+    RankedTensorType flatInType = RankedTensorType::get(
+        {dag.numRows, dag.featureSize},
+        cast<RankedTensorType>(inputTensor.getType()).getElementType());
     Value flatInput = rewriter.create<tensor::CollapseShapeOp>(
-        loc, flatInType, dag.input, reassoc);
+        loc, flatInType, inputTensor, reassoc);
     // A residual add becomes an integer producer of int16 samples, right in
     // front of the normalization and at the same rank, so nothing sits between
     // them. Epsilon then carries that producer's step instead of an input
     // scale.
     double sampleStep = dag.inputScale;
+    Value flatResidual;
+    // A producer over two int8 activations is left in front of the op, where
+    // dispatch formation clones it in beside the LayerNorm. Once one of them
+    // is int16 it would fuse into the matmul instead, so it goes inside the
+    // region (see `kLayerNormResidualInRegion`).
+    bool producerInRegion = false;
     if (dag.residual) {
-      Value flatResidual = rewriter.create<tensor::CollapseShapeOp>(
-          loc, flatInType, dag.residual, reassoc);
-      flatInput = buildResidualProducer(rewriter, loc, flatInput, flatResidual,
-                                        multipliers);
-      flatInType = cast<RankedTensorType>(flatInput.getType());
+      // The residual branch keeps its own width: only the requantization in
+      // front of the other one was widened.
+      auto flatResidualType = RankedTensorType::get(
+          {dag.numRows, dag.featureSize},
+          cast<RankedTensorType>(dag.residual.getType()).getElementType());
+      flatResidual = rewriter.create<tensor::CollapseShapeOp>(
+          loc, flatResidualType, dag.residual, reassoc);
+      producerInRegion = succeeded(widenable);
+      if (!producerInRegion) {
+        flatInput = buildResidualProducer(rewriter, loc, flatInput,
+                                          flatResidual, multipliers);
+        flatInType = cast<RankedTensorType>(flatInput.getType());
+      }
       sampleStep = multipliers.commonStep;
     }
     dag.sampleStep = sampleStep;
@@ -454,15 +644,18 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
     bindDims(ctx, d0);
     // One symbol, the feature length, which is never tiled. Gamma and beta are
     // not operands -- they ride on the op as `kLayerNormGammaBeta` and end up
-    // in the core's own data memory -- so the op moves exactly two tensors.
+    // in the core's own data memory -- so the only tensors the op moves are its
+    // samples (or, with the producer inside, the two activations that make
+    // them) and its result.
     AffineExpr s0 = getAffineSymbolExpr(0, ctx);
     AffineMap rowAndFeatures = AffineMap::get(1, 1, {d0, s0}, ctx);
-    SmallVector<Attribute> maps = {AffineMapAttr::get(rowAndFeatures),
-                                   AffineMapAttr::get(rowAndFeatures)};
+    SmallVector<Value> inputs = {flatInput};
+    if (producerInRegion) inputs.push_back(flatResidual);
+    SmallVector<Attribute> maps(inputs.size() + 1,
+                                AffineMapAttr::get(rowAndFeatures));
 
     Value init = rewriter.create<tensor::EmptyOp>(loc, flatOutType.getShape(),
                                                   flatOutType.getElementType());
-    SmallVector<Value> inputs = {flatInput};
     auto iteratorAttr =
         rewriter.getArrayAttr({IREE::LinalgExt::IteratorTypeAttr::get(
             ctx, utils::IteratorType::parallel)});
@@ -473,7 +666,9 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
     // The region sees fully dynamic slices of each operand.
     SmallVector<Type> bbTypes;
     SmallVector<Location> bbLocs;
-    for (Value v : {flatInput, init}) {
+    SmallVector<Value> operands(inputs);
+    operands.push_back(init);
+    for (Value v : operands) {
       auto t = cast<RankedTensorType>(v.getType());
       bbTypes.push_back(RankedTensorType::get(
           SmallVector<int64_t>(t.getRank(), ShapedType::kDynamic),
@@ -483,15 +678,20 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
     Region &region = customOp.getRegion();
     Block *body = rewriter.createBlock(&region, region.end(), bbTypes, bbLocs);
     rewriter.setInsertionPointToStart(body);
+    // Built first, so that everything in front of it in the block is its own
+    // and the unfold can tell where the normalization starts.
+    Value samples = body->getArgument(0);
+    if (producerInRegion)
+      samples = buildResidualProducer(rewriter, loc, body->getArgument(0),
+                                      body->getArgument(1), multipliers);
     // The packed constant is materialized inside the region so that the body
     // stays a complete description of the op, but it is not an operand: nothing
     // streams it in.
     Value gammaBeta = rewriter.create<arith::ConstantOp>(
         loc, cast<RankedTensorType>(maybeGammaBeta->getType()),
         *maybeGammaBeta);
-    Value result =
-        buildLayerNormBody(rewriter, loc, body->getArgument(0), gammaBeta,
-                           body->getArgument(1), dag);
+    Value result = buildLayerNormBody(rewriter, loc, samples, gammaBeta,
+                                      body->getArguments().back(), dag);
     rewriter.create<IREE::LinalgExt::YieldOp>(loc, result);
 
     // Mark the op, and carry the constants the microkernel lowering needs in
@@ -503,6 +703,8 @@ struct RaiseLayerNormPattern : OpRewritePattern<linalg::GenericOp> {
         kLayerNormEpsilonScaled,
         rewriter.getF32FloatAttr(dag.epsilon / (sampleStep * sampleStep)));
     customOp->setAttr(kLayerNormGammaBeta, *maybeGammaBeta);
+    if (producerInRegion)
+      customOp->setAttr(kLayerNormResidualInRegion, rewriter.getUnitAttr());
 
     rewriter.setInsertionPointAfter(customOp);
     Value expanded = rewriter.create<tensor::ExpandShapeOp>(

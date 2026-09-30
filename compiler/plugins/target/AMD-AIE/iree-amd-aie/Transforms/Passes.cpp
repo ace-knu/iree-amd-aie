@@ -734,6 +734,10 @@ void buildAMDAIETransformPassPipeline(
   {
     FunctionLikeNest funcPassManager(modulePassManager);
     funcPassManager.addPass(createTypePropagationPass)
+        // Before anything picks a tiling or a pipeline: from here on a
+        // LayerNorm dispatch always has its residual producer in front of the
+        // op, whichever width the activations it adds are.
+        .addPass(createAMDAIEUnfoldLayerNormResidualPass)
         .addPass(createBubbleUpOrdinalOpsPass)
         // Replace the math dialect's transcendental functions with polynomial
         // approximations. A core has no libm to fall back on, so an op left
