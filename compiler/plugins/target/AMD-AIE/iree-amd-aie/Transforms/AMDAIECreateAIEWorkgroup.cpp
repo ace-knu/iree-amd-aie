@@ -9,6 +9,10 @@
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
+#include <functional>
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -66,6 +70,15 @@ AMDAIE::CoreOp CoreContext::mergeCoreOps(AMDAIE::CoreOp source,
   rewriter.eraseOp(dest);
   rewriter.eraseOp(source);
   return newCoreOp;
+}
+
+/// The induction variables of a loop this pass rebuilds inside a core.
+static SmallVector<Value> loopInductionVars(Operation *op) {
+  if (auto forOp = dyn_cast<scf::ForOp>(op))
+    return SmallVector<Value>{forOp.getInductionVar()};
+  if (auto forallOp = dyn_cast<scf::ForallOp>(op))
+    return llvm::to_vector(forallOp.getInductionVars());
+  return {};
 }
 
 /// Clone CoreOp and add to or merge with coreContext.
@@ -313,6 +326,24 @@ LogicalResult WorkgroupBuilder::buildForSingleBody(
     Block::iterator coreEnd = coreOp.getBody()->getTerminator()->getIterator();
     newOp.getBody()->getOperations().splice(
         insertIt, coreOp.getBody()->getOperations(), coreBegin, coreEnd);
+    // What was spliced in still names the induction variables of the loop it
+    // came from, and that loop is about to go away -- the core runs its own
+    // copy now. Point those uses at the copy's variables. Reading a core-local
+    // constant at an offset derived from the loop is what needs this; a core
+    // body that only touches object fifos has no such use.
+    // The variables can be the original loop's or, where the clone into the
+    // core went through the IR map, the control code copy's.
+    SmallVector<Value> coreIvs = loopInductionVars(newOp.getOperation());
+    for (Operation *source :
+         {op.getOperation(), newControlCodeForOp.getOperation()}) {
+      SmallVector<Value> sourceIvs = loopInductionVars(source);
+      if (sourceIvs.size() != coreIvs.size()) continue;
+      for (auto [sourceIv, coreIv] : llvm::zip_equal(sourceIvs, coreIvs)) {
+        rewriter.replaceUsesWithIf(sourceIv, coreIv, [&](OpOperand &use) {
+          return newOp->isProperAncestor(use.getOwner());
+        });
+      }
+    }
     rewriter.moveOpBefore(newOp, coreOp.getBody()->getTerminator());
   }
   coreContext.mergeContext(nestedCoreContext);
@@ -425,6 +456,80 @@ LogicalResult WorkgroupBuilder::build(
 
 namespace {
 
+/// Move a core-local constant's reads back inside the core that does them.
+///
+/// A constant placed in the core's own data memory is named by a
+/// `memref.get_global`, and the reader takes a view of it at an offset built
+/// from the surrounding loops. Earlier passes are free to hoist those pure ops
+/// out of the core -- they are loop-invariant and common to several cores --
+/// but this pass rebuilds each core's body somewhere else entirely, and
+/// anything left behind would dangle. So sink the whole chain back in first.
+/// Only chains rooted at a `memref.get_global` move; a view of anything else
+/// is backed by a buffer both sides can still name.
+static void sinkCoreLocalConstantReads(func::FuncOp funcOp) {
+  auto isView = [](Operation *op) {
+    return isa<memref::SubViewOp, memref::ExpandShapeOp,
+               memref::CollapseShapeOp, memref::ReinterpretCastOp>(op);
+  };
+  std::function<void(Value, AMDAIE::CoreOp, SetVector<Operation *> &)>
+      collectIndex = [&](Value value, AMDAIE::CoreOp coreOp,
+                         SetVector<Operation *> &chain) {
+        Operation *def = value.getDefiningOp();
+        if (!def || coreOp->isProperAncestor(def)) return;
+        if (!isMemoryEffectFree(def)) return;
+        if (!llvm::all_of(def->getResultTypes(),
+                          [](Type type) { return type.isIntOrIndex(); }))
+          return;
+        for (Value operand : def->getOperands())
+          collectIndex(operand, coreOp, chain);
+        chain.insert(def);
+      };
+  std::function<bool(Value, AMDAIE::CoreOp, SetVector<Operation *> &)> collect =
+      [&](Value value, AMDAIE::CoreOp coreOp,
+          SetVector<Operation *> &chain) -> bool {
+    Operation *def = value.getDefiningOp();
+    if (!def || coreOp->isProperAncestor(def)) return false;
+    if (isa<memref::GetGlobalOp>(def)) {
+      chain.insert(def);
+      return true;
+    }
+    if (!isView(def)) return false;
+    bool fromConstant = false;
+    for (Value operand : def->getOperands())
+      fromConstant |= collect(operand, coreOp, chain);
+    if (!fromConstant) return false;
+    for (Value operand : def->getOperands())
+      collectIndex(operand, coreOp, chain);
+    chain.insert(def);
+    return true;
+  };
+
+  IRRewriter rewriter(funcOp.getContext());
+  funcOp.walk([&](AMDAIE::CoreOp coreOp) {
+    SetVector<Operation *> chain;
+    coreOp.walk([&](Operation *inner) {
+      for (Value operand : inner->getOperands())
+        collect(operand, coreOp, chain);
+    });
+    if (chain.empty()) return;
+    IRMapping mapping;
+    Operation *previous = nullptr;
+    for (Operation *op : chain) {
+      if (previous)
+        rewriter.setInsertionPointAfter(previous);
+      else
+        rewriter.setInsertionPointToStart(coreOp.getBody());
+      Operation *clone = rewriter.clone(*op, mapping);
+      mapping.map(op->getResult(0), clone->getResult(0));
+      rewriter.replaceUsesWithIf(
+          op->getResult(0), clone->getResult(0), [&](OpOperand &use) {
+            return coreOp->isProperAncestor(use.getOwner());
+          });
+      previous = clone;
+    }
+  });
+}
+
 /// Traverse the function operation and create a single workgroup and control
 /// code.
 LogicalResult createSingleWorkgroupAndControlCode(func::FuncOp funcOp,
@@ -433,6 +538,7 @@ LogicalResult createSingleWorkgroupAndControlCode(func::FuncOp funcOp,
   if (funcOp.isPrivate()) {
     return success();
   }
+  sinkCoreLocalConstantReads(funcOp);
   IRRewriterAndMapper rewriter(funcOp.getContext());
   IRRewriterAndMapper controlCodeRewriter(funcOp.getContext());
   Block *funcBlock = &funcOp.getBody().front();

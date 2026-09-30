@@ -13,8 +13,12 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "llvm/Support/Path.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -31,8 +35,9 @@ class AMDAIELowerToUKernelsPass
   AMDAIELowerToUKernelsPass(const AMDAIELowerToUKernelsPass &pass) {}
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Codegen::IREECodegenDialect,
-                    bufferization::BufferizationDialect, memref::MemRefDialect>();
+    registry.insert<IREE::Codegen::IREECodegenDialect, arith::ArithDialect,
+                    bufferization::BufferizationDialect, memref::MemRefDialect,
+                    tensor::TensorDialect>();
   }
   void runOnOperation() override;
 };
@@ -371,6 +376,201 @@ static FailureOr<Value> materializeCoreLocalConstant(RewriterBase &rewriter,
       .getResult();
 }
 
+/// The largest constant we are willing to place in every core's data memory.
+/// A core has 64 KB and the matmul tiles already take about 20 KB of it.
+static constexpr int64_t kMaxCoreConstantBytes = 16 * 1024;
+
+/// Row-major strides of a static shape.
+static SmallVector<int64_t> rowMajorStrides(ArrayRef<int64_t> shape) {
+  SmallVector<int64_t> strides(shape.size(), 1);
+  for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i)
+    strides[i] = strides[i + 1] * shape[i + 1];
+  return strides;
+}
+
+/// True when the slice is one contiguous run of its source: the dimensions it
+/// takes whole are a suffix, and every dimension outside the outermost partial
+/// one contributes a single element.
+static bool isContiguousSlice(tensor::ExtractSliceOp op) {
+  auto sourceType = dyn_cast<RankedTensorType>(op.getSource().getType());
+  if (!sourceType || !sourceType.hasStaticShape()) return false;
+  for (OpFoldResult stride : op.getMixedStrides()) {
+    std::optional<int64_t> value = getConstantIntValue(stride);
+    if (!value || *value != 1) return false;
+  }
+  ArrayRef<int64_t> sizes = op.getStaticSizes();
+  if (llvm::any_of(sizes, ShapedType::isDynamic)) return false;
+  ArrayRef<int64_t> shape = sourceType.getShape();
+  if (sizes.size() != shape.size()) return false;
+  int64_t partial = shape.size();
+  while (partial > 0 && sizes[partial - 1] == shape[partial - 1]) --partial;
+  for (int64_t i = 0; i + 1 < partial; ++i)
+    if (sizes[i] != 1) return false;
+  return true;
+}
+
+/// True when the pack only renames indices -- one inner tile, taken from the
+/// last dimension, no padding and no outer permutation -- so that element k of
+/// the source and element k of the result are the same value.
+static bool isReshapePack(linalg::PackOp op) {
+  if (op.getPaddingValue()) return false;
+  ArrayRef<int64_t> perm = op.getOuterDimsPerm();
+  for (auto [i, p] : llvm::enumerate(perm))
+    if (static_cast<int64_t>(i) != p) return false;
+  ArrayRef<int64_t> pos = op.getInnerDimsPos();
+  ArrayRef<int64_t> tiles = op.getStaticInnerTiles();
+  auto sourceType = dyn_cast<RankedTensorType>(op.getSource().getType());
+  if (!sourceType || !sourceType.hasStaticShape()) return false;
+  int64_t rank = sourceType.getRank();
+  if (pos.size() != 1 || pos[0] != rank - 1) return false;
+  if (tiles.size() != 1 || ShapedType::isDynamic(tiles[0]) || tiles[0] == 0)
+    return false;
+  return sourceType.getShape()[rank - 1] % tiles[0] == 0;
+}
+
+/// One hop of a staging chain, and what it reads. Tiling stages a constant into
+/// a buffer either with a `linalg.pack`, when it reshapes on the way in, or
+/// with a plain `linalg.copy` when it does not. Returns null for anything else,
+/// and for a pack that does more than rename indices.
+static Value stagedSourceOf(Operation *op) {
+  if (auto packOp = dyn_cast<linalg::PackOp>(op))
+    return isReshapePack(packOp) ? packOp.getSource() : Value();
+  if (auto copyOp = dyn_cast<linalg::CopyOp>(op))
+    return copyOp.getDpsInputs().size() == 1 ? copyOp.getDpsInputs()[0]
+                                             : Value();
+  return Value();
+}
+
+/// Walk `value` back to the dense constant it is a view of, collecting the
+/// slices taken on the way. Returns failure as soon as a step does something
+/// other than rename indices.
+static FailureOr<DenseElementsAttr> traceToDenseConstant(
+    Value value, SmallVectorImpl<tensor::ExtractSliceOp> &slices) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (auto constantOp = dyn_cast<arith::ConstantOp>(def)) {
+      auto data = dyn_cast<DenseElementsAttr>(constantOp.getValue());
+      if (!data || data.isSplat()) return failure();
+      auto type = dyn_cast<RankedTensorType>(data.getType());
+      // Rank 1 keeps the offset arithmetic below to a single index.
+      if (!type || !type.hasStaticShape() || type.getRank() != 1)
+        return failure();
+      return data;
+    }
+    if (Value staged = stagedSourceOf(def)) {
+      value = staged;
+      continue;
+    }
+    if (auto sliceOp = dyn_cast<tensor::ExtractSliceOp>(def)) {
+      if (!isContiguousSlice(sliceOp)) return failure();
+      slices.push_back(sliceOp);
+      value = sliceOp.getSource();
+      continue;
+    }
+    return failure();
+  }
+  return failure();
+}
+
+/// Read a staged constant out of the core's own memory instead of streaming it
+/// in.
+///
+/// A `linalg.pack` that fills a core buffer from a dense constant means the
+/// constant is being staged DDR -> L2 -> L1, and the DDR end of that costs a
+/// shim MM2S channel. npu4's shim has two per direction and a matmul already
+/// spends both on activations and weights, so channel assignment fails with
+/// "no producer DMA channel available". This is what a per-channel vector in a
+/// matmul's elementwise tail runs into.
+///
+/// Every hop of the staging chain only renames indices, so the values the core
+/// ends up reading are one contiguous run of the original constant. Replacing
+/// the chain with a slice of a core-local copy therefore changes nothing the
+/// kernel sees, and both transfers disappear along with the buffers.
+template <typename OpTy>
+struct ReadStagedConstantFromCoreMemory : public OpRewritePattern<OpTy> {
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpTy packOp,
+                                PatternRewriter &rewriter) const override {
+    // Only the last hop, the one that fills a core buffer.
+    auto toTensorOp =
+        packOp.getDpsInits()[0].template getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensorOp)
+      return rewriter.notifyMatchFailure(packOp, "destination is not a buffer");
+    auto memrefType = dyn_cast<MemRefType>(toTensorOp.getBuffer().getType());
+    if (!memrefType)
+      return rewriter.notifyMatchFailure(packOp, "destination is not a memref");
+    auto memorySpace =
+        dyn_cast_if_present<IntegerAttr>(memrefType.getMemorySpace());
+    if (!memorySpace || memorySpace.getInt() != 2)
+      return rewriter.notifyMatchFailure(packOp, "destination is not core memory");
+    Value staged = stagedSourceOf(packOp.getOperation());
+    if (!staged)
+      return rewriter.notifyMatchFailure(packOp, "not a plain staging step");
+    auto resultType =
+        dyn_cast<RankedTensorType>(packOp->getResult(0).getType());
+    if (!resultType || !resultType.hasStaticShape())
+      return rewriter.notifyMatchFailure(packOp, "result shape is not static");
+
+    SmallVector<tensor::ExtractSliceOp> slices;
+    FailureOr<DenseElementsAttr> data = traceToDenseConstant(staged, slices);
+    if (failed(data))
+      return rewriter.notifyMatchFailure(packOp, "not a view of a dense constant");
+
+    auto constantType = cast<RankedTensorType>(data->getType());
+    int64_t bytes =
+        constantType.getNumElements() *
+        llvm::divideCeil(constantType.getElementTypeBitWidth(), 8);
+    if (bytes > kMaxCoreConstantBytes)
+      return rewriter.notifyMatchFailure(packOp, "constant is too big for a core");
+
+    Location loc = packOp.getLoc();
+    rewriter.setInsertionPoint(packOp);
+
+    // The linear offset of the run, summed over the slices taken on the way
+    // out to the constant. Every slice dominates this pack, so its offsets do
+    // too.
+    Value offset = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    for (tensor::ExtractSliceOp sliceOp : slices) {
+      auto sourceType = cast<RankedTensorType>(sliceOp.getSource().getType());
+      SmallVector<int64_t> strides = rowMajorStrides(sourceType.getShape());
+      for (auto [sliceOffset, stride] :
+           llvm::zip_equal(sliceOp.getMixedOffsets(), strides)) {
+        std::optional<int64_t> constantOffset = getConstantIntValue(sliceOffset);
+        if (constantOffset && *constantOffset == 0) continue;
+        Value scaled = getValueOrCreateConstantIndexOp(rewriter, loc, sliceOffset);
+        if (stride != 1) {
+          Value strideValue = rewriter.create<arith::ConstantIndexOp>(loc, stride);
+          scaled = rewriter.create<arith::MulIOp>(loc, scaled, strideValue);
+        }
+        offset = rewriter.create<arith::AddIOp>(loc, offset, scaled);
+      }
+    }
+
+    FailureOr<Value> coreConstant =
+        materializeCoreLocalConstant(rewriter, packOp, *data);
+    if (failed(coreConstant))
+      return rewriter.notifyMatchFailure(packOp, "failed to place the constant");
+
+    int64_t numElements = resultType.getNumElements();
+    Value run = rewriter.create<tensor::ExtractSliceOp>(
+        loc,
+        RankedTensorType::get({numElements}, resultType.getElementType()),
+        *coreConstant, ArrayRef<OpFoldResult>{offset},
+        ArrayRef<OpFoldResult>{rewriter.getIndexAttr(numElements)},
+        ArrayRef<OpFoldResult>{rewriter.getIndexAttr(1)});
+
+    Value replacement = run;
+    if (resultType.getRank() != 1) {
+      ReassociationIndices group;
+      for (int64_t i = 0; i < resultType.getRank(); ++i) group.push_back(i);
+      replacement = rewriter.create<tensor::ExpandShapeOp>(
+          loc, resultType, run, SmallVector<ReassociationIndices>{group});
+    }
+    rewriter.replaceOp(packOp, replacement);
+    return success();
+  }
+};
+
 /// Replace a raised quantized LayerNorm with one int8 microkernel call.
 ///
 /// Everything the kernel needs beyond the data is already folded by the raise:
@@ -571,6 +771,12 @@ void AMDAIELowerToUKernelsPass::runOnOperation() {
       context, allTargets, matchSoftmaxDAGForUKernel, kSoftmaxUKernelName);
   patterns.insert<LowerToUKernelPattern<IREE::LinalgExt::CustomOp>>(
       context, allTargets, matchLayerNormDAGForUKernel, kLayerNormUKernelName);
+
+  // Not a microkernel: it takes a constant the tiling staged through L2 and
+  // hands the core its own copy, which is the only way a matmul tail can read
+  // a per-channel vector -- the shim has no DMA channel left for it.
+  patterns.insert<ReadStagedConstantFromCoreMemory<linalg::PackOp>,
+                  ReadStagedConstantFromCoreMemory<linalg::CopyOp>>(context);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }
