@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <functional>
+
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -130,6 +132,71 @@ FailureOr<Dequantized> matchDequantize(Value value) {
 /// After it, the per-channel scale is an ordinary `[N]` operand of the
 /// matmul's elementwise tail, and the requantization that follows fuses into
 /// it as it does for any per-tensor matmul.
+///
+/// The same holds for a `linalg.batch_matmul` with a unit batch (see
+/// `matchBatchOperand`) -- the shape BERT's FC2 arrives in.
+
+/// A contraction's two operands, once dequantized.
+struct Operands {
+  Dequantized lhs, rhs;
+};
+
+LogicalResult checkScales(const Operands &ops, RankedTensorType resultType) {
+  // Only the case the per-tensor path cannot already take.
+  if (ops.lhs.scale.size() != 1 || ops.rhs.scale.size() == 1) return failure();
+  int64_t n = resultType.getDimSize(resultType.getRank() - 1);
+  if (ShapedType::isDynamic(n) || static_cast<int64_t>(ops.rhs.scale.size()) != n)
+    return failure();
+  return success();
+}
+
+/// Build `sitofp(acc) * (sx * sw[n])` over `acc`, and replace `contraction`.
+void replaceWithScaledTail(PatternRewriter &rewriter, Operation *contraction,
+                           Value acc, const Operands &ops) {
+  Location loc = contraction->getLoc();
+  auto accType = cast<RankedTensorType>(acc.getType());
+  int64_t rank = accType.getRank();
+  int64_t n = accType.getDimSize(rank - 1);
+  Type f32 = rewriter.getF32Type();
+  SmallVector<float> combined;
+  combined.reserve(n);
+  for (float s : ops.rhs.scale) combined.push_back(ops.lhs.scale.front() * s);
+  auto scaleType = RankedTensorType::get({n}, f32);
+  Value scales = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(scaleType, ArrayRef<float>(combined)));
+
+  MLIRContext *ctx = rewriter.getContext();
+  AffineMap identity = AffineMap::getMultiDimIdentityMap(rank, ctx);
+  AffineMap column =
+      AffineMap::get(rank, 0, {getAffineDimExpr(rank - 1, ctx)}, ctx);
+  Value outInit = rewriter.create<tensor::EmptyOp>(
+      loc, tensor::getMixedSizes(rewriter, loc, acc), f32);
+  auto scaled = rewriter.create<linalg::GenericOp>(
+      loc, TypeRange{outInit.getType()}, ValueRange{acc, scales},
+      ValueRange{outInit}, ArrayRef<AffineMap>{identity, column, identity},
+      SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
+      [&](OpBuilder &b, Location l, ValueRange args) {
+        Value f = b.create<arith::SIToFPOp>(l, f32, args[0]);
+        b.create<linalg::YieldOp>(l, b.create<arith::MulFOp>(l, f, args[1])
+                                         .getResult());
+      });
+  rewriter.replaceOp(contraction, scaled.getResults());
+}
+
+/// A zero-filled i32 accumulator shaped like `like`.
+Value zeroAccumulator(PatternRewriter &rewriter, Location loc, Value like) {
+  Value init = rewriter.create<tensor::EmptyOp>(
+      loc, tensor::getMixedSizes(rewriter, loc, like), rewriter.getI32Type());
+  Value zero =
+      rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0));
+  return rewriter.create<linalg::FillOp>(loc, zero, init).getResult(0);
+}
+
+bool isZeroFilled(Value init) {
+  auto fill = init.getDefiningOp<linalg::FillOp>();
+  return fill && matchPattern(fill.getInputs()[0], m_AnyZeroFloat());
+}
+
 struct FoldPerChannelDequantIntoMatmul : OpRewritePattern<linalg::MatmulOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -139,60 +206,135 @@ struct FoldPerChannelDequantIntoMatmul : OpRewritePattern<linalg::MatmulOp> {
     auto resultType = cast<RankedTensorType>(matmul.getResult(0).getType());
     if (!resultType.getElementType().isF32() || resultType.getRank() != 2)
       return failure();
-    if (!matmul.getIndexingMapsArray().empty() &&
-        matmul.getIndexingMapsArray() !=
-            matmul.getDefaultIndexingMaps(matmul.getContext()))
+    if (matmul.getIndexingMapsArray() !=
+        linalg::MatmulOp::getDefaultIndexingMaps(matmul.getContext()))
       return failure();
-    auto fill = matmul.getOutputs()[0].getDefiningOp<linalg::FillOp>();
-    if (!fill || !matchPattern(fill.getInputs()[0], m_AnyZeroFloat()))
-      return failure();
+    if (!isZeroFilled(matmul.getOutputs()[0])) return failure();
     FailureOr<Dequantized> lhs = matchDequantize(matmul.getInputs()[0]);
     FailureOr<Dequantized> rhs = matchDequantize(matmul.getInputs()[1]);
     if (failed(lhs) || failed(rhs)) return failure();
-    // Only the case the per-tensor path cannot already take.
-    if (lhs->scale.size() != 1 || rhs->scale.size() == 1) return failure();
-    int64_t n = resultType.getDimSize(1);
-    if (ShapedType::isDynamic(n) ||
-        static_cast<int64_t>(rhs->scale.size()) != n)
-      return failure();
+    Operands ops{*lhs, *rhs};
+    if (failed(checkScales(ops, resultType))) return failure();
 
     Location loc = matmul.getLoc();
-    Type i32 = rewriter.getI32Type();
-    Type f32 = rewriter.getF32Type();
-    SmallVector<OpFoldResult> sizes =
-        tensor::getMixedSizes(rewriter, loc, matmul.getOutputs()[0]);
-    Value accInit = rewriter.create<tensor::EmptyOp>(loc, sizes, i32);
-    Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0));
-    Value accZero =
-        rewriter.create<linalg::FillOp>(loc, zero, accInit).getResult(0);
+    Value accZero = zeroAccumulator(rewriter, loc, matmul.getOutputs()[0]);
     Value acc = rewriter
                     .create<linalg::MatmulOp>(
                         loc, TypeRange{accZero.getType()},
-                        ValueRange{lhs->quantized, rhs->quantized},
+                        ValueRange{ops.lhs.quantized, ops.rhs.quantized},
                         ValueRange{accZero})
                     .getResult(0);
+    replaceWithScaledTail(rewriter, matmul, acc, ops);
+    return success();
+  }
+};
 
-    SmallVector<float> combined;
-    combined.reserve(n);
-    for (float s : rhs->scale) combined.push_back(lhs->scale.front() * s);
-    auto scaleType = RankedTensorType::get({n}, f32);
-    Value scales = rewriter.create<arith::ConstantOp>(
-        loc, DenseElementsAttr::get(scaleType, ArrayRef<float>(combined)));
+/// A unit-batch operand of a `batch_matmul`, traced back to its int8 source.
+/// Three shapes reach this pass:
+///   - a 3-D dequantization of a 3-D int8 tensor (the activation);
+///   - a 2-D dequantization given a unit batch by
+///     `expand_shape [[0, 1], [2]]`;
+///   - a 2-D dequantization broadcast to the batch by a copy-only
+///     `linalg.generic` with map `(d0, d1, d2) -> (d1, d2)` (the weight).
+/// `rebuild` gives the int8 source the same batch the float operand had.
+struct BatchOperand {
+  Dequantized dequant;
+  std::function<Value(PatternRewriter &, Location, Value)> rebuild;
+};
 
-    MLIRContext *ctx = rewriter.getContext();
-    AffineMap identity = AffineMap::getMultiDimIdentityMap(2, ctx);
-    AffineMap column = AffineMap::get(2, 0, {getAffineDimExpr(1, ctx)}, ctx);
-    Value outInit = rewriter.create<tensor::EmptyOp>(loc, sizes, f32);
-    auto scaled = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{outInit.getType()}, ValueRange{acc, scales},
-        ValueRange{outInit}, ArrayRef<AffineMap>{identity, column, identity},
-        SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
-        [&](OpBuilder &b, Location l, ValueRange args) {
-          Value f = b.create<arith::SIToFPOp>(l, f32, args[0]);
-          b.create<linalg::YieldOp>(l, b.create<arith::MulFOp>(l, f, args[1])
-                                           .getResult());
-        });
-    rewriter.replaceOp(matmul, scaled.getResults());
+FailureOr<BatchOperand> matchBatchOperand(Value v) {
+  auto type = dyn_cast<RankedTensorType>(v.getType());
+  if (!type || type.getRank() != 3 || type.getDimSize(0) != 1) return failure();
+  if (FailureOr<Dequantized> d = matchDequantize(v); succeeded(d)) {
+    BatchOperand op{*d, [](PatternRewriter &, Location, Value q) { return q; }};
+    return op;
+  }
+  if (auto expand = v.getDefiningOp<tensor::ExpandShapeOp>()) {
+    SmallVector<ReassociationIndices> reassoc =
+        expand.getReassociationIndices();
+    if (expand.getSrcType().getRank() != 2 || reassoc.size() != 2 ||
+        reassoc[0] != ReassociationIndices{0, 1} ||
+        reassoc[1] != ReassociationIndices{2})
+      return failure();
+    FailureOr<Dequantized> d = matchDequantize(expand.getSrc());
+    if (failed(d)) return failure();
+    BatchOperand op{*d, [expand](PatternRewriter &rewriter, Location loc,
+                                 Value q) mutable {
+      auto i8Type = RankedTensorType::get(expand.getResultType().getShape(),
+                                          rewriter.getI8Type());
+      return rewriter
+          .create<tensor::ExpandShapeOp>(loc, i8Type, q,
+                                         expand.getReassociationIndices(),
+                                         expand.getMixedOutputShape())
+          .getResult();
+    }};
+    return op;
+  }
+  if (auto bcast = v.getDefiningOp<linalg::GenericOp>()) {
+    if (bcast.getNumDpsInputs() != 1 || bcast.getNumDpsInits() != 1 ||
+        bcast.getNumReductionLoops() != 0)
+      return failure();
+    auto yield = cast<linalg::YieldOp>(bcast.getRegion().front().getTerminator());
+    if (yield.getValues()[0] != bcast.getRegion().front().getArgument(0))
+      return failure();
+    MLIRContext *ctx = bcast.getContext();
+    AffineMap expected = AffineMap::get(
+        3, 0, {getAffineDimExpr(1, ctx), getAffineDimExpr(2, ctx)}, ctx);
+    SmallVector<AffineMap> maps = bcast.getIndexingMapsArray();
+    if (maps[0] != expected || !maps[1].isIdentity()) return failure();
+    FailureOr<Dequantized> d = matchDequantize(bcast.getDpsInputs()[0]);
+    if (failed(d)) return failure();
+    BatchOperand op{*d, [bcast, maps](PatternRewriter &rewriter, Location loc,
+                                      Value q) mutable {
+      Type i8 = rewriter.getI8Type();
+      Value init = rewriter.create<tensor::EmptyOp>(
+          loc, cast<RankedTensorType>(bcast.getResult(0).getType()).getShape(),
+          i8);
+      return rewriter
+          .create<linalg::GenericOp>(
+              loc, TypeRange{init.getType()}, ValueRange{q}, ValueRange{init},
+              maps, bcast.getIteratorTypesArray(),
+              [](OpBuilder &b, Location l, ValueRange args) {
+                b.create<linalg::YieldOp>(l, args[0]);
+              })
+          .getResult(0);
+    }};
+    return op;
+  }
+  return failure();
+}
+
+struct FoldPerChannelDequantIntoBatchMatmul
+    : OpRewritePattern<linalg::BatchMatmulOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::BatchMatmulOp matmul,
+                                PatternRewriter &rewriter) const override {
+    if (!matmul.hasPureTensorSemantics()) return failure();
+    auto resultType = cast<RankedTensorType>(matmul.getResult(0).getType());
+    if (!resultType.getElementType().isF32() || resultType.getRank() != 3 ||
+        resultType.getDimSize(0) != 1)
+      return failure();
+    if (matmul.getIndexingMapsArray() !=
+        linalg::BatchMatmulOp::getDefaultIndexingMaps(matmul.getContext()))
+      return failure();
+    if (!isZeroFilled(matmul.getOutputs()[0])) return failure();
+    FailureOr<BatchOperand> lhs = matchBatchOperand(matmul.getInputs()[0]);
+    FailureOr<BatchOperand> rhs = matchBatchOperand(matmul.getInputs()[1]);
+    if (failed(lhs) || failed(rhs)) return failure();
+    Operands ops{lhs->dequant, rhs->dequant};
+    if (failed(checkScales(ops, resultType))) return failure();
+
+    Location loc = matmul.getLoc();
+    Value lhsI8 = lhs->rebuild(rewriter, loc, ops.lhs.quantized);
+    Value rhsI8 = rhs->rebuild(rewriter, loc, ops.rhs.quantized);
+    Value accZero = zeroAccumulator(rewriter, loc, matmul.getOutputs()[0]);
+    Value acc = rewriter
+                    .create<linalg::BatchMatmulOp>(
+                        loc, TypeRange{accZero.getType()},
+                        ValueRange{lhsI8, rhsI8}, ValueRange{accZero})
+                    .getResult(0);
+    replaceWithScaledTail(rewriter, matmul, acc, ops);
     return success();
   }
 };
@@ -208,7 +350,8 @@ class AMDAIEFoldPerChannelDequantIntoMatmulPass
 
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    patterns.insert<FoldPerChannelDequantIntoMatmul>(&getContext());
+    patterns.insert<FoldPerChannelDequantIntoMatmul,
+                    FoldPerChannelDequantIntoBatchMatmul>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
   }
