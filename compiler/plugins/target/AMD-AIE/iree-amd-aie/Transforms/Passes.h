@@ -274,6 +274,10 @@ std::unique_ptr<Pass> createAMDAIEFoldBroadcastAddIntoDestPass();
 /// matmul, leaving an int8 matmul and a per-channel scaled tail.
 std::unique_ptr<Pass> createAMDAIEFoldPerChannelDequantIntoMatmulPass();
 
+/// Create a pass to rewrite a per-channel float requantization into integer
+/// arithmetic at the tensor level.
+std::unique_ptr<Pass> createAMDAIEPerChannelIntegerRequantizationPass();
+
 /// Create a pass to fuse the producer operations into the scf loops.
 std::unique_ptr<Pass> createAMDAIEFuseProducerIntoLoopPass(
     AMDAIEFuseProducerIntoLoopOptions options = {});

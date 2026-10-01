@@ -485,6 +485,28 @@ def AMDAIEFoldPerChannelDequantIntoMatmul :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldPerChannelDequantIntoMatmulPass()";
 }
 
+def AMDAIEPerChannelIntegerRequantization :
+  Pass<"iree-amdaie-per-channel-integer-requantization", ""> {
+  let summary = "Rewrite a per-channel float requantization into integer "
+                "arithmetic while it is still a tensor op.";
+  let description = [{
+    Takes the pair
+
+      %f = generic ins(%acc : i32, %s : [N] f32) { sitofp(acc) * s[n] }
+      %q = generic ins(%f) { roundeven(f / S2) [+ zp] -> clamp -> iM }
+
+    that a per-channel matmul's requantization arrives as and rewrites it to
+
+      %q = generic ins(%acc, %m : [N] i32) {
+             round_half_even(acc * m[n] >> shift) [+ zp] -> clamp -> iM }
+
+    with `m[n] / 2^shift ~= s[n] / S2` and a shift shared by every channel.
+    `AMDAIEIntegerRequantization` does this for a scalar scale on the core's
+    code, but a per-channel scale is a table there, not a constant.
+  }];
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEPerChannelIntegerRequantizationPass()";
+}
+
 def AMDAIEFuseConsumerIntoLoop :
     InterfacePass<"iree-amdaie-fuse-consumer-into-loop", "mlir::FunctionOpInterface"> {
   let summary = "Fuse the consumer operation into the innermost last scf loop.";

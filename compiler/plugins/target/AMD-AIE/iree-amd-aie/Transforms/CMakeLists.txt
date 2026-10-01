@@ -80,6 +80,7 @@ iree_cc_library(
     "AMDAIELinalgFunctionOutlining.cpp"
     "AMDAIEFoldBroadcastAddIntoDest.cpp"
     "AMDAIEFoldPerChannelDequantIntoMatmul.cpp"
+    "AMDAIEPerChannelIntegerRequantization.cpp"
     "AMDAIEFoldDmaWaits.cpp"
     "AMDAIEFuseConsumerIntoLoop.cpp"
     "AMDAIEFuseFillIntoForall.cpp"

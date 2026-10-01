@@ -73,6 +73,12 @@ struct AMDAIESession
     // reduction and no dispatch holds the whole thing.
     if (layernormUkernelEnabled())
       passManager.addPass(AMDAIE::createAMDAIERaiseLayerNormPass());
+    // A per-channel matmul's requantization has a table, not a constant, for
+    // a scale, so the scalar integer-requantization pass on the core's code
+    // cannot take it and its float arithmetic overflows the core's program
+    // memory. Make it integer here, while the scales are still visible --
+    // after the raise, which widens that requantization by its float form.
+    passManager.addPass(AMDAIE::createAMDAIEPerChannelIntegerRequantizationPass());
     // Demote contraction (matmul + conv) inputs f32 -> bf16 before the named
     // ops are generalized (the upstream demote pass only matches named ops).
     // npu4 has no f32 vector path, so this is required to run f32 models.
