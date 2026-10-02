@@ -641,6 +641,22 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
   return iree_ok_status();
 }
 
+// Makes a binding's device writes visible to the host after a dispatch.
+// A buffer the compiler marked SHARING_IMMUTABLE (the constant pool) is never
+// written after initialization, and the HAL lets implementations skip the
+// synchronization a mutable buffer would need. Skipping it matters here: the
+// invalidate flushes the bound range line by line on the host, and BERT-base
+// binds its whole ~90 MB weight pool to most dispatches.
+static iree_status_t iree_hal_amdxdna_invalidate_binding(
+    iree_hal_buffer_t* buffer, iree_device_size_t offset,
+    iree_device_size_t length) {
+  if (iree_all_bits_set(iree_hal_buffer_allowed_usage(buffer),
+                        IREE_HAL_BUFFER_USAGE_SHARING_IMMUTABLE)) {
+    return iree_ok_status();
+  }
+  return iree_hal_amdxdna_buffer_invalidate_range(buffer, offset, length);
+}
+
 // Submit a contiguous span [begin, end) of a group's sub-commands as one
 // ERT_CMD_CHAIN on `queue`, binding the group's referenced buffers for
 // residency.
@@ -748,7 +764,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_flush_chains(
     if (!iree_status_is_ok(status)) break;
     // Sync this group's I/O bindings back to host once its chains complete.
     for (const iree_hal_buffer_ref_t& binding_ref : group.binding_refs) {
-      status = iree_hal_amdxdna_buffer_invalidate_range(
+      status = iree_hal_amdxdna_invalidate_binding(
           binding_ref.buffer, binding_ref.offset, binding_ref.length);
       if (!iree_status_is_ok(status)) break;
     }
@@ -846,9 +862,9 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
   // Sync the bindings back to the host.
   for (iree_host_size_t j = 0; j < bindings.count; ++j) {
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_amdxdna_buffer_invalidate_range(
-                bindings.values[j].buffer, bindings.values[j].offset,
-                bindings.values[j].length));
+        z0, iree_hal_amdxdna_invalidate_binding(bindings.values[j].buffer,
+                                                bindings.values[j].offset,
+                                                bindings.values[j].length));
   }
 
   IREE_TRACE_ZONE_END(z0);
