@@ -507,6 +507,19 @@ def AMDAIEPerChannelIntegerRequantization :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEPerChannelIntegerRequantizationPass()";
 }
 
+def AMDAIESliceCoreConstants : Pass<"iree-amdaie-slice-core-constants", ""> {
+  let summary = "Give each core a table of only the core-local constant "
+                "elements it reads.";
+  let description = [{
+    A core-local constant holds a whole per-channel vector and every core of
+    the dispatch carries it, though each reads only its own columns. Once the
+    workgroup is built a core's offsets depend only on its own constant-bound
+    loops, so the runs it reads are copied into a table of its own and the
+    views are rebased onto it.
+  }];
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIESliceCoreConstantsPass()";
+}
+
 def AMDAIEFuseConsumerIntoLoop :
     InterfacePass<"iree-amdaie-fuse-consumer-into-loop", "mlir::FunctionOpInterface"> {
   let summary = "Fuse the consumer operation into the innermost last scf loop.";

@@ -1434,6 +1434,7 @@ LogicalResult generateUnifiedObject(
                                      "-O2",
                                      "--march=" + StringRef(targetArch).lower(),
                                      "--function-sections",
+                                     "--data-sections",
                                      "--filetype=obj",
                                      "-o",
                                      outputFile,

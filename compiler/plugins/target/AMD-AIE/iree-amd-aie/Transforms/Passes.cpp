@@ -890,6 +890,7 @@ void addAMDAIEObjectFifoLoweringPasses(
     passManager.addNestedPass<func::FuncOp>(
         createAMDAIECreateAIEWorkgroupPass(options));
   }
+  passManager.addPass(createAMDAIESliceCoreConstantsPass());
   passManager.addPass(createCSEPass());
   passManager.addPass(createAMDAIEDmaCSEPass());
 

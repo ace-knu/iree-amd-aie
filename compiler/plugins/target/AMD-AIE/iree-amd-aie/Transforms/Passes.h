@@ -278,6 +278,9 @@ std::unique_ptr<Pass> createAMDAIEFoldPerChannelDequantIntoMatmulPass();
 /// arithmetic at the tensor level.
 std::unique_ptr<Pass> createAMDAIEPerChannelIntegerRequantizationPass();
 
+/// Create a pass giving each core only the core-local constant elements it reads.
+std::unique_ptr<Pass> createAMDAIESliceCoreConstantsPass();
+
 /// Create a pass to fuse the producer operations into the scf loops.
 std::unique_ptr<Pass> createAMDAIEFuseProducerIntoLoopPass(
     AMDAIEFuseProducerIntoLoopOptions options = {});
