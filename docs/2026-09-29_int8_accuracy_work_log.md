@@ -21,6 +21,7 @@
 | **+ LayerNorm ukernel bf16 제거 (§5)** | **0.8409** | 0.8434 (`cboth`) | |
 | + 남은 4 개도 넓힘 (§5.6) | 0.8415 | 0.8434 (`cboth`) | 0.8414 (`cboth`), **NPU 64 문장 0.8400** (§5.7) |
 | **+ FC2 가중치 per-channel (§7.5)** | | | ORT 0.9447, **NPU 64 문장 0.9448** |
+| **+ FC1 가중치도 per-channel (§7.7)** | | | ORT 0.9509, **NPU 64 문장 0.9503** |
 | 인계 문서의 상한 (문제 텐서 fp32, 가중치 per-tensor) | | | 0.929 |
 
 ①②③ 모두 NPU 까지 끝났고, LayerNorm ukernel 2 단계에서 bf16 으로 내리던 과정을 없애 NPU - ORT
@@ -30,6 +31,7 @@ vmfb 바이트 동일이다.
 
 LayerNorm ukernel 의 계통 오차(3.9)는 §5.4 의 커널 수정으로 함께 고쳐졌다. 그 뒤 가중치 per-channel(§7)로
 FC2 12 개를 바꿔 **NPU 64 문장 0.8400 -> 0.9448** 이 됐다(디스패치 136 = NPU 131 / CPU 5 그대로).
+코어마다 자기 열의 상수만 넣게 해(§7.7) FC1 12 개도 per-channel 로 바꿀 수 있게 됐고, **0.9503** 이다.
 
 **커밋했다 (2026-09-30), 푸시는 안 했다.** `_local/wj` 의 로컬 브랜치 `bert-int8-accuracy`
 (`origin/bert-onnx` 의 `1549c7f6` 위):
@@ -46,6 +48,9 @@ FC2 12 개를 바꿔 **NPU 64 문장 0.8400 -> 0.9448** 이 됐다(디스패치 
 | `c5c58239` | `COMPLETED_FIXES.md` 에 이 작업 기록 | 문서 |
 | `b0051a62` | 같은 패스를 unit-batch `batch_matmul` 로 확장 (§7.5) | BERT FC2 12 개 i8, f32 matmul 0 |
 | `30bd07b0` | 새 패스 `AMDAIEPerChannelIntegerRequantization` (§7.5) | NPU 64 문장 0.9448, `sqall` 16/16 바이트 동일 |
+| `7b9cb1d3` | 런타임: 불변 바인딩의 디스패치 뒤 invalidate 생략 (속도 문서) | 두 모델 64/64 바이트 동일 |
+| `9945b920` | 이 기록을 브랜치 `docs/` 에 추가 | 문서 |
+| `55826b23` | 새 패스 `AMDAIESliceCoreConstants`, 코어 오브젝트에 `--data-sections` (§7.7) | FC1+FC2 per-channel NPU 0.9503, FC2 만 모델 64/64 바이트 동일 |
 
 바뀐 파일:
 
@@ -59,9 +64,10 @@ FC2 12 개를 바꿔 **NPU 64 문장 0.8400 -> 0.9448** 이 됐다(디스패치 
 | `Transforms/Utils/AMDAIELayerNormUtils.{h,cpp}` | ② residual 채널 스케일 벗겨내기, ③ `kLayerNormResidualInRegion` |
 | `Transforms/KernelDispatch.cpp` | ② 뱅크 인식 타일 재현 |
 | `Target/uKernels/npu4/peano/layernorm.cc` | ② `(4, 768)` 인스턴스 4 개, §5.4 2 단계 f32 |
-| `Target/XCLBinGen.cpp` | §7.3 상수식 GEP 의 `nuw` 제거 |
+| `Target/XCLBinGen.cpp` | §7.3 상수식 GEP 의 `nuw` 제거, §7.7 `llc --data-sections` |
 | `Transforms/AMDAIEFoldPerChannelDequantIntoMatmul.cpp` (새 파일) | §7.3 2D matmul, §7.5 batch_matmul |
 | `Transforms/AMDAIEPerChannelIntegerRequantization.cpp` (새 파일) | §7.5 채널별 정수 재양자화 |
+| `Transforms/AMDAIESliceCoreConstants.cpp` (새 파일) | §7.7 코어마다 자기 열의 상수만 |
 | `PluginRegistration.cpp` | §7 두 패스를 전처리에 등록 |
 | `docs/COMPLETED_FIXES.md` | 6 번 항목 |
 
@@ -1293,4 +1299,38 @@ ld.lld: error: section '.data' will not fit in region 'data': overflowed by 9024
 
 `constant_1` 은 `AMDAIEPerChannelIntegerRequantization` (§7.5) 이 만든 배수 표다. 두 표 모두 3,072 개 전체가 코어에
 들어가고, 코어는 오프셋으로 자기 열을 골라 읽는다. 출력이 768 채널인 attn_out · FC2 는 배수 표가 3,072 B 라 들어갔다.
+
+### 7.7 FC1 — 코어마다 자기 열의 상수만 (`55826b23`, 2026-10-02)
+
+§7.6 의 초과는 표 두 개가 3,072 개 전부 코어마다 들어간 탓이다. 어느 열을 읽는지 workgroup 생성 직후의 IR 에서 봤다
+(FC1 디스패치만 떼어 `--compile-mode=hal-executable` 로 컴파일, 3 초에 재현):
+
+```
+scf.forall (%arg0, %arg1, %arg2) in (1, 1, 6) {          // core_1_2
+  %198 = affine.apply affine_map<(d0) -> (d0 * 512)>(%arg2)
+  %199 = arith.addi %198, %c64 : index                    // 코어 열 항: core_0_2 는 0, core_5_3 은 320
+  %subview = memref.subview %197[%199] [64] [1] : memref<3072xi32> to ...
+```
+
+한 코어가 읽는 것은 64 개짜리 6 조각, 384 개다. 이 시점에는 오프셋이 그 코어의 상수 범위 루프만으로 정해진다.
+
+**패스 `AMDAIESliceCoreConstants`** (workgroup 생성 직후). 코어마다 `__amdaie_core_constant_*` 를 자르는 `subview` 의
+오프셋을 루프 변수의 모든 값에 대해 계산해, 읽는 조각을 반복 순서대로 새 표에 모으고 오프셋을 `반복 번호 * 64` 로
+바꾼다. 내용이 같은 표는 하나로 공유한다(같은 열의 코어 4 개).
+
+**`llc --data-sections`.** 코어 오브젝트(`input.o`)는 모든 코어가 같이 쓰고, 링커 스크립트가 `*(.rodata*)` 를 가져간다.
+표가 `.rodata` 하나로 묶여 있으면 모든 코어의 표가 모든 코어에 들어간다. 표마다 섹션이 생기면 `--gc-sections` 가
+그 코어가 부르지 않는 표를 버린다.
+
+| | 결과 |
+|---|---|
+| FC1 코어 `.rodata` | 24,576 B -> **3,072 B** (`[384 x float]`, `[384 x i32]`), 데이터 영역 15,552 B |
+| FC1 + FC2 per-channel 컴파일 | 성공, vmfb 207,783,809 B, 디스패치 136 |
+| **NPU 64 문장** | **0.9503** (최저 0.9422), ORT 0.9509 와 차이 -0.0006 (-1.4 SE) |
+| FC2 만 (§7.5) 대비 | 0.9448 -> 0.9503, **+0.0056, 58/64 개선** |
+| 회귀 — FC2 만 모델 | NPU 출력 **64/64 바이트 동일**, vmfb 212,345,391 -> 207,191,919 B |
+
+attn_out(§7.6)과 달리 FC1 은 ORT 이득(+0.0062)이 NPU 에서도 거의 그대로 나왔다.
+
+아직 안 본 것: 이 모델의 속도, attn_out + FC1 + FC2 조합(ORT 0.9514), 다른 모델의 회귀, 표가 넘칠 때의 진단 메시지.
 
