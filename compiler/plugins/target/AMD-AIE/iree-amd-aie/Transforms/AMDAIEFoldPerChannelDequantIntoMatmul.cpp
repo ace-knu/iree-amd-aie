@@ -5,11 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include <functional>
+#include <limits>
+#include <optional>
 
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -23,16 +27,19 @@ namespace {
 /// An int8 tensor dequantized by a `linalg.generic`, as the ONNX importer
 /// writes it:
 ///
-///   sitofp(x) * s                       -- a per-tensor activation
+///   sitofp(x) * s                           -- a per-tensor activation
+///   sitofp(extsi(x) - zp) * s               -- the same, asymmetric
 ///   sitofp(extsi(w) - extsi(zp[n])) * s[n]  -- a per-channel weight
 ///
 /// `scale` is either a scalar f32 constant (captured by the body) or a 1-D
-/// f32 constant indexed by the generic's last loop. A zero point, when
-/// present, has to be a constant zero.
+/// f32 constant indexed by the generic's last loop. A per-channel zero point
+/// has to be a constant zero; a scalar one captured by the body may be any
+/// constant.
 struct Dequantized {
   Value quantized;
   /// One entry for a per-tensor scale, `N` for a per-channel one.
   SmallVector<float> scale;
+  int64_t zeroPoint = 0;
 };
 
 /// The constant `v` is, as floats, or nothing.
@@ -69,16 +76,24 @@ FailureOr<Dequantized> matchDequantize(Value value) {
   unsigned rank = op.getNumLoops();
 
   // The value being converted: the quantized operand itself, or it minus a
-  // zero point that has to be zero.
+  // zero point -- a per-channel operand that has to be zero, or a scalar
+  // constant.
   Value converted = toFloat.getIn();
+  int64_t zeroPoint = 0;
   if (auto sub = converted.getDefiningOp<arith::SubIOp>()) {
     auto lhs = sub.getLhs().getDefiningOp<arith::ExtSIOp>();
-    auto rhs = sub.getRhs().getDefiningOp<arith::ExtSIOp>();
-    if (!lhs || !rhs) return failure();
-    auto zpArg = dyn_cast<BlockArgument>(rhs.getIn());
-    if (!zpArg || zpArg.getOwner() != &body) return failure();
-    if (!isZeroConstant(op.getDpsInputs()[zpArg.getArgNumber()]))
-      return failure();
+    if (!lhs) return failure();
+    APInt zp;
+    if (matchPattern(sub.getRhs(), m_ConstantInt(&zp))) {
+      zeroPoint = zp.getSExtValue();
+    } else {
+      auto rhs = sub.getRhs().getDefiningOp<arith::ExtSIOp>();
+      if (!rhs) return failure();
+      auto zpArg = dyn_cast<BlockArgument>(rhs.getIn());
+      if (!zpArg || zpArg.getOwner() != &body) return failure();
+      if (!isZeroConstant(op.getDpsInputs()[zpArg.getArgNumber()]))
+        return failure();
+    }
     converted = lhs.getIn();
   }
   auto quantArg = dyn_cast<BlockArgument>(converted);
@@ -90,6 +105,7 @@ FailureOr<Dequantized> matchDequantize(Value value) {
 
   Dequantized result;
   result.quantized = quantOperand->get();
+  result.zeroPoint = zeroPoint;
   Value scale = mul.getRhs();
   if (auto scaleArg = dyn_cast<BlockArgument>(scale);
       scaleArg && scaleArg.getOwner() == &body) {
@@ -123,8 +139,16 @@ FailureOr<Dequantized> matchDequantize(Value value) {
 ///   %acc = linalg.matmul ins(%x, %w) outs(fill 0) -> i32
 ///   %y   = sitofp(%acc) * (sx * sw[n])
 ///
-/// which is exact: the scales factor out of the sum over K. The per-tensor
-/// form already arrives this way (as `linalg.quantized_matmul`); the ONNX
+/// which is exact: the scales factor out of the sum over K. An activation
+/// with a zero point zx adds a term that does not depend on it,
+///
+///   sum_k (x[m,k] - zx) * w[k,n] = acc[m,n] - zx * sum_k w[k,n],
+///
+/// so for a constant weight the tail subtracts a compile-time [N] table:
+///
+///   %y   = sitofp(%acc - c[n]) * (sx * sw[n]),   c[n] = zx * sum_k w[k,n]
+///
+/// The per-tensor form already arrives this way (as `linalg.quantized_matmul`); the ONNX
 /// importer only falls back to a float matmul because that named op cannot
 /// carry a per-channel zero point. Left as it was, both dequantizations and a
 /// float matmul would land in one dispatch, which the NPU cannot lower.
@@ -144,15 +168,64 @@ struct Operands {
 LogicalResult checkScales(const Operands &ops, RankedTensorType resultType) {
   // Only the case the per-tensor path cannot already take.
   if (ops.lhs.scale.size() != 1 || ops.rhs.scale.size() == 1) return failure();
+  // A weight zero point would need the activation's row sums at run time.
+  if (ops.rhs.zeroPoint != 0) return failure();
   int64_t n = resultType.getDimSize(resultType.getRank() - 1);
   if (ShapedType::isDynamic(n) || static_cast<int64_t>(ops.rhs.scale.size()) != n)
     return failure();
   return success();
 }
 
-/// Build `sitofp(acc) * (sx * sw[n])` over `acc`, and replace `contraction`.
+/// The int8 values of a constant `[K, N]` weight, row-major, or nothing.
+std::optional<SmallVector<int8_t>> readI8(Value v) {
+  Attribute attr;
+  if (!matchPattern(v, m_Constant(&attr))) return std::nullopt;
+  if (auto dense = dyn_cast<DenseIntElementsAttr>(attr)) {
+    if (!dense.getElementType().isInteger(8)) return std::nullopt;
+    SmallVector<int8_t> out;
+    out.reserve(dense.getNumElements());
+    for (APInt i : dense.getValues<APInt>())
+      out.push_back(static_cast<int8_t>(i.getSExtValue()));
+    return out;
+  }
+  if (auto resource = dyn_cast<DenseI8ResourceElementsAttr>(attr)) {
+    std::optional<ArrayRef<int8_t>> data = resource.tryGetAsArrayRef();
+    if (!data) return std::nullopt;
+    return SmallVector<int8_t>(data->begin(), data->end());
+  }
+  return std::nullopt;
+}
+
+/// `c[n] = zx * sum_k w[k,n]` for an activation zero point `zx` and the
+/// constant weight `w : [K, N]`; empty when `zx` is zero, failure when the
+/// weight is not a readable constant or a term leaves i32.
+FailureOr<SmallVector<int32_t>> zeroPointCorrection(const Operands &ops) {
+  if (ops.lhs.zeroPoint == 0) return SmallVector<int32_t>{};
+  auto type = dyn_cast<RankedTensorType>(ops.rhs.quantized.getType());
+  if (!type || type.getRank() != 2 || !type.hasStaticShape()) return failure();
+  std::optional<SmallVector<int8_t>> w = readI8(ops.rhs.quantized);
+  int64_t k = type.getDimSize(0), n = type.getDimSize(1);
+  if (!w || static_cast<int64_t>(w->size()) != k * n) return failure();
+  SmallVector<int64_t> sums(n, 0);
+  for (int64_t r = 0; r < k; ++r)
+    for (int64_t c = 0; c < n; ++c) sums[c] += (*w)[r * n + c];
+  SmallVector<int32_t> out;
+  out.reserve(n);
+  for (int64_t s : sums) {
+    int64_t c = ops.lhs.zeroPoint * s;
+    if (c < std::numeric_limits<int32_t>::min() ||
+        c > std::numeric_limits<int32_t>::max())
+      return failure();
+    out.push_back(static_cast<int32_t>(c));
+  }
+  return out;
+}
+
+/// Build `sitofp(acc [- c[n]]) * (sx * sw[n])` over `acc`, and replace
+/// `contraction`.
 void replaceWithScaledTail(PatternRewriter &rewriter, Operation *contraction,
-                           Value acc, const Operands &ops) {
+                           Value acc, const Operands &ops,
+                           ArrayRef<int32_t> correction) {
   Location loc = contraction->getLoc();
   auto accType = cast<RankedTensorType>(acc.getType());
   int64_t rank = accType.getRank();
@@ -171,12 +244,22 @@ void replaceWithScaledTail(PatternRewriter &rewriter, Operation *contraction,
       AffineMap::get(rank, 0, {getAffineDimExpr(rank - 1, ctx)}, ctx);
   Value outInit = rewriter.create<tensor::EmptyOp>(
       loc, tensor::getMixedSizes(rewriter, loc, acc), f32);
+  SmallVector<Value> inputs{acc, scales};
+  SmallVector<AffineMap> maps{identity, column};
+  if (!correction.empty()) {
+    auto corrType = RankedTensorType::get({n}, rewriter.getI32Type());
+    inputs.push_back(rewriter.create<arith::ConstantOp>(
+        loc, DenseElementsAttr::get(corrType, correction)));
+    maps.push_back(column);
+  }
+  maps.push_back(identity);
   auto scaled = rewriter.create<linalg::GenericOp>(
-      loc, TypeRange{outInit.getType()}, ValueRange{acc, scales},
-      ValueRange{outInit}, ArrayRef<AffineMap>{identity, column, identity},
+      loc, TypeRange{outInit.getType()}, inputs, ValueRange{outInit}, maps,
       SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
       [&](OpBuilder &b, Location l, ValueRange args) {
-        Value f = b.create<arith::SIToFPOp>(l, f32, args[0]);
+        Value a = args[0];
+        if (!correction.empty()) a = b.create<arith::SubIOp>(l, a, args[2]);
+        Value f = b.create<arith::SIToFPOp>(l, f32, a);
         b.create<linalg::YieldOp>(l, b.create<arith::MulFOp>(l, f, args[1])
                                          .getResult());
       });
@@ -215,6 +298,8 @@ struct FoldPerChannelDequantIntoMatmul : OpRewritePattern<linalg::MatmulOp> {
     if (failed(lhs) || failed(rhs)) return failure();
     Operands ops{*lhs, *rhs};
     if (failed(checkScales(ops, resultType))) return failure();
+    FailureOr<SmallVector<int32_t>> correction = zeroPointCorrection(ops);
+    if (failed(correction)) return failure();
 
     Location loc = matmul.getLoc();
     Value accZero = zeroAccumulator(rewriter, loc, matmul.getOutputs()[0]);
@@ -224,7 +309,7 @@ struct FoldPerChannelDequantIntoMatmul : OpRewritePattern<linalg::MatmulOp> {
                         ValueRange{ops.lhs.quantized, ops.rhs.quantized},
                         ValueRange{accZero})
                     .getResult(0);
-    replaceWithScaledTail(rewriter, matmul, acc, ops);
+    replaceWithScaledTail(rewriter, matmul, acc, ops, *correction);
     return success();
   }
 };
@@ -324,6 +409,8 @@ struct FoldPerChannelDequantIntoBatchMatmul
     if (failed(lhs) || failed(rhs)) return failure();
     Operands ops{lhs->dequant, rhs->dequant};
     if (failed(checkScales(ops, resultType))) return failure();
+    FailureOr<SmallVector<int32_t>> correction = zeroPointCorrection(ops);
+    if (failed(correction)) return failure();
 
     Location loc = matmul.getLoc();
     Value lhsI8 = lhs->rebuild(rewriter, loc, ops.lhs.quantized);
@@ -334,7 +421,7 @@ struct FoldPerChannelDequantIntoBatchMatmul
                         loc, TypeRange{accZero.getType()},
                         ValueRange{lhsI8, rhsI8}, ValueRange{accZero})
                     .getResult(0);
-    replaceWithScaledTail(rewriter, matmul, acc, ops);
+    replaceWithScaledTail(rewriter, matmul, acc, ops, *correction);
     return success();
   }
 };

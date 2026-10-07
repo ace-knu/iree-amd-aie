@@ -480,7 +480,12 @@ def AMDAIEFoldPerChannelDequantIntoMatmul :
       %acc = linalg.matmul ins(%x, %w) outs(fill 0) -> i32
       %y   = sitofp(%acc) * (sx * sw[n])
 
-    exactly: the scales factor out of the sum over K.
+    exactly: the scales factor out of the sum over K. An activation with a
+    constant zero point zx is taken too, when the weight is a constant: the
+    term zx * sum_k w[k,n] does not depend on the activation, so the tail
+    subtracts it as a compile-time [N] table,
+
+      %y   = sitofp(%acc - c[n]) * (sx * sw[n]),   c[n] = zx * sum_k w[k,n]
   }];
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFoldPerChannelDequantIntoMatmulPass()";
 }
@@ -492,13 +497,16 @@ def AMDAIEPerChannelIntegerRequantization :
   let description = [{
     Takes the pair
 
-      %f = generic ins(%acc : i32, %s : [N] f32) { sitofp(acc) * s[n] }
+      %f = generic ins(%acc : i32, %s : [N] f32 [, %c : [N] i32])
+             { sitofp(acc [- c[n]]) * s[n] }
       %q = generic ins(%f) { roundeven(f / S2) [+ zp] -> clamp -> iM }
 
-    that a per-channel matmul's requantization arrives as and rewrites it to
+    that a per-channel matmul's requantization arrives as (`c` is the
+    correction for an activation zero point) and rewrites it to
 
-      %q = generic ins(%acc, %m : [N] i32) {
-             round_half_even(acc * m[n] >> shift) [+ zp] -> clamp -> iM }
+      %q = generic ins(%acc, %m : [N] i32 [, %c]) {
+             round_half_even((acc [- c[n]]) * m[n] >> shift) [+ zp]
+             -> clamp -> iM }
 
     with `m[n] / 2^shift ~= s[n] / S2` and a shift shared by every channel.
     `AMDAIEIntegerRequantization` does this for a scalar scale on the core's

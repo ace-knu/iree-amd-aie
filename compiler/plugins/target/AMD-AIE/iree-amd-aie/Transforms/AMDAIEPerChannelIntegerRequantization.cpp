@@ -25,8 +25,11 @@ namespace {
 /// `AMDAIEFoldPerChannelDequantIntoMatmul` leaves it and the requantization
 /// after it writes it:
 ///
-///   %f = generic ins(%acc : iK, %s : [N] f32) { sitofp(acc) * s[n] }
+///   %f = generic ins(%acc : iK, %s : [N] f32 [, %c : [N] i32])
+///          { sitofp(acc [- c[n]]) * s[n] }
 ///   %q = generic ins(%f) { roundeven(f / S2) [+ zp] -> clamp [lo, hi] -> iM }
+///
+/// where `c` is the correction for an activation zero point.
 ///
 /// The scale is a vector, so `AMDAIEIntegerRequantization` -- which works on
 /// the core's scalar code and needs a compile-time constant -- cannot take it,
@@ -34,8 +37,9 @@ namespace {
 /// BERT-base's FC2 that overflows the 16 KB program memory. This rewrites the
 /// pair, while it is still a tensor op whose scales are visible, into
 ///
-///   %q = generic ins(%acc, %m : [N] i32) {
-///          round_half_even(acc * m[n] >> shift) [+ zp] -> clamp -> iM }
+///   %q = generic ins(%acc, %m : [N] i32 [, %c]) {
+///          round_half_even((acc [- c[n]]) * m[n] >> shift) [+ zp]
+///          -> clamp -> iM }
 ///
 /// with `m[n] / 2^shift ~= s[n] / S2` and one shift for every channel. The
 /// table the core reads becomes integer, and so does all of its arithmetic.
@@ -94,26 +98,39 @@ FailureOr<Tail> matchRequantization(linalg::GenericOp q) {
   return tail;
 }
 
-/// The scaled accumulator generic `f`: its accumulator and per-channel scales.
+/// The scaled accumulator generic `f`: its accumulator, per-channel scales and,
+/// when it has one, the per-channel correction subtracted before the scale.
 LogicalResult matchScaledAccumulator(linalg::GenericOp f, Value &acc,
-                                     SmallVector<double> &scales) {
-  if (f.getNumDpsInputs() != 2 || f.getNumDpsInits() != 1 ||
+                                     SmallVector<double> &scales,
+                                     Value &correction) {
+  unsigned numInputs = f.getNumDpsInputs();
+  if ((numInputs != 2 && numInputs != 3) || f.getNumDpsInits() != 1 ||
       f.getNumReductionLoops() != 0)
     return failure();
   unsigned rank = f.getNumLoops();
   SmallVector<AffineMap> maps = f.getIndexingMapsArray();
   AffineMap column = AffineMap::get(
       rank, 0, {getAffineDimExpr(rank - 1, f.getContext())}, f.getContext());
-  if (!maps[0].isIdentity() || maps[1] != column || !maps[2].isIdentity())
+  if (!maps[0].isIdentity() || maps[1] != column || !maps.back().isIdentity())
     return failure();
+  if (numInputs == 3 && maps[2] != column) return failure();
   Block &body = f.getRegion().front();
   auto yield = cast<linalg::YieldOp>(body.getTerminator());
   auto mul = yield.getValues()[0].getDefiningOp<arith::MulFOp>();
   if (!mul || mul.getRhs() != body.getArgument(1)) return failure();
   auto toFloat = mul.getLhs().getDefiningOp<arith::SIToFPOp>();
-  if (!toFloat || toFloat.getIn() != body.getArgument(0) ||
-      !body.getArgument(0).getType().isInteger(32))
+  if (!toFloat || !body.getArgument(0).getType().isInteger(32))
     return failure();
+  Value converted = toFloat.getIn();
+  if (numInputs == 3) {
+    auto sub = converted.getDefiningOp<arith::SubIOp>();
+    if (!sub || sub.getRhs() != body.getArgument(2) ||
+        !body.getArgument(2).getType().isInteger(32))
+      return failure();
+    converted = sub.getLhs();
+    correction = f.getDpsInputs()[2];
+  }
+  if (converted != body.getArgument(0)) return failure();
   DenseElementsAttr attr;
   if (!matchPattern(f.getDpsInputs()[1], m_Constant(&attr))) return failure();
   for (APFloat v : attr.getValues<APFloat>()) scales.push_back(v.convertToDouble());
@@ -131,9 +148,10 @@ struct PerChannelIntegerRequantization
     if (failed(tail)) return failure();
     auto f = q.getDpsInputs()[0].getDefiningOp<linalg::GenericOp>();
     if (!f || !f->hasOneUse()) return failure();
-    Value acc;
+    Value acc, correction;
     SmallVector<double> scales;
-    if (failed(matchScaledAccumulator(f, acc, scales))) return failure();
+    if (failed(matchScaledAccumulator(f, acc, scales, correction)))
+      return failure();
 
     // One shift for every channel: as large as the widest channel's multiplier
     // allows inside i32, so the narrowest keeps the most bits it can.
@@ -163,15 +181,20 @@ struct PerChannelIntegerRequantization
     Value table = rewriter.create<arith::ConstantOp>(
         loc, DenseElementsAttr::get(tableType, ArrayRef<int32_t>(multipliers)));
     SmallVector<AffineMap> maps = f.getIndexingMapsArray();
-    maps[2] = q.getIndexingMapsArray()[1];
+    maps.back() = q.getIndexingMapsArray()[1];
+    SmallVector<Value> inputs{acc, table};
+    if (correction) inputs.push_back(correction);
     auto replacement = rewriter.create<linalg::GenericOp>(
-        loc, q.getResultTypes(), ValueRange{acc, table}, q.getDpsInits(), maps,
+        loc, q.getResultTypes(), inputs, q.getDpsInits(), maps,
         q.getIteratorTypesArray(),
         [&](OpBuilder &b, Location l, ValueRange args) {
           auto c = [&](int64_t v) -> Value {
             return b.create<arith::ConstantOp>(l, b.getI64IntegerAttr(v));
           };
           Value a = b.create<arith::ExtSIOp>(l, i64, args[0]);
+          if (correction)
+            a = b.create<arith::SubIOp>(
+                l, a, b.create<arith::ExtSIOp>(l, i64, args[2]));
           Value m = b.create<arith::ExtSIOp>(l, i64, args[1]);
           Value product = b.create<arith::MulIOp>(l, a, m);
           // An arithmetic shift floors, so the remainder is in [0, 2^shift)
