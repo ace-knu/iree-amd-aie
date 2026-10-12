@@ -74,6 +74,8 @@ struct AMDAIESession
       AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
       poolOptions.channelMultiple = options.getNumRows(deviceModel);
       poolOptions.haloSplitColumns = options.getNumCols(deviceModel);
+      poolOptions.rowMultiple = options.getNumCols(deviceModel);
+      poolOptions.columnsPolicy = options.poolColumnsPolicy;
       passManager.addPass(
           AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass(poolOptions));
     }

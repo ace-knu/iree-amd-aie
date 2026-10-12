@@ -7,6 +7,7 @@
 #ifndef IREE_AMD_AIE_TRANSFORMS_AMDAIEUTILS_H_
 #define IREE_AMD_AIE_TRANSFORMS_AMDAIEUTILS_H_
 
+#include "iree-amd-aie/Transforms/KernelDispatch.h"
 #include "iree-amd-aie/aie_runtime/AMDAIEEnums.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -63,6 +64,42 @@ bool isGemvMExtent(int64_t m);
 /// Whether small-M matmuls take the GEMV pipeline for this target
 /// (`gemv_pipeline` in the executable target config; absent means enabled).
 bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// Whether the Flow pad pass may pad a GEMV's N up to a multiple of
+/// `numRows * numCols * n1` so the GEMV pipeline reaches every core
+/// (`gemv_pad_n` in the executable target config; absent means enabled).
+bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// Bytes reserved for the stack in each core (`core_stack_size` in the
+/// executable target config; absent means 1024, the backend default).
+int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// The GEMV pipeline's per-core N tile and the core count a block reaches, for
+/// a (1 x K) x (N x K)^T matmul with `kTile` K elements streamed per step.
+/// Over the divisors `n1` of N whose double-buffered A/B/C tiles fit
+/// `l1Limit`, take the one whose block covers the most cores; ties go to the
+/// largest tile (fewest blocks). A block must fill whole columns or stay in
+/// one (`cores <= numRows || cores % numRows == 0`): the L2 weight split hands
+/// every memtile one column. Shared by `KernelDispatch` (tile sizes) and the
+/// Flow pad pass (whether N needs padding) so both see the same core count.
+struct GemvNTiling {
+  int64_t n1;
+  int64_t cores;
+};
+FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
+                                         int64_t bytesLhs, int64_t bytesRhs,
+                                         int64_t bytesOut, int64_t numRows,
+                                         int64_t numCols, int64_t l1Limit);
+
+/// The N the Flow pad pass pads a GEMV to so `chooseGemvNTiling` reaches all
+/// `numRows * numCols` cores: over the L1-fitting `n1`, the multiple of
+/// `cores * n1` that pads N by at most 1/8 with the fewest blocks, then the
+/// least padding; falls back to a multiple of `cores` (n1 = 1). Returns N
+/// unchanged when it already reaches every core, or when N < cores (one
+/// output per core is not worth a pad + crop).
+int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
+                       int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
+                       int64_t numCols, int64_t l1Limit);
 
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);
@@ -139,12 +176,62 @@ FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp);
 bool isMaxPoolingOp(linalg::LinalgOp linalgOp);
 
 /// Number of array columns the pool pipeline spreads a pooling's leading
-/// spatial output dim `oh` over: its odd factor when 1 < odd <= numCols (a
-/// halving pooling chain keeps that factor down to its last layer, so every
-/// layer gets the same column count), else the largest divisor of `oh` that is
-/// <= numCols. Shared by the root config and the preprocessing halo split so
-/// both agree on the chunk count.
+/// spatial output dim `oh` over under `PoolColumnsPolicy::Odd`: its odd factor
+/// when 1 < odd <= numCols (a halving pooling chain keeps that factor down to
+/// its last layer, so every layer gets the same column count), else the
+/// largest divisor of `oh` that is <= numCols.
 int64_t choosePoolColumns(int64_t oh, int64_t numCols);
+
+/// Per-column cost model of a pool dispatch, `t(cols) = fixedMs +
+/// perColumnMs * (cols - 1) + msPerMBPerColumn * MB / cols`: each column adds
+/// a fixed cost (its shim DMA programming / sync) and one shim channel's worth
+/// of bandwidth. Fitted on npu4, f32 scalar pooling, VGG-16 pool1-5 at 7
+/// columns and pool4/5 at 1 column (docs_POOL/1001_pool_column_cost_model.md).
+struct PoolColumnCost {
+  double fixedMs = 0.74;
+  double perColumnMs = 0.21;
+  double msPerMBPerColumn = 1.77;
+  // Host side of padding OH (only when a padded candidate is considered): a
+  // pad dispatch that copies the input and a crop dispatch that copies the
+  // output, at an assumed host copy rate, plus a launch each. Not measured;
+  // an estimate (5 GB/s, 50 us) that keeps a padded candidate from winning on
+  // a few hundred microseconds of NPU time (pool5: 2 padded columns would be
+  // 0.17 ms faster than 1 unpadded column on the NPU alone).
+  double hostMsPerMB = 0.2;
+  double hostDispatchMs = 0.05;
+  double timeMs(int64_t cols, double bytes) const {
+    return fixedMs + perColumnMs * (cols - 1) +
+           msPerMBPerColumn * (bytes / (1024.0 * 1024.0)) / cols;
+  }
+  double hostPadMs(double bytesCopied) const {
+    return hostMsPerMB * (bytesCopied / (1024.0 * 1024.0)) +
+           2 * hostDispatchMs;
+  }
+};
+
+/// What a 2-D max pooling moves through the array for the cost model, from
+/// its output extents and window: `(inExtent(oh) * inExtent(ow) * c) *
+/// bytesIn + (oh * ow * c) * bytesOut`, `inExtent(t) = (t - 1) * stride +
+/// window`. Computed from the same quantities in the preprocessing pass and
+/// the root config so the two choose the same column count.
+struct PoolShape {
+  int64_t ow, c, windowH, windowW, strideH, strideW, bytesIn, bytesOut;
+  double bytesMoved(int64_t oh) const;
+};
+
+/// Column count for `oh` under `policy` (see `PoolColumnsPolicy`). With
+/// `allowPad` the result may name an `ohPadded > oh` the caller must pad OH up
+/// to first (preprocessing); the root config calls with `allowPad = false` on
+/// the shape it is given and gets the same `cols` the preprocessing chose for
+/// it, since both evaluate the same candidates on the same bytes.
+struct PoolColumns {
+  int64_t cols;
+  int64_t ohPadded;
+};
+PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
+                              PoolColumnsPolicy policy, const PoolShape &shape,
+                              bool allowPad,
+                              const PoolColumnCost &cost = PoolColumnCost());
 
 /// Returns true if `v` has no defined contents: it is a `tensor.empty`, or a
 /// slice of one. Such an operand (e.g. a pooling window that only sizes the

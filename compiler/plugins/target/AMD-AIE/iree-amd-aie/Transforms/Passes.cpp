@@ -874,7 +874,8 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int callReplication, bool insertLoopAroundCoreBlock, bool enableCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas, PoolCoreSplit poolCoreSplit) {
+    uint32_t coreStackSize, bool reprogramDmas, PoolCoreSplit poolCoreSplit,
+    PoolColumnsPolicy poolColumnsPolicy) {
   OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
   {
     FunctionLikeNest funcPassManager(modulePassManager);
@@ -893,6 +894,7 @@ void buildAMDAIETransformPassPipeline(
     options.enableAMDAIEUkernels = enableAMDAIEUkernels;
     options.stackSize = coreStackSize;
     options.poolCoreSplit = poolCoreSplit;
+    options.poolColumnsPolicy = poolColumnsPolicy;
     modulePassManager.addPass(createAMDAIELoweringStrategyPass(options));
   }
   modulePassManager.addPass(createLowerExecutableUsingTransformDialectPass());

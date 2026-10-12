@@ -6,6 +6,7 @@
 
 #include "AMDAIEUtils.h"
 
+#include <algorithm>
 #include <optional>
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
@@ -108,10 +109,133 @@ int64_t choosePoolColumns(int64_t oh, int64_t numCols) {
   return best;
 }
 
+double PoolShape::bytesMoved(int64_t oh) const {
+  auto inExtent = [](int64_t t, int64_t stride, int64_t window) {
+    return (t - 1) * stride + window;
+  };
+  double in = static_cast<double>(inExtent(oh, strideH, windowH)) *
+              inExtent(ow, strideW, windowW) * c * bytesIn;
+  double out = static_cast<double>(oh) * ow * c * bytesOut;
+  return in + out;
+}
+
+PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
+                              PoolColumnsPolicy policy, const PoolShape &shape,
+                              bool allowPad, const PoolColumnCost &cost) {
+  if (oh <= 0 || numCols <= 0) return {1, oh};
+  auto roundUp = [](int64_t v, int64_t m) { return ((v + m - 1) / m) * m; };
+  switch (policy) {
+    case PoolColumnsPolicy::Odd:
+      return {choosePoolColumns(oh, numCols), oh};
+    case PoolColumnsPolicy::Full: {
+      if (oh % numCols == 0) return {numCols, oh};
+      if (allowPad) return {numCols, roundUp(oh, numCols)};
+      return {choosePoolColumns(oh, numCols), oh};
+    }
+    case PoolColumnsPolicy::Cost: {
+      // Cheapest divisor of a given extent under the cost model.
+      auto bestFor = [&](int64_t extent) {
+        double bytes = shape.bytesMoved(extent);
+        int64_t bestCols = 1;
+        double bestT = cost.timeMs(1, bytes);
+        for (int64_t d = 2; d <= std::min(extent, numCols); ++d) {
+          if (extent % d != 0) continue;
+          double t = cost.timeMs(d, bytes);
+          if (t < bestT) {
+            bestT = t;
+            bestCols = d;
+          }
+        }
+        return std::make_pair(bestCols, bestT);
+      };
+      auto [cols, t] = bestFor(oh);
+      if (allowPad && oh % numCols != 0) {
+        int64_t padded = roundUp(oh, numCols);
+        auto [colsP, tP] = bestFor(padded);
+        // The padded shape also pays the host pad (input copy) and crop
+        // (output copy) dispatches.
+        tP += cost.hostPadMs(shape.bytesMoved(padded));
+        if (tP < t) return {colsP, padded};
+      }
+      return {cols, oh};
+    }
+  }
+  return {choosePoolColumns(oh, numCols), oh};
+}
+
 bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<BoolAttr> attr =
       getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");
   return !attr || attr->getValue();
+}
+
+bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr =
+      getConfigAttr<BoolAttr>(targetAttr, "gemv_pad_n");
+  return !attr || attr->getValue();
+}
+
+int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<IntegerAttr> attr =
+      getConfigAttr<IntegerAttr>(targetAttr, "core_stack_size");
+  return attr ? attr->getInt() : 1024;
+}
+
+FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
+                                         int64_t bytesLhs, int64_t bytesRhs,
+                                         int64_t bytesOut, int64_t numRows,
+                                         int64_t numCols, int64_t l1Limit) {
+  // Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles.
+  auto l1Bytes = [&](int64_t n1) {
+    return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
+  };
+  int64_t numCores = numRows * numCols;
+  GemvNTiling best{0, 0};
+  for (int64_t n1 = 1; n1 <= N && l1Bytes(n1) <= l1Limit; ++n1) {
+    if (N % n1 != 0) continue;
+    int64_t cores = 0;
+    for (int64_t c = numCores; c >= 1; --c) {
+      if (N % (c * n1) != 0 || (c > numRows && c % numRows != 0)) continue;
+      cores = c;
+      break;
+    }
+    if (cores > best.cores || (cores == best.cores && n1 > best.n1))
+      best = {n1, cores};
+  }
+  if (best.n1 == 0) return failure();
+  return best;
+}
+
+int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
+                       int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
+                       int64_t numCols, int64_t l1Limit) {
+  int64_t numCores = numRows * numCols;
+  if (N < numCores) return N;
+  FailureOr<GemvNTiling> now = chooseGemvNTiling(
+      M, N, kTile, bytesLhs, bytesRhs, bytesOut, numRows, numCols, l1Limit);
+  if (succeeded(now) && now->cores == numCores) return N;
+  auto l1Bytes = [&](int64_t n1) {
+    return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
+  };
+  auto roundUp = [](int64_t v, int64_t m) { return ((v + m - 1) / m) * m; };
+  // Candidates N' = roundUp(N, cores * n1) for every L1-fitting n1 that pads
+  // by at most 1/8: fewest blocks first (each block is a full L3->L2->L1 pass
+  // over the K loop), then the least padding (weight bytes copied per
+  // inference). N=1000 -> 1024 (n1 32, 1 block), 500 -> 512 (n1 16),
+  // 21843 -> 23808 (n1 62, 12 blocks, 9 %) rather than 21856 (n1 1, 683
+  // blocks).
+  int64_t best = 0, bestBlocks = 0;
+  for (int64_t n1 = 1; n1 <= N && l1Bytes(n1) <= l1Limit; ++n1) {
+    int64_t padded = roundUp(N, numCores * n1);
+    if ((padded - N) * 8 > N) continue;
+    int64_t blocks = padded / (numCores * n1);
+    if (best == 0 || blocks < bestBlocks ||
+        (blocks == bestBlocks && padded < best)) {
+      best = padded;
+      bestBlocks = blocks;
+    }
+  }
+  return best ? best : roundUp(N, numCores);
 }
 
 bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr) {

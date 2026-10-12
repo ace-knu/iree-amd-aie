@@ -187,6 +187,12 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // Set the GEMV pipeline routing flag (read per dispatch by the Flow pad /
     // split passes and by KernelDispatch).
     addConfig("gemv_pipeline", BoolAttr::get(context, options.enableGemvPipeline));
+    // Whether the Flow pad pass may grow a GEMV's N to reach every core, and
+    // the core stack size it needs for the same L1 budget as KernelDispatch.
+    addConfig("gemv_pad_n", BoolAttr::get(context, options.gemvPadN));
+    addConfig("core_stack_size",
+              IntegerAttr::get(IntegerType::get(context, 32),
+                               options.coreStackSize));
     // Set the pooling placement flag (read by AMDAIEAssignDeviceAffinities).
     addConfig("pooling", BoolAttr::get(context, options.enablePooling));
     // Set number of rows/cols used in an AIE array.
@@ -247,7 +253,8 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
         options.enableCoalescingLoops, options.enableCollapsingUnitDims,
         options.enableFunctionOutlining, options.callReplication,
         options.insertLoopAroundCoreBlock, options.enableCtrlPkt,
-        options.coreStackSize, options.reprogramDmas, options.poolCoreSplit);
+        options.coreStackSize, options.reprogramDmas, options.poolCoreSplit,
+        options.poolColumnsPolicy);
   }
 
   void buildLinkingPassPipeline(OpPassManager &passManager) override {

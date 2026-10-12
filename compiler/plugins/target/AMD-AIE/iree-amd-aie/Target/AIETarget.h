@@ -108,6 +108,9 @@ struct AMDAIEOptions {
   // M/N padding and N-splitting (KernelDispatch, AMDAIEPadContractionDispatches).
   // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
   bool enableGemvPipeline{true};
+  // Let the Flow pad pass grow a GEMV's N (host pad + crop) to a multiple of
+  // 32 * n1 when its divisors would leave cores idle (N=1000: 20 -> 32 cores).
+  bool gemvPadN{true};
   // Preprocessing: rewrite NCHW max pooling as NHWC (channels-last) pooling
   // wrapped in transposes, so pooling matches the NHWC convs and the transposes
   // around each pool cancel. Stage 0 of the NPU pooling work; default off.
@@ -120,6 +123,9 @@ struct AMDAIEOptions {
   // How the pool pipeline lays max pooling out on the core array (see
   // `PoolCoreSplit`). Only matters with `--iree-amdaie-enable-pooling`.
   PoolCoreSplit poolCoreSplit{PoolCoreSplit::SpatialChannel};
+  // How many columns the pool pipeline uses for a pooling (and whether the
+  // preprocessing pads OH to get there); see `PoolColumnsPolicy`.
+  PoolColumnsPolicy poolColumnsPolicy{PoolColumnsPolicy::Cost};
   bool enableCtrlPkt{false};
 
   enum class DeviceHAL { XRT, AMDXDNA };
@@ -210,6 +216,13 @@ struct AMDAIEOptions {
         llvm::cl::desc("Lower small-M (GEMV-like) matmuls with the GEMV tile "
                        "pipeline instead of pack-peel (and skip their M/N "
                        "padding and N-splitting). Default true."));
+
+    binder.opt<bool>(
+        "iree-amdaie-gemv-pad-n", gemvPadN, llvm::cl::cat(category),
+        llvm::cl::desc("Pad a GEMV's N on the host (Flow pad pass, with a "
+                       "crop) up to a multiple of 32 * n1 when its divisors "
+                       "would leave cores idle, so the GEMV pipeline uses "
+                       "every core. Default true."));
 
     binder.opt<bool>(
         "iree-amdaie-enable-pooling", enablePooling, llvm::cl::cat(category),
@@ -380,6 +393,20 @@ struct AMDAIEOptions {
             clEnumValN(PoolCoreSplit::Search, "search",
                        "Search one distributed output dim, ranked by core "
                        "count, channel tile and L1 bytes.")));
+    binder.opt<PoolColumnsPolicy>(
+        "iree-amdaie-pool-columns-policy", poolColumnsPolicy,
+        llvm::cl::cat(category),
+        llvm::cl::desc("How many array columns a max pooling is spread over "
+                       "(with --iree-amdaie-enable-pooling)"),
+        llvm::cl::values(
+            clEnumValN(PoolColumnsPolicy::Odd, "odd",
+                       "OH's odd factor (7 for VGG-16), never pads OH."),
+            clEnumValN(PoolColumnsPolicy::Cost, "cost",
+                       "The divisor of OH (padded when cheaper) that "
+                       "minimises the per-column cost model."),
+            clEnumValN(PoolColumnsPolicy::Full, "full",
+                       "All columns; OH is padded on the host to a multiple "
+                       "of the column count.")));
     binder.opt<PacketFlowStrategy>(
         "iree-amdaie-packet-flow-strategy", packetFlowStrategy,
         llvm::cl::cat(category),

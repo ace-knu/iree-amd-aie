@@ -145,7 +145,8 @@ module {
 // -----
 
 // The GEMV predicate is M == 1 regardless of element type, so f32 M=1 (npu4 has
-// no f32 matmul vector instruction; pack-peel used to abort on it) is GEMV too.
+// no f32 matmul vector instruction; pack-peel used to abort on it) is GEMV too
+// (transpose_b weight, as every GEMV must be).
 // 4-byte operands halve the N tile (the K tile stays 256): n1=32 needs
 // 2*(256*4 + 32*256*4 + 32*4) = 66.25 KB > 64 KB, n1=16 still covers 32 cores.
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
@@ -163,6 +164,39 @@ module {
 ]>
 module {
   func.func @gemv_f32_m1() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4096xf32>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4096x4096xf32>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4096xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [1, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4096xf32>> -> tensor<1x4096xf32>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [4096, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4096x4096xf32>> -> tensor<4096x4096xf32>
+    %5 = tensor.empty() : tensor<1x4096xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<1x4096xf32>) -> tensor<1x4096xf32>
+    %7 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>] ins(%3, %4 : tensor<1x4096xf32>, tensor<4096x4096xf32>) outs(%6 : tensor<1x4096xf32>) -> tensor<1x4096xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [1, 4096], strides = [1, 1] : tensor<1x4096xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x4096xf32>>
+    return
+  }
+}
+
+// -----
+
+// A plain [K, N] weight (K outer) is not GEMV-eligible: the GEMV L2 split cuts
+// the weight block along its first non-unit dim, K here, so every core would
+// read from one memtile and channel assignment fails on the full array. Such an
+// M=1 matmul stays on pack-peel (f32: no vector-size constraint, so it lowers).
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
+// CHECK-SAME:      [1, 128, 0], [0, 0, 1], [1, 1, 0]
+// CHECK-SAME:  ]>
+// CHECK-NOT:   amdaie.tile_pipeline = "gemv"
+// CHECK:       func.func @gemv_kn_layout_packpeel
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @gemv_kn_layout_packpeel() {
     %cst = arith.constant 0.000000e+00 : f32
     %c0 = arith.constant 0 : index
     %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4096xf32>>

@@ -38,6 +38,7 @@
 // (affinity -> device global -> executable target attr), never hardcoded, so the
 // logic is portable if device placement ever moves to a later (Stream) stage.
 
+#include "iree-amd-aie/Transforms/KernelDispatch.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
@@ -71,6 +72,11 @@ struct PaddingMultiples {
   // `isGemvMExtent`), which tiles neither M nor a fixed N tile, so those need
   // no M/N padding and no N-split.
   bool gemvPipeline;
+  // Whether a GEMV's N may be padded so the GEMV pipeline reaches every core
+  // (`gemv_pad_n`), and what that decision needs: the core grid and the
+  // per-core memory budget KernelDispatch sizes its N tile with.
+  bool gemvPadN;
+  int64_t numRows, numCols, l1Limit;
 };
 
 /// Resolves the amd-aie executable target a dispatch is pinned to via its
@@ -129,7 +135,12 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
       /*m=*/*numRows * (*instr)[0],
       /*n=*/*numCols * (*instr)[1],
       /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1),
-      /*gemvPipeline=*/getConfigEnableGemvPipeline(target)};
+      /*gemvPipeline=*/getConfigEnableGemvPipeline(target),
+      /*gemvPadN=*/getConfigGemvPadN(target),
+      /*numRows=*/*numRows,
+      /*numCols=*/*numCols,
+      /*l1Limit=*/static_cast<int64_t>(deviceModel.getCoreTileLocalMemorySize()) -
+          getConfigCoreStackSize(target)};
 }
 
 /// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
@@ -575,15 +586,27 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
 
     // An M == 1 (GEMV) matmul is lowered by the GEMV pipeline (KernelDispatch,
     // same predicate), which leaves M untiled and spreads N over the cores by
-    // whatever factor N has, so neither dim is padded: that removes the 32x
-    // zero-padding of the output rows and, for N=1000, the weight pad that a
-    // runtime dispatch would otherwise redo on every inference. K keeps its
-    // multiple: the pipeline takes any K, but a 32-aligned K keeps the DMA runs
-    // long.
+    // whatever factor N has, so M is never padded (that removes the 32x
+    // zero-padding of the output rows). N is padded only when its divisors
+    // would leave cores idle (`chooseGemvNPad`, the same rule KernelDispatch
+    // tiles with: N=1000 reaches 20 cores, 1024 reaches 32) and the target
+    // allows it (`gemv_pad_n`); the weight pad is a host dispatch redone every
+    // inference, so it must buy a core-count gain. K keeps its multiple: the
+    // pipeline takes any K, but a 32-aligned K keeps the DMA runs long.
     bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
     int64_t mPad = isGemv ? m : roundUpToMultiple(m, mult->m);
-    int64_t nPad = isGemv ? n : roundUpToMultiple(n, mult->n);
     int64_t kPad = roundUpToMultiple(k, mult->k);
+    int64_t nPad = n;
+    if (!isGemv) {
+      nPad = roundUpToMultiple(n, mult->n);
+    } else if (mult->gemvPadN) {
+      auto bytesOf = [](Type t) { return t.getIntOrFloatBitWidth() / 8; };
+      int64_t kTile = detail::findLargestFactor(kPad, kGemvKTile);
+      nPad = chooseGemvNPad(m, n, kTile, bytesOf(lhsType.getElementType()),
+                            bytesOf(rhsType.getElementType()),
+                            bytesOf(outElemType), mult->numRows, mult->numCols,
+                            mult->l1Limit);
+    }
     if (mPad == m && nPad == n && kPad == k) continue;  // already divisible
     // Any output dim (M outer and/or N inner) may be padded; the grown result is
     // cropped back on the host by a single extract_slice dispatch.

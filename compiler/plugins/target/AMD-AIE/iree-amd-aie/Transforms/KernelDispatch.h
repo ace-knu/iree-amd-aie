@@ -44,6 +44,11 @@ enum class BufferizeOperand {
 /// Enum for hardware mapping attributes.
 enum class HardwareMapping { Core, Block, None };
 
+/// K elements the GEMV pipeline streams through L1 per step (see
+/// `setRootConfigForGemvPipeline`). Shared with the Flow pad pass, which
+/// evaluates the GEMV core count on the same K tile.
+constexpr int64_t kGemvKTile = 256;
+
 /// How the pool pipeline spreads a max-pooling dispatch over the core array
 /// (see `setRootConfigForPoolPipeline`).
 enum class PoolCoreSplit {
@@ -55,6 +60,23 @@ enum class PoolCoreSplit {
   // Exhaustive search over one distributed output dim (1-D core forall),
   // ranked by core count, then channel tile, then L1 bytes.
   Search
+};
+
+/// How the pool pipeline (and the preprocessing halo split / row padding that
+/// must agree with it) picks the number of array columns a max pooling's
+/// leading spatial output dim OH is spread over.
+enum class PoolColumnsPolicy {
+  // OH's odd factor when 1 < odd <= numCols, else its largest divisor <=
+  // numCols. The pre-cost-model rule: every layer of a halving pooling chain
+  // gets the same column count (7 for VGG-16). Never pads OH.
+  Odd,
+  // The divisor of OH (or of OH padded up to a multiple of numCols, when that
+  // is cheaper) that minimises the measured per-column cost model
+  // `fixed + perColumn * (cols - 1) + bytes / (bandwidth * cols)`.
+  Cost,
+  // Always numCols: OH is padded up to a multiple of numCols on the host when
+  // it does not divide. Every pooling uses the full array.
+  Full
 };
 
 enum class OutliningStrategy {
@@ -97,7 +119,8 @@ LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
                                   AMDAIEDevice targetDevice, uint32_t numRows,
                                   uint32_t numCols, uint32_t stackSize,
                                   std::string enableAMDAIEUkernels,
-                                  PoolCoreSplit poolCoreSplit);
+                                  PoolCoreSplit poolCoreSplit,
+                                  PoolColumnsPolicy poolColumnsPolicy);
 
 }  // namespace mlir::iree_compiler::AMDAIE
 

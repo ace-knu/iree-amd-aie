@@ -104,6 +104,17 @@ def AMDAIEConvertPoolingToChannelsLast :
       "Pad the channel dim of the NHWC pooling up to a multiple of this value (the pool pipeline splits C over the array rows, so it is the row count); the padded channels are sliced off the result. 1 disables.">,
     Option<"haloSplitColumns", "halo-split-columns", "int64_t", /*default=*/"0",
       "Array column count. An NHWC max pooling whose window overlaps along H (window != stride) is pre-split on the host into `choosePoolColumns(OH, columns)` row chunks (each with its halo rows duplicated) stacked on a leading dim, so the pool pipeline can spread the chunks over the columns' memtiles. 0 disables.">,
+    Option<"rowMultiple", "row-multiple", "int64_t", /*default=*/"0",
+      "Array column count. When the column policy asks for more columns than OH divides into, OH is padded up to a multiple of this value (the input H grows by stride rows per output row, with the fill value) and the padded output rows are sliced off the result. 0 disables.">,
+    Option<"columnsPolicy", "columns-policy",
+      "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost",
+      "How many array columns the pool pipeline will spread OH over; must match the lowering strategy's `pool-columns-policy`.",
+      [{::llvm::cl::values(
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Odd, "odd", "OH's odd factor."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost, "cost", "Per-column cost model."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full", "All columns, padding OH.")
+      )}]>,
   ];
 }
 
@@ -682,6 +693,18 @@ def AMDAIELoweringStrategy :
                    "Columns take the leading spatial output dim (its odd factor), rows take the channel dim."),
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolCoreSplit::Search, "search",
                    "Search one distributed output dim, ranked by core count, channel tile and L1 bytes.")
+      )}]>,
+    Option<"poolColumnsPolicy", "pool-columns-policy",
+      "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost",
+      "How many array columns the pool pipeline spreads a max pooling's leading spatial output dim over.",
+      [{::llvm::cl::values(
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Odd, "odd",
+                   "OH's odd factor (else its largest divisor that fits)."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost, "cost",
+                   "The divisor of OH that minimises the per-column cost model."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full",
+                   "All columns (OH is padded up to a multiple of the column count by the preprocessing).")
       )}]>,
   ];
 }
