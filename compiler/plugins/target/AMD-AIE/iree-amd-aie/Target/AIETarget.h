@@ -111,6 +111,9 @@ struct AMDAIEOptions {
   // Let the Flow pad pass grow a GEMV's N (host pad + crop) to a multiple of
   // 32 * n1 when its divisors would leave cores idle (N=1000: 20 -> 32 cores).
   bool gemvPadN{true};
+  // Per-core N tile cap of the canonical GEMV layout (outputs per core per
+  // block); 32 is the fc1 tile the pipeline was measured with.
+  int64_t gemvN1{32};
   // Preprocessing: rewrite NCHW max pooling as NHWC (channels-last) pooling
   // wrapped in transposes, so pooling matches the NHWC convs and the transposes
   // around each pool cancel. Stage 0 of the NPU pooling work; default off.
@@ -223,6 +226,12 @@ struct AMDAIEOptions {
                        "crop) up to a multiple of 32 * n1 when its divisors "
                        "would leave cores idle, so the GEMV pipeline uses "
                        "every core. Default true."));
+
+    binder.opt<int64_t>(
+        "iree-amdaie-gemv-n1", gemvN1, llvm::cl::cat(category),
+        llvm::cl::desc("Per-core N tile cap of the canonical GEMV layout: N "
+                       "is padded to 32 * n1 * blocks with n1 <= this (and "
+                       "the L1 budget). Default 32."));
 
     binder.opt<bool>(
         "iree-amdaie-enable-pooling", enablePooling, llvm::cl::cat(category),

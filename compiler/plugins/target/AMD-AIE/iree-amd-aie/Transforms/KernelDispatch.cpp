@@ -631,9 +631,11 @@ static LogicalResult setRootConfigForGemvPipeline(
   // so 50 x 20 cores in one block unless the pad pass has grown N to 1024.
   int64_t kTile = findLargestFactor(K, kGemvKTile);
   int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize() - stackSize;
+  int64_t n1Max =
+      getConfigGemvN1(IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn));
   FailureOr<GemvNTiling> tiling =
       chooseGemvNTiling(M, N, kTile, nBytesLhs, nBytesRhs, nBytesOut, numRows,
-                        numCols, l1Limit);
+                        numCols, l1Limit, n1Max);
   if (failed(tiling)) {
     return linalgOp.emitOpError("GEMV tiles (M=")
            << M << ", n1=1, k=" << kTile << ") do not fit in core memory ("

@@ -181,17 +181,51 @@ int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr) {
   return attr ? attr->getInt() : 1024;
 }
 
+int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<IntegerAttr> attr =
+      getConfigAttr<IntegerAttr>(targetAttr, "gemv_n1");
+  return attr ? attr->getInt() : 32;
+}
+
+/// Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles.
+static int64_t gemvL1Bytes(int64_t M, int64_t n1, int64_t kTile,
+                           int64_t bytesLhs, int64_t bytesRhs,
+                           int64_t bytesOut) {
+  return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
+}
+
+int64_t gemvN1Cap(int64_t M, int64_t kTile, int64_t bytesLhs, int64_t bytesRhs,
+                  int64_t bytesOut, int64_t l1Limit, int64_t n1Max) {
+  int64_t cap = 0;
+  for (int64_t n1 = 1; n1 <= n1Max; ++n1) {
+    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
+      break;
+    cap = n1;
+  }
+  return cap;
+}
+
 FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
                                          int64_t bytesLhs, int64_t bytesRhs,
                                          int64_t bytesOut, int64_t numRows,
-                                         int64_t numCols, int64_t l1Limit) {
-  // Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles.
-  auto l1Bytes = [&](int64_t n1) {
-    return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
-  };
+                                         int64_t numCols, int64_t l1Limit,
+                                         int64_t n1Max) {
   int64_t numCores = numRows * numCols;
   GemvNTiling best{0, 0};
-  for (int64_t n1 = 1; n1 <= N && l1Bytes(n1) <= l1Limit; ++n1) {
+  auto better = [&](int64_t n1, int64_t cores) {
+    if (cores != best.cores) return cores > best.cores;
+    if (cores == numCores) {
+      // Canonical: the largest n1 that is <= n1Max; anything above the cap
+      // only if nothing fits under it.
+      bool a = n1 <= n1Max, b = best.n1 <= n1Max;
+      if (a != b) return a;
+      return a ? n1 > best.n1 : n1 < best.n1;
+    }
+    return n1 > best.n1;
+  };
+  for (int64_t n1 = 1; n1 <= N; ++n1) {
+    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
+      break;
     if (N % n1 != 0) continue;
     int64_t cores = 0;
     for (int64_t c = numCores; c >= 1; --c) {
@@ -199,8 +233,7 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
       cores = c;
       break;
     }
-    if (cores > best.cores || (cores == best.cores && n1 > best.n1))
-      best = {n1, cores};
+    if (best.n1 == 0 || better(n1, cores)) best = {n1, cores};
   }
   if (best.n1 == 0) return failure();
   return best;
@@ -208,34 +241,16 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
 
 int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
                        int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
-                       int64_t numCols, int64_t l1Limit) {
+                       int64_t numCols, int64_t l1Limit, int64_t n1Max) {
   int64_t numCores = numRows * numCols;
   if (N < numCores) return N;
-  FailureOr<GemvNTiling> now = chooseGemvNTiling(
-      M, N, kTile, bytesLhs, bytesRhs, bytesOut, numRows, numCols, l1Limit);
-  if (succeeded(now) && now->cores == numCores) return N;
-  auto l1Bytes = [&](int64_t n1) {
-    return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
-  };
-  auto roundUp = [](int64_t v, int64_t m) { return ((v + m - 1) / m) * m; };
-  // Candidates N' = roundUp(N, cores * n1) for every L1-fitting n1 that pads
-  // by at most 1/8: fewest blocks first (each block is a full L3->L2->L1 pass
-  // over the K loop), then the least padding (weight bytes copied per
-  // inference). N=1000 -> 1024 (n1 32, 1 block), 500 -> 512 (n1 16),
-  // 21843 -> 23808 (n1 62, 12 blocks, 9 %) rather than 21856 (n1 1, 683
-  // blocks).
-  int64_t best = 0, bestBlocks = 0;
-  for (int64_t n1 = 1; n1 <= N && l1Bytes(n1) <= l1Limit; ++n1) {
-    int64_t padded = roundUp(N, numCores * n1);
-    if ((padded - N) * 8 > N) continue;
-    int64_t blocks = padded / (numCores * n1);
-    if (best == 0 || blocks < bestBlocks ||
-        (blocks == bestBlocks && padded < best)) {
-      best = padded;
-      bestBlocks = blocks;
-    }
-  }
-  return best ? best : roundUp(N, numCores);
+  int64_t cap =
+      gemvN1Cap(M, kTile, bytesLhs, bytesRhs, bytesOut, l1Limit, n1Max);
+  if (cap <= 0) return N;
+  auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+  int64_t blocks = ceilDiv(N, numCores * cap);
+  int64_t n1 = ceilDiv(N, numCores * blocks);
+  return numCores * n1 * blocks;
 }
 
 bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr) {

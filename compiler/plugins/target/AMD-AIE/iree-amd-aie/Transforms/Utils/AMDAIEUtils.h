@@ -74,14 +74,34 @@ bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr);
 /// executable target config; absent means 1024, the backend default).
 int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr);
 
+/// The canonical GEMV layout: every core of the array, `n1` outputs per core
+/// with `n1 <= n1Max` (`gemv_n1` on the target, default 32: the fc1 tile the
+/// pipeline was measured with; the L1 budget may cap it lower), K streamed in
+/// `kGemvKTile` steps, and as few blocks as that allows. The Flow pad pass
+/// grows N to `cores * n1 * blocks` (`chooseGemvNPad`) and the root config
+/// picks the same `n1` back out of the padded N (`chooseGemvNTiling`), so
+/// every GEMV dispatch has the same core grid, the same per-core tile shape
+/// (up to a narrower n1 for N < cores * n1Max) and the same DMA pattern; only
+/// the block count varies.
+
+/// Largest n1 whose double-buffered A/B/C tiles fit `l1Limit`, capped at
+/// `n1Max`.
+int64_t gemvN1Cap(int64_t M, int64_t kTile, int64_t bytesLhs, int64_t bytesRhs,
+                  int64_t bytesOut, int64_t l1Limit, int64_t n1Max);
+
+/// Whether N is a multiple of the full core count.
 /// The GEMV pipeline's per-core N tile and the core count a block reaches, for
 /// a (1 x K) x (N x K)^T matmul with `kTile` K elements streamed per step.
 /// Over the divisors `n1` of N whose double-buffered A/B/C tiles fit
-/// `l1Limit`, take the one whose block covers the most cores; ties go to the
-/// largest tile (fewest blocks). A block must fill whole columns or stay in
-/// one (`cores <= numRows || cores % numRows == 0`): the L2 weight split hands
-/// every memtile one column. Shared by `KernelDispatch` (tile sizes) and the
-/// Flow pad pass (whether N needs padding) so both see the same core count.
+/// `l1Limit`, take the one whose block covers the most cores. Among the
+/// candidates that reach every core, the canonical one: the largest n1 that
+/// is <= `n1Max` (the pad pass's choice; a larger n1 would be a layout the
+/// pad pass never intends). Otherwise (NPU-only builds, where N is not
+/// padded) ties go to the largest tile (fewest blocks). A block must fill
+/// whole columns or stay in one (`cores <= numRows || cores % numRows == 0`):
+/// the L2 weight split hands every memtile one column. Shared by
+/// `KernelDispatch` (tile sizes) and the Flow pad pass (whether N needs
+/// padding) so both see the same core count.
 struct GemvNTiling {
   int64_t n1;
   int64_t cores;
@@ -89,17 +109,25 @@ struct GemvNTiling {
 FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
                                          int64_t bytesLhs, int64_t bytesRhs,
                                          int64_t bytesOut, int64_t numRows,
-                                         int64_t numCols, int64_t l1Limit);
+                                         int64_t numCols, int64_t l1Limit,
+                                         int64_t n1Max);
 
-/// The N the Flow pad pass pads a GEMV to so `chooseGemvNTiling` reaches all
-/// `numRows * numCols` cores: over the L1-fitting `n1`, the multiple of
-/// `cores * n1` that pads N by at most 1/8 with the fewest blocks, then the
-/// least padding; falls back to a multiple of `cores` (n1 = 1). Returns N
-/// unchanged when it already reaches every core, or when N < cores (one
-/// output per core is not worth a pad + crop).
+/// The N the Flow pad pass pads a GEMV to for the canonical layout:
+///   blocks = ceil(N / (cores * n1Cap)),  n1 = ceil(N / (cores * blocks)),
+///   N' = cores * n1 * blocks,
+/// i.e. the fewest blocks the per-core cap allows, then the narrowest tile
+/// that fills them. Padding is < cores (b = 1) or < cores * blocks (so under
+/// 2 / n1Cap of N for b >= 2). N=1000 -> 1024 (n1 32, 1 block), 500 -> 512
+/// (n1 16), 2144 -> 2208 (n1 23, 3 blocks). Returns N unchanged when it
+/// already has that form, or when N < cores (one output per core is not
+/// worth a pad + crop).
 int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
                        int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
-                       int64_t numCols, int64_t l1Limit);
+                       int64_t numCols, int64_t l1Limit, int64_t n1Max);
+
+/// Per-core N tile cap of the canonical GEMV layout (`gemv_n1` in the
+/// executable target config; absent means 32).
+int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr);
 
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);

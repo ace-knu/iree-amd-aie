@@ -76,7 +76,7 @@ struct PaddingMultiples {
   // (`gemv_pad_n`), and what that decision needs: the core grid and the
   // per-core memory budget KernelDispatch sizes its N tile with.
   bool gemvPadN;
-  int64_t numRows, numCols, l1Limit;
+  int64_t numRows, numCols, l1Limit, gemvN1;
 };
 
 /// Resolves the amd-aie executable target a dispatch is pinned to via its
@@ -140,7 +140,8 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
       /*numRows=*/*numRows,
       /*numCols=*/*numCols,
       /*l1Limit=*/static_cast<int64_t>(deviceModel.getCoreTileLocalMemorySize()) -
-          getConfigCoreStackSize(target)};
+          getConfigCoreStackSize(target),
+      /*gemvN1=*/getConfigGemvN1(target)};
 }
 
 /// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
@@ -587,12 +588,12 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // An M == 1 (GEMV) matmul is lowered by the GEMV pipeline (KernelDispatch,
     // same predicate), which leaves M untiled and spreads N over the cores by
     // whatever factor N has, so M is never padded (that removes the 32x
-    // zero-padding of the output rows). N is padded only when its divisors
-    // would leave cores idle (`chooseGemvNPad`, the same rule KernelDispatch
-    // tiles with: N=1000 reaches 20 cores, 1024 reaches 32) and the target
-    // allows it (`gemv_pad_n`); the weight pad is a host dispatch redone every
-    // inference, so it must buy a core-count gain. K keeps its multiple: the
-    // pipeline takes any K, but a 32-aligned K keeps the DMA runs long.
+    // zero-padding of the output rows). N is padded to the canonical GEMV
+    // layout (`chooseGemvNPad`: every core, n1 <= gemv_n1, fewest blocks;
+    // N=1000 -> 1024, 2144 -> 2208) when the target allows it (`gemv_pad_n`);
+    // the weight pad is a host dispatch redone every inference. K keeps its
+    // multiple: the pipeline takes any K, but a 32-aligned K keeps the DMA
+    // runs long.
     bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
     int64_t mPad = isGemv ? m : roundUpToMultiple(m, mult->m);
     int64_t kPad = roundUpToMultiple(k, mult->k);
@@ -605,7 +606,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       nPad = chooseGemvNPad(m, n, kTile, bytesOf(lhsType.getElementType()),
                             bytesOf(rhsType.getElementType()),
                             bytesOf(outElemType), mult->numRows, mult->numCols,
-                            mult->l1Limit);
+                            mult->l1Limit, mult->gemvN1);
     }
     if (mPad == m && nPad == n && kPad == k) continue;  // already divisible
     // Any output dim (M outer and/or N inner) may be padded; the grown result is

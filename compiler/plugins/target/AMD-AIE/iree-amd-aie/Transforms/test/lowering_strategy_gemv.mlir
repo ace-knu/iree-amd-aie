@@ -82,6 +82,45 @@ module {
 
 // -----
 
+// N=1088 = 32 x 34 after the pad pass has grown 1025 for the canonical layout
+// (blocks 2, n1 17). Among the n1 that reach 32 cores (1, 2, 17, 34) the root
+// config takes the largest <= gemv_n1 (32): 17, two blocks of 544, not 34 in
+// one block, so the pad pass's intent (one tile shape for every GEMV) holds.
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
+// CHECK-SAME:      [0, 544, 0], [0, 0, 256], [0, 17, 0]
+// CHECK-SAME:  ]>
+// CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "gemv"}>
+// CHECK-NOT:   packing_config
+// CHECK:       func.func @gemv_canonical_n1088
+// CHECK:       linalg.matmul
+// CHECK-SAME:    {lowering_config = #config}
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @gemv_canonical_n1088() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4096xbf16>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1088x4096xbf16>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1088xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [1, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4096xbf16>> -> tensor<1x4096xbf16>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [1088, 4096], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1088x4096xbf16>> -> tensor<1088x4096xbf16>
+    %5 = tensor.empty() : tensor<1x1088xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<1x1088xf32>) -> tensor<1x1088xf32>
+    %7 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d1, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d0, d1)>]
+         ins(%3, %4 : tensor<1x4096xbf16>, tensor<1088x4096xbf16>) outs(%6 : tensor<1x1088xf32>) -> tensor<1x1088xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [1, 1088], strides = [1, 1] : tensor<1x1088xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1088xf32>>
+    return
+  }
+}
+
+// -----
+
 // M=16 (a batch of 16) is not a GEMV shape today: only M == 1 is routed, so
 // it keeps the pack-peel config and packing_config, with no pipeline override.
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = {{.*}}>

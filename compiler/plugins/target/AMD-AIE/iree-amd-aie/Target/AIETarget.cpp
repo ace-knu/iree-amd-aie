@@ -190,6 +190,8 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // Whether the Flow pad pass may grow a GEMV's N to reach every core, and
     // the core stack size it needs for the same L1 budget as KernelDispatch.
     addConfig("gemv_pad_n", BoolAttr::get(context, options.gemvPadN));
+    addConfig("gemv_n1", IntegerAttr::get(IntegerType::get(context, 32),
+                                          options.gemvN1));
     addConfig("core_stack_size",
               IntegerAttr::get(IntegerType::get(context, 32),
                                options.coreStackSize));
