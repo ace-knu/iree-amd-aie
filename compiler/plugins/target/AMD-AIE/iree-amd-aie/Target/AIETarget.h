@@ -109,14 +109,12 @@ struct AMDAIEOptions {
   // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
   bool enableGemvPipeline{true};
   // Let the Flow pad pass grow a GEMV's N (host pad + crop) to the canonical
-  // layout (N=1000 -> 1024: 20 -> 32 cores). Off by default: a GEMV whose
-  // padded weight is produced on the host from a shorter input (the pad
-  // dispatch, or a flow.tensor.update) does not complete on the NPU
-  // ("amdxdna dispatch did not complete: ert state 8"), while the same NPU
-  // program over a directly supplied or elementwise-produced 1024-row weight
-  // runs; pack-peel's padded dispatches are unaffected. Under investigation
-  // (docs_POOL/1012_full_array_padding_design.md §8.7).
-  bool gemvPadN{false};
+  // layout (N=1000 -> 1024: 20 -> 32 cores). The padded weight rows are
+  // filled with 1.0, not 0: a core whose rows are all exact zeros runs its
+  // scalar bf16 loop on the fast path, finishes far ahead of the others and
+  // the GEMV pipeline deadlocks ("ert state 8"); see
+  // docs_POOL/1012_full_array_padding_design.md §8.8.
+  bool gemvPadN{true};
   // Per-core N tile cap of the canonical GEMV layout (outputs per core per
   // block); 32 is the fc1 tile the pipeline was measured with.
   int64_t gemvN1{32};
@@ -230,8 +228,7 @@ struct AMDAIEOptions {
         "iree-amdaie-gemv-pad-n", gemvPadN, llvm::cl::cat(category),
         llvm::cl::desc("Pad a GEMV's N on the host (Flow pad pass, with a "
                        "crop) to the canonical layout so the GEMV pipeline "
-                       "uses every core. Default false: the padded GEMV "
-                       "currently hangs on the NPU (see AIETarget.h)."));
+                       "uses every core. Default true."));
 
     binder.opt<int64_t>(
         "iree-amdaie-gemv-n1", gemvN1, llvm::cl::cat(category),

@@ -338,14 +338,18 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // cores (1000 = 20 x 50), 1024 reaches 32 with n1 = 32 and a 2.4 % pad, so
 // the weight grows 1000 -> 1024 along its N dim (dim 0 of the [N, K] weight)
 // and the [1, 1024] result is cropped back to [1, 1000] on the host. The
-// activation is untouched (K=4096 is a multiple of 32).
+// activation is untouched (K=4096 is a multiple of 32). The pad value is 1.0,
+// not 0: the padded rows' outputs are cropped, and a core whose rows are all
+// zero finishes far ahead of the others and deadlocks the GEMV pipeline.
 
 // CHECK-LABEL: func.func @matmul_gemv
 // CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4096xbf16>>
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x4096xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
+// CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
 // CHECK:         tensor.pad %{{.+}} low[0, 0] high[24, 0]
+// CHECK:           tensor.yield %[[ONE]] : bf16
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 1000] [1, 1]
 // CHECK-LABEL: util.func public @main_gemv
@@ -386,16 +390,22 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // GEMV pipeline takes any K, but a 32-aligned K keeps the DMA runs long. K is a
 // reduction dim, so both operands grow along it; N=1000 is padded to 1024 for
 // the core count as above, so the weight grows on both dims and the result is
-// cropped.
+// cropped. The activation's K pad is zero (it multiplies real weights); the
+// weight pad is 1.0 on both dims: its K columns meet A's zero pad and its N
+// rows are cropped, and an all-zero row block would stall the GEMV pipeline.
 
 // CHECK-LABEL: func.func @matmul_gemv_k
 // CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x128xbf16>>
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x128xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
+// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
 // CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 28]
+// CHECK:           tensor.yield %[[ZERO]] : bf16
 // CHECK:       flow.executable private @pad_executable_1
+// CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
 // CHECK:         tensor.pad %{{.+}} low[0, 0] high[24, 28]
+// CHECK:           tensor.yield %[[ONE]] : bf16
 // CHECK:       flow.executable private @crop_executable_2
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 1000] [1, 1]
 // CHECK-LABEL: util.func public @main_gemv_k

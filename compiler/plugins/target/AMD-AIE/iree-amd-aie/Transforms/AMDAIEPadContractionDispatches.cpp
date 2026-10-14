@@ -310,10 +310,19 @@ static IREE::HAL::DeviceAffinityAttr getHostAffinity(ModuleOp module) {
 /// (unlike `flow.tensor.update`, which only copies contiguous outer-dim
 /// sub-ranges) performs the strided placement required to pad an inner
 /// dimension. `counter` uniquifies the symbol names.
+/// `padOne` pads with 1.0 instead of 0: used for a GEMV's weight. Its padded
+/// rows only feed outputs that are cropped off, and A's padded K columns are
+/// zero, so any finite value is correct there; it must not be zero because the
+/// GEMV pipeline deadlocks when one core's rows are all exact zeros (its
+/// scalar bf16 loop takes the fast path and the core finishes far ahead of the
+/// others; the same hang reproduces with NaN rows or with a zero-row core on
+/// the unpadded 20-core shape, so it is a core-synchronisation defect of the
+/// pipeline, not of padding: docs_POOL/1012_full_array_padding_design.md
+/// §8.8).
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
                                    Value v, ArrayRef<int64_t> dstShape,
                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
-                                   int &counter) {
+                                   int &counter, bool padOne = false) {
   Location loc = v.getLoc();
   auto srcType = cast<RankedTensorType>(v.getType());
   if (dstShape == srcType.getShape()) return v;
@@ -331,8 +340,10 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   funcOp.setPublic();
   Block *entry = funcOp.addEntryBlock();
   OpBuilder fb = OpBuilder::atBlockBegin(entry);
+  Type elemType = srcType.getElementType();
   Value zero = fb.create<arith::ConstantOp>(
-      loc, fb.getZeroAttr(srcType.getElementType()));
+      loc, padOne ? static_cast<TypedAttr>(fb.getFloatAttr(elemType, 1.0))
+                  : fb.getZeroAttr(elemType));
   Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
   Value padded = tensor::createPadHighOp(dstType, loaded, zero,
@@ -642,9 +653,10 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     Value lhsPadded =
         createPaddingDispatch(rewriter, module, dispatch.getArguments()[lhsArgNo],
                               lhsPad, hostAffinity, counter);
-    Value rhsPadded =
-        createPaddingDispatch(rewriter, module, dispatch.getArguments()[rhsArgNo],
-                              rhsPad, hostAffinity, counter);
+    Value rhsPadded = createPaddingDispatch(
+        rewriter, module, dispatch.getArguments()[rhsArgNo], rhsPad,
+        hostAffinity, counter,
+        /*padOne=*/isGemv && isa<FloatType>(rhsType.getElementType()));
     dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
 
