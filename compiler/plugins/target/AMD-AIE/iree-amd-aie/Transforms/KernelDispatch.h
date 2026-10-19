@@ -76,7 +76,11 @@ enum class PoolColumnsPolicy {
   Cost,
   // Always numCols: OH is padded up to a multiple of numCols on the host when
   // it does not divide. Every pooling uses the full array.
-  Full
+  Full,
+  // The largest divisor of OH that is <= numCols: all columns whenever OH
+  // divides by numCols, else as many as divide it (7 for 7 / 14 / 28, 6 for
+  // 6 / 12). Never pads OH, never consults the cost model.
+  Max
 };
 
 enum class OutliningStrategy {

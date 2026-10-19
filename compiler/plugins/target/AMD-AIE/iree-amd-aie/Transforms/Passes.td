@@ -108,12 +108,13 @@ def AMDAIEConvertPoolingToChannelsLast :
       "Array column count. When the column policy asks for more columns than OH divides into, OH is padded up to a multiple of this value (the input H grows by stride rows per output row, with the fill value) and the padded output rows are sliced off the result. 0 disables.">,
     Option<"columnsPolicy", "columns-policy",
       "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
-      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max",
       "How many array columns the pool pipeline will spread OH over; must match the lowering strategy's `pool-columns-policy`.",
       [{::llvm::cl::values(
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Odd, "odd", "OH's odd factor."),
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost, "cost", "Per-column cost model."),
-        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full", "All columns, padding OH.")
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full", "All columns, padding OH."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max, "max", "OH's largest divisor that fits; never pads.")
       )}]>,
   ];
 }
@@ -696,7 +697,7 @@ def AMDAIELoweringStrategy :
       )}]>,
     Option<"poolColumnsPolicy", "pool-columns-policy",
       "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
-      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max",
       "How many array columns the pool pipeline spreads a max pooling's leading spatial output dim over.",
       [{::llvm::cl::values(
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Odd, "odd",
@@ -704,7 +705,9 @@ def AMDAIELoweringStrategy :
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost, "cost",
                    "The divisor of OH that minimises the per-column cost model."),
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full",
-                   "All columns (OH is padded up to a multiple of the column count by the preprocessing).")
+                   "All columns (OH is padded up to a multiple of the column count by the preprocessing)."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max, "max",
+                   "OH's largest divisor that fits the array (all columns when OH divides by the column count); never pads.")
       )}]>,
   ];
 }

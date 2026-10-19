@@ -132,7 +132,7 @@ struct AMDAIEOptions {
   PoolCoreSplit poolCoreSplit{PoolCoreSplit::SpatialChannel};
   // How many columns the pool pipeline uses for a pooling (and whether the
   // preprocessing pads OH to get there); see `PoolColumnsPolicy`.
-  PoolColumnsPolicy poolColumnsPolicy{PoolColumnsPolicy::Cost};
+  PoolColumnsPolicy poolColumnsPolicy{PoolColumnsPolicy::Max};
   bool enableCtrlPkt{false};
 
   enum class DeviceHAL { XRT, AMDXDNA };
@@ -418,7 +418,11 @@ struct AMDAIEOptions {
                        "minimises the per-column cost model."),
             clEnumValN(PoolColumnsPolicy::Full, "full",
                        "All columns; OH is padded on the host to a multiple "
-                       "of the column count.")));
+                       "of the column count."),
+            clEnumValN(PoolColumnsPolicy::Max, "max",
+                       "OH's largest divisor that fits the array (all "
+                       "columns when OH divides by the column count); "
+                       "never pads OH. The default.")));
     binder.opt<PacketFlowStrategy>(
         "iree-amdaie-packet-flow-strategy", packetFlowStrategy,
         llvm::cl::cat(category),

@@ -1,4 +1,5 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8})' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8})' %s | FileCheck %s --check-prefix=MAX
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 pool-columns-policy=cost})' %s | FileCheck %s
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 pool-columns-policy=odd})' %s | FileCheck %s --check-prefix=ODD
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 pool-columns-policy=full})' %s | FileCheck %s --check-prefix=FULL
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 pool-core-split=search})' %s | FileCheck %s --check-prefix=SEARCH
@@ -10,12 +11,14 @@
 //
 // Default `pool-core-split=spatial-channel`: array columns take OH, array rows
 // take C (C / 4 channels each) and the core forall is 2-D (OH, C). How many
-// columns OH is spread over is the `pool-columns-policy`: `cost` (default)
-// picks the divisor of OH that minimises the per-column cost model
-// t = 0.74 + 0.21 (cols - 1) + 1.77 MB / cols [ms] (docs_POOL/
-// 1001_pool_column_cost_model.md); `odd` (ODD) takes OH's odd factor (7 for
-// every VGG-16 layer); `full` (FULL) takes all 8 when OH divides by 8 (the
-// preprocessing pads OH so it does; on an unpadded OH it falls back to `odd`).
+// columns OH is spread over is the `pool-columns-policy`: `max` (default, MAX)
+// takes OH's largest divisor <= 8 (all 8 when OH divides by 8, else 7 for the
+// VGG-16 layers), never padding; `cost` (CHECK) picks the divisor of OH that
+// minimises the per-column cost model t = 0.74 + 0.21 (cols - 1) + 1.77 MB /
+// cols [ms] (docs_POOL/1001_pool_column_cost_model.md); `odd` (ODD) takes
+// OH's odd factor (7 for every VGG-16 layer); `full` (FULL) takes all 8 when
+// OH divides by 8 (the preprocessing pads OH so it does; on an unpadded OH it
+// falls back to `odd`).
 // `pool-core-split=search` (SEARCH) spreads cores along one output dim only,
 // ranked by core count, then channel tile and L1 bytes.
 
@@ -31,6 +34,11 @@
 // CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "pool"}>
 // CHECK-NOT:   packing_config
 // CHECK:       func.func @pool1
+// max: 112 divides by 8 -> 8 columns, the same layout as cost.
+// MAX:          #config = #iree_codegen.lowering_config<tile_sizes = [
+// MAX-SAME:         [56, 14, 0, 0, 0], [7, 0, 16, 0, 0]
+// MAX-SAME:     ]>
+// MAX:          func.func @pool1
 // CHECK:       linalg.generic
 // CHECK-SAME:    lowering_config = #config
 // odd: cols 7 (odd factor of 112); tile [4, 16, 16] (40 KB, beats [1, 56, 16]
@@ -88,6 +96,11 @@ module {
 // CHECK-SAME:  ]>
 // CHECK:       #translation = #iree_codegen.translation_info<pipeline = Custom, {amdaie.tile_pipeline = "pool"}>
 // CHECK:       func.func @pool4
+// max: 14's largest divisor <= 8 is 7, as odd.
+// MAX:          #config = #iree_codegen.lowering_config<tile_sizes = [
+// MAX-SAME:         [7, 7, 0, 0, 0], [1, 0, 128, 0, 0]
+// MAX-SAME:     ]>
+// MAX:          func.func @pool4
 // ODD:          #config = #iree_codegen.lowering_config<tile_sizes = [
 // ODD-SAME:         [7, 7, 0, 0, 0], [1, 0, 128, 0, 0]
 // ODD-SAME:     ]>
@@ -139,6 +152,11 @@ module {
 // CHECK-SAME:      [1, 0, 512, 0, 0], [0, 0, 128, 0, 0]
 // CHECK-SAME:  ]>
 // CHECK:       func.func @pool5
+// max: 7 columns (OH itself), 28 cores, as odd.
+// MAX:          #config = #iree_codegen.lowering_config<tile_sizes = [
+// MAX-SAME:         [7, 0, 0, 0, 0], [1, 0, 128, 0, 0]
+// MAX-SAME:     ]>
+// MAX:          func.func @pool5
 // odd / full (7 does not divide by 8): cols 7 (OH itself), block [7, 7, 512]
 // = the whole output, a single block; 28 cores.
 // ODD:          #config = #iree_codegen.lowering_config<tile_sizes = [
@@ -198,6 +216,11 @@ module {
 // CHECK-SAME:      [16, 2, 0, 0, 0], [4, 0, 128, 0, 0]
 // CHECK-SAME:  ]>
 // CHECK:       func.func @pool4_padded
+// max: 16 divides by 8 -> 8 columns, as full.
+// MAX:          #config = #iree_codegen.lowering_config<tile_sizes = [
+// MAX-SAME:         [8, 7, 0, 0, 0], [1, 0, 128, 0, 0]
+// MAX-SAME:     ]>
+// MAX:          func.func @pool4_padded
 // ODD:          #config = #iree_codegen.lowering_config<tile_sizes = [
 // ODD-SAME:         [8, 7, 0, 0, 0], [1, 0, 128, 0, 0]
 // ODD-SAME:     ]>
@@ -240,6 +263,10 @@ module {
 // CHECK-SAME:      [7, 1, 0, 0, 0, 0], [1, 0, 0, 16, 0, 0]
 // CHECK-SAME:  ]>
 // CHECK:       func.func @pool_halo_chunks
+// MAX:          #config = #iree_codegen.lowering_config<tile_sizes = [
+// MAX-SAME:         [7, 1, 0, 0, 0, 0], [1, 0, 0, 16, 0, 0]
+// MAX-SAME:     ]>
+// MAX:          func.func @pool_halo_chunks
 // The chunk count is whatever the preprocessing made it, under every policy.
 // ODD:          #config = #iree_codegen.lowering_config<tile_sizes = [
 // ODD-SAME:         [7, 1, 0, 0, 0, 0], [1, 0, 0, 16, 0, 0]

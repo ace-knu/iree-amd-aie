@@ -127,6 +127,12 @@ PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
   switch (policy) {
     case PoolColumnsPolicy::Odd:
       return {choosePoolColumns(oh, numCols), oh};
+    case PoolColumnsPolicy::Max: {
+      int64_t best = 1;
+      for (int64_t d = 1; d <= std::min(oh, numCols); ++d)
+        if (oh % d == 0) best = d;
+      return {best, oh};
+    }
     case PoolColumnsPolicy::Full: {
       if (oh % numCols == 0) return {numCols, oh};
       if (allowPad) return {numCols, roundUp(oh, numCols)};

@@ -226,7 +226,9 @@ struct PoolingNhwcMaxPadRows : OpRewritePattern<linalg::PoolingNhwcMaxOp> {
 
   LogicalResult matchAndRewrite(linalg::PoolingNhwcMaxOp op,
                                 PatternRewriter &rewriter) const override {
-    if (columns <= 1 || policy == PoolColumnsPolicy::Odd) return failure();
+    if (columns <= 1 || policy == PoolColumnsPolicy::Odd ||
+        policy == PoolColumnsPolicy::Max)
+      return failure();
     if (!op.hasPureTensorSemantics())
       return rewriter.notifyMatchFailure(op, "expected tensor semantics");
     Value input = op.getInputs()[0];
