@@ -123,6 +123,18 @@ static bool isBlank(const std::string &line) {
 /// TODO(jornt): For the exact stack size of the program we need the function
 /// call graph as well as all functions' stack sizes. Once the retrieval of this
 /// is supported in peano, we can use the exact stack size of the program.
+///
+/// Known gap: functions without a .stack_sizes entry are not counted. These
+/// are the precompiled libc/compiler-rt helpers linked into the core, e.g. the
+/// soft-float __mulsf3 (64-byte frame in Peano v19 and v22). When the listed
+/// sum is close to the assigned stack, the real usage can exceed it without
+/// this check failing; the stack then runs into the next buffer and the
+/// results are silently wrong. Seen with Peano v22 before full unrolling was
+/// disabled: an f32 8x4x8 matmul core summed to 1024 bytes and needed 1088.
+/// Counting the helpers needs their frame sizes, which only Peano's
+/// llvm-objdump can decode (IREE's LLVM has no AIE target), so it is left
+/// out. If a core whose sum is near its stack size gives wrong results, raise
+/// --iree-amdaie-stack-size.
 FailureOr<uint32_t> getMaxStackSize(const std::string &stackSizesOutput) {
   std::istringstream stackSizesStream(stackSizesOutput);
   std::string line;
