@@ -53,7 +53,7 @@ WORKDIR /workspace
 #   Hermetic: clones the fork at a pinned commit (not the local tree).
 #   For local verification, override the repo to the local clone:
 #     --build-arg IREE_AMD_AIE_REPO=file:///home/ace/Projects/iree-amd-aie
-#     --build-arg IREE_AMD_AIE_COMMIT=<sha with the v19 peano pin>
+#     --build-arg IREE_AMD_AIE_COMMIT=<sha with the v22 peano pin>
 #   BUILD_JOBS caps parallelism on constrained hosts (laptops); servers can raise it.
 # ============================================================
 FROM base-deps AS builder
@@ -65,7 +65,7 @@ RUN git clone --recursive "${IREE_AMD_AIE_REPO}" /src/iree-amd-aie \
  && cd /src/iree-amd-aie \
  && git checkout "${IREE_AMD_AIE_COMMIT}" \
  && git submodule update --init --recursive \
- && bash build_tools/download_peano.sh          # Peano v19 per peano_commit_linux.txt (fork release mirror)
+ && bash build_tools/download_peano.sh          # Peano v22 per peano_commit_linux.txt (fork release mirror)
 
 # Release (assertions OFF), frontends ON, amdxdna.
 # PYTHON_BINDINGS=ON so the version-matched model importers ship with the compiler:

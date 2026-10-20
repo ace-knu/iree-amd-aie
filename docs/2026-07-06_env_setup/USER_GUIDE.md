@@ -60,7 +60,7 @@ git clone --recursive --branch dev \
   https://github.com/ace-knu/iree-amd-aie.git ~/Projects/iree-amd-aie
 cd ~/Projects/iree-amd-aie
 git remote add upstream https://github.com/nod-ai/iree-amd-aie.git   # 원본(upstream) 추적
-bash build_tools/download_peano.sh          # Peano(llvm-aie) v19 → ./llvm-aie (fork release mirror)
+bash build_tools/download_peano.sh          # Peano(llvm-aie) v22 → ./llvm-aie (fork release mirror)
 ```
 참고: recursive clone이 중간에 끊기면 이어받지 말고 폴더를 지우고 처음부터 다시 받는다.
 

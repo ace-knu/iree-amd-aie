@@ -11,10 +11,11 @@ RELEASE=$(cat $this_dir/peano_commit_linux.txt)
 
 # Peano is mirrored as a GitHub Release asset on the ace-knu fork rather than
 # fetched from the Xilinx nightly index: nightly assets are periodically pruned
-# (the v19 pin was removed that way), and newer Peano (v21) miscompiles npu4 f32
-# matmul. So we pin v19 and download it from a durable mirror.
+# (the earlier v19 pin was removed that way). The pin is v22; it needs full
+# unrolling disabled in opt (see makePeanoOptArgs in XCLBinGen.cpp). The v19
+# mirror (tag peano-v19) is kept for rollback.
 # See docs/2026-07-06_env_setup/DEV_CONTAINER.md.
-URL="https://github.com/ace-knu/iree-amd-aie/releases/download/peano-v19/peano-v19-linux.tar.gz"
+URL="https://github.com/ace-knu/iree-amd-aie/releases/download/peano-v22/peano-v22-linux.tar.gz"
 
 echo "Downloading Peano ${RELEASE} from ${URL}"
 rm -rf "$PWD/llvm-aie" "$PWD"/llvm_aie-*.dist-info
