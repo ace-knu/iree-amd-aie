@@ -154,6 +154,9 @@ void matmul_vectorized_8x8x8_i8_i8_i32(const int8 *__restrict pA,
       "so the number of K iterations should be a factor of 2.");
   static_assert(n / t > 0,
                 "There should be at least one iteration on the N dimension.");
+  static_assert(m / r % 2 == 0 && n / t % 2 == 0,
+                "The ukernel is manually unrolled 2x2 in the M and N "
+                "iterations, so their counts should be multiples of 2.");
   return matmul_vectorized_i8_i32<m / r, k / s, n / t, r, s, t>(
       pA, offsetA, pB, offsetB, pC, offsetC);
 }
@@ -287,6 +290,9 @@ void matmul_vectorized_8x8x8_bf16_bf16_f32(const bfloat16 *__restrict pA,
   static_assert(m / r > 0);
   static_assert(k / s > 0);
   static_assert(n / t > 0);
+  static_assert(m / r % 2 == 0 && n / t % 2 == 0,
+                "The ukernel is manually unrolled 2x2 in the M and N "
+                "iterations, so their counts should be multiples of 2.");
   return matmul_vectorized_bf16_f32<m / r, k / s, n / t, r, s, t>(
       pA, offsetA, pB, offsetB, pC, offsetC);
 }
@@ -316,8 +322,6 @@ matmul_combos_i8(matmul_vectorized_c_func, 64, 32, 128)
 matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 128)
 matmul_combos_i8(matmul_vectorized_c_func, 64, 64, 128)
 
-matmul_combos_bfp16(matmul_vectorized_c_func, 16, 8, 32)
-matmul_combos_bfp16(matmul_vectorized_c_func, 16, 8, 64)
 matmul_combos_bfp16(matmul_vectorized_c_func, 16, 16, 32)
 matmul_combos_bfp16(matmul_vectorized_c_func, 32, 32, 32)
 matmul_combos_bfp16(matmul_vectorized_c_func, 32, 32, 64)

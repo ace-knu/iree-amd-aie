@@ -179,26 +179,31 @@ npu4_matmul_tests = [
             "--iree-amdaie-enable-infinite-loop-around-core-block=true"
         ],
     },
-    {
-        "M": 64,
-        "N": 64,
-        "K": 64,
-        "input_type": "bf16",
-        "acc_type": "f32",
-        "use_ukernel": True,
-        "use_chess_for_ukernel": False,
-    },
-    {
-        "M": 64,
-        "N": 64,
-        "K": 64,
-        "input_type": "bf16",
-        "acc_type": "f32",
-        "use_ukernel": True,
-        "use_chess_for_ukernel": False,
-        "tile_pipeline": "pack-peel-4-level-tiling",
-        "name_suffix": "4rows_8cols_npu4",
-    },
+    # TODO: Re-enable once the matmul ukernels support an odd number of 8x8x8
+    # blocks per core, or the column count is chosen per dispatch. 64x64x64 on
+    # 4x8 cores gives a 16x8 per-core tile (1 block in N), which the
+    # 2x2-unrolled ukernel cannot process; it used to pass by reading and
+    # writing past the tile.
+    # {
+    #     "M": 64,
+    #     "N": 64,
+    #     "K": 64,
+    #     "input_type": "bf16",
+    #     "acc_type": "f32",
+    #     "use_ukernel": True,
+    #     "use_chess_for_ukernel": False,
+    # },
+    # {
+    #     "M": 64,
+    #     "N": 64,
+    #     "K": 64,
+    #     "input_type": "bf16",
+    #     "acc_type": "f32",
+    #     "use_ukernel": True,
+    #     "use_chess_for_ukernel": False,
+    #     "tile_pipeline": "pack-peel-4-level-tiling",
+    #     "name_suffix": "4rows_8cols_npu4",
+    # },
     {
         "M": 512,
         "N": 512,

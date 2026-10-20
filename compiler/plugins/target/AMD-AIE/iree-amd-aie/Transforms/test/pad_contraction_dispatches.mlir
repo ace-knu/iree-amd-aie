@@ -330,3 +330,86 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
     util.return %0 : tensor<32x200xf32>
   }
 }
+
+// -----
+
+// With ukernels enabled the M/N multiples double (num_rows*2*instrM = 64,
+// num_cols*2*instrN = 128), because the matmul ukernels need an even number of
+// vector instructions per core. M=196 is padded to 256 (not 224) and N=64,
+// already divisible without ukernels, is padded to 128.
+
+// CHECK-LABEL: func.func @matmul_uk
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<256x64xbf16>>
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<64x128xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<256x128xf32>>
+// CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<256x64xbf16>, tensor<64x128xbf16>) outs(%{{.+}} : tensor<256x128xf32>)
+// CHECK-LABEL: util.func public @main_uk
+// CHECK:         flow.dispatch @dispatch_uk::@matmul_uk
+// CHECK-SAME:      : (tensor<256x64xbf16>, tensor<64x128xbf16>) -> tensor<256x128xf32>
+// CHECK:         flow.dispatch @crop_executable_2::@crop_dispatch_2
+// CHECK-SAME:      : (tensor<256x128xf32>) -> tensor<196x64xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "matmul"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_uk {
+    flow.executable.export public @matmul_uk workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_uk(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<196x64xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<64x64xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196x64xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<196x64xbf16>> -> tensor<196x64xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [64, 64], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<64x64xbf16>> -> tensor<64x64xbf16>
+        %2 = tensor.empty() : tensor<196x64xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<196x64xf32>) -> tensor<196x64xf32>
+        %4 = linalg.matmul ins(%0, %1 : tensor<196x64xbf16>, tensor<64x64xbf16>) outs(%3 : tensor<196x64xf32>) -> tensor<196x64xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : tensor<196x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<196x64xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_uk(%arg0: tensor<196x64xbf16>, %arg1: tensor<64x64xbf16>) -> tensor<196x64xf32> {
+    %0 = flow.dispatch @dispatch_uk::@matmul_uk(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<196x64xbf16>, tensor<64x64xbf16>) -> tensor<196x64xf32>
+    util.return %0 : tensor<196x64xf32>
+  }
+}
+
+// -----
+
+// With ukernels enabled a transpose_b matmul (GEMV-like, M=1) gets the same
+// doubled multiples as a plain matmul: M 1 -> 64, N 64 -> 128.
+
+// CHECK-LABEL: func.func @matmul_tb_uk
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<64x64xbf16>>
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<128x64xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<64x128xf32>>
+// CHECK-LABEL: util.func public @main_tb_uk
+// CHECK:         flow.dispatch @dispatch_tb_uk::@matmul_tb_uk
+// CHECK-SAME:      : (tensor<64x64xbf16>, tensor<128x64xbf16>) -> tensor<64x128xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "matmul"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_tb_uk {
+    flow.executable.export public @matmul_tb_uk workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_tb_uk(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x64xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<64x64xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x64xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [1, 64], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x64xbf16>> -> tensor<1x64xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [64, 64], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<64x64xbf16>> -> tensor<64x64xbf16>
+        %2 = tensor.empty() : tensor<1x64xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<1x64xf32>) -> tensor<1x64xf32>
+        %4 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>] ins(%0, %1 : tensor<1x64xbf16>, tensor<64x64xbf16>) outs(%3 : tensor<1x64xf32>) -> tensor<1x64xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [1, 64], strides = [1, 1] : tensor<1x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x64xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_tb_uk(%arg0: tensor<1x64xbf16>, %arg1: tensor<64x64xbf16>) -> tensor<1x64xf32> {
+    %0 = flow.dispatch @dispatch_tb_uk::@matmul_tb_uk(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<1x64xbf16>, tensor<64x64xbf16>) -> tensor<1x64xf32>
+    util.return %0 : tensor<1x64xf32>
+  }
+}

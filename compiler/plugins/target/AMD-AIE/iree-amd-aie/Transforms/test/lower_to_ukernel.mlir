@@ -384,3 +384,32 @@ func.func @trunci(%arg0 : tensor<16x16x4x4xi16>) -> tensor<16x16x4x4xi8> attribu
 // CHECK-SAME:       fn_def_attrs {link_with = "trunci.o"}
 // CHECK-SAME:       -> tensor<16x16x4x4xi8>
 // CHECK:        return %[[MICRO_KERNEL]]
+
+// -----
+
+// A tile with an odd number of vector instructions in M (56 = 7 x 8) is not
+// lowered: the ukernels process 2x2 instructions per step.
+func.func @generic_matmul_bf16bf16f32_odd_m(%arg0 : tensor<4x7x8x8xbf16>, %arg1 : tensor<4x4x8x8xbf16>,
+    %arg2 : tensor<4x7x8x8xf32>) -> tensor<4x7x8x8xf32> attributes {
+  hal.executable.target = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
+} {
+  %0 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3, d4, d5) -> (d2, d0, d3, d5)>,
+                                        affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d2, d5, d4)>,
+                                        affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d0, d3, d4)>],
+                       iterator_types = ["parallel", "parallel", "reduction",
+                                         "parallel", "parallel", "reduction"]
+                      } ins(%arg0, %arg1 : tensor<4x7x8x8xbf16>, tensor<4x4x8x8xbf16>)
+                        outs(%arg2 : tensor<4x7x8x8xf32>)
+      {
+        ^bb0(%in: bf16, %in_9: bf16, %out: f32):
+          %1 = arith.extf %in : bf16 to f32
+          %2 = arith.extf %in_9 : bf16 to f32
+          %3 = arith.mulf %1, %2 : f32
+          %4 = arith.addf %out, %3 : f32
+          linalg.yield %4 : f32
+      } -> tensor<4x7x8x8xf32>
+  return %0 : tensor<4x7x8x8xf32>
+}
+//      CHECK: func @generic_matmul_bf16bf16f32_odd_m
+//      CHECK:  linalg.generic
+//  CHECK-NOT:  iree_codegen.ukernel.generic

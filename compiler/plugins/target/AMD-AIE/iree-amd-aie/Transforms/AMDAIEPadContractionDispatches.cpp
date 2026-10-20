@@ -42,6 +42,7 @@
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
@@ -95,8 +96,11 @@ static IREE::HAL::ExecutableTargetAttr getDispatchTarget(
 /// Computes the M/N/K pad multiples for `target` and the matmul element types,
 /// entirely from the device info tables (no hardcoded geometry): M/N from the
 /// core-array shape (num_rows/num_cols) times the vector instruction size, K
-/// from the shared pack-peel reduction tile. Returns nullopt if `target` is not
-/// a recognized amd-aie target.
+/// from the shared pack-peel reduction tile. With ukernels enabled M/N are
+/// doubled, because the matmul ukernels process 2x2 vector instructions per
+/// step and need an even count per core (KernelDispatch picks the per-core
+/// tile to match). Returns nullopt if `target` is not a recognized amd-aie
+/// target.
 static std::optional<PaddingMultiples> getPaddingMultiples(
     IREE::HAL::ExecutableTargetAttr target, Type lhsElemType, Type rhsElemType,
     Type accElemType) {
@@ -121,8 +125,9 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   //   * with ukernels enabled KernelDispatch picks a factor of K instead, so
   //     padding K at all is unnecessary work. `ukernels` *is* on the target
   //     attr, so that half could be handled without any new plumbing.
-  return PaddingMultiples{/*m=*/*numRows * (*instr)[0],
-                          /*n=*/*numCols * (*instr)[1],
+  int64_t perCore = hasUkernel(target.getConfiguration()) ? 2 : 1;
+  return PaddingMultiples{/*m=*/*numRows * perCore * (*instr)[0],
+                          /*n=*/*numCols * perCore * (*instr)[1],
                           /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
 }
 

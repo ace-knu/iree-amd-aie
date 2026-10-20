@@ -1,5 +1,6 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4})' %s | FileCheck %s
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 use-tile-pipeline=pack-peel-4-level-tiling})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=UKERNEL
 
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
 // CHECK-SAME:                [128, 128, 0], [0, 0, 1], [1, 1, 0]
@@ -37,6 +38,38 @@ module {
     // CHECK:  linalg.matmul {lowering_config = #config, packing_config = #packingConfig}
     %7 = linalg.matmul ins(%3, %4 : tensor<128x256xbf16>, tensor<256x128xbf16>) outs(%6 : tensor<128x128xf32>) -> tensor<128x128xf32>
     iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [128, 128], strides = [1, 1] : tensor<128x128xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<128x128xf32>>
+    return
+  }
+}
+
+// -----
+
+// With ukernels on 4x8 cores the per-core tile must hold an even number of
+// 8x8x8 instructions in M and N. The only factor of M=3136 that is a multiple
+// of 4*16=64 and within the L0 bound (4 x L1 tile 56 = 224) is 64, so the
+// per-core M tile is 16. Without ukernels it is 56 = 7 instructions, which the
+// ukernels cannot process.
+
+// UKERNEL{LITERAL}: #config = #iree_codegen.lowering_config<tile_sizes = [[64, 256, 0], [0, 0, 1], [1, 1, 0]]>
+// UKERNEL:          #packingConfig = #amdaie.packing_config<packing_config = [{packedSizes = [16, 32, 128]
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @matmul_3136x256x1152_bf16xbf16xf32() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3136x1152xbf16>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1152x256xbf16>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<3136x256xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [3136, 1152], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3136x1152xbf16>> -> tensor<3136x1152xbf16>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [1152, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1152x256xbf16>> -> tensor<1152x256xbf16>
+    %5 = tensor.empty() : tensor<3136x256xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
+    %7 = linalg.matmul ins(%3, %4 : tensor<3136x1152xbf16>, tensor<1152x256xbf16>) outs(%6 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [3136, 256], strides = [1, 1] : tensor<3136x256xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<3136x256xf32>>
     return
   }
 }

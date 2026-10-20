@@ -115,6 +115,13 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
   int M, N, K, r, s, t;
   std::tie(M, K, r, s) = getTilingInfo(lhsType);
   std::tie(std::ignore, N, std::ignore, t) = getTilingInfo(outType);
+  // The matmul ukernels process 2x2 vector instructions per step and would
+  // read and write past the tile for an odd count, so leave such a tile to the
+  // non-ukernel path.
+  if ((M / r) % 2 != 0 || (N / t) % 2 != 0) {
+    return rewriter.notifyMatchFailure(
+        op, "tile needs an even number of vector instructions in M and N");
+  }
   std::string inputOutputElemTypeAndSize =
       typeToString(lhsElemType) + "_" + typeToString(rhsElemType) + "_" +
       typeToString(outElemType) + "_" + std::to_string(M) + "x" +

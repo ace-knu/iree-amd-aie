@@ -293,6 +293,18 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   uint32_t maxL0SizeN = numCols * maxL1Size.N;
   uint32_t M0 = findLargestFactor(M, maxL0SizeM, maxL1Size.M);
   uint32_t N0 = findLargestFactor(N, maxL0SizeN, maxL1Size.N);
+  // The matmul ukernels process 2x2 vector instructions per step, so with
+  // ukernels the per-core tile (M0 / numRows, N0 / numCols) must hold an even
+  // number of instructions in M and N. When M/N allow it, pick M0/N0 as
+  // multiples of that instead of the L1 size; this stays within the L1 bound
+  // because the L1 size is at least 16. Otherwise the ukernel is not used for
+  // the resulting odd tile (see AMDAIELowerToUKernels).
+  if (enableAMDAIEUkernels != "none") {
+    uint32_t mMultiple = numRows * 2 * m1Pack;
+    uint32_t nMultiple = numCols * 2 * n1Pack;
+    if (M % mMultiple == 0) M0 = findLargestFactor(M, maxL0SizeM, mMultiple);
+    if (N % nMultiple == 0) N0 = findLargestFactor(N, maxL0SizeN, nMultiple);
+  }
   uint32_t m0Pack = (M0 / numRows) % m1Pack == 0 ? (M0 / numRows) : M0;
   uint32_t n0Pack = (N0 / numCols) % n1Pack == 0 ? (N0 / numCols) : N0;
 
