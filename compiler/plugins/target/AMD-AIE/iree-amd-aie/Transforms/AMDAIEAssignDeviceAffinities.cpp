@@ -159,7 +159,7 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   DenseMap<StringRef, bool> executableIsAccel;
   for (auto exe : moduleOp.getOps<IREE::Flow::ExecutableOp>())
     executableIsAccel[exe.getSymName()] = executableIsContractionOrConv(exe);
-  unsigned accelIdx = 1;
+  unsigned accelIdx = 0;
   DenseSet<Attribute> usedRefs;
   moduleOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
     bool onAccel = false;

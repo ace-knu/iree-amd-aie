@@ -70,6 +70,12 @@ struct AMDAIESession
     passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
   }
 
+  void extendStreamTransformPassPipeline(OpPassManager &passManager) override {
+    // Resolve optimal<[...]> buffer owners from stream.topology (replaces the
+    // runtime "amdxdna" rule). No-op without a topology or on ties.
+    passManager.addPass(AMDAIE::createAMDAIEResolveBufferOwnerPass());
+  }
+
   void extendFlowTransformPassPipeline(OpPassManager &passManager) override {
     // Heterogeneous placement: pin contraction/conv dispatches to the amd-aie
     // (NPU) device and everything else (transposes, casts) to the CPU device.

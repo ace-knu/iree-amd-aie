@@ -83,6 +83,7 @@ std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 /// Create a pass to assign per-dispatch device affinities (contraction/conv ->
 /// NPU, everything else -> CPU) for heterogeneous CPU+NPU execution.
 std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass();
+std::unique_ptr<Pass> createAMDAIEResolveBufferOwnerPass();
 
 /// Create a pass to pad the operands of NPU contraction dispatches up to the
 /// target's pack-peel tile multiples (so divisibility holds inside the

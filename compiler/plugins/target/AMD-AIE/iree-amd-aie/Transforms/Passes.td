@@ -87,6 +87,13 @@ def AMDAIEAssignDeviceAffinities :
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
 }
 
+def AMDAIEResolveBufferOwner :
+    Pass<"iree-amdaie-resolve-buffer-owner", "ModuleOp"> {
+  let summary = "Resolve #hal.device.optimal allocation affinities to a single owner using stream.topology (all other candidates must have transparent access to the owner).";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEResolveBufferOwnerPass()";
+}
+
 def AMDAIEPadContractionDispatches :
     Pass<"iree-amdaie-pad-contraction-dispatches", "ModuleOp"> {
   let summary = "Pad NPU contraction dispatch operands up to the target pack-peel tile multiples at the Flow dispatch boundary (target-known, via each dispatch's device affinity).";
