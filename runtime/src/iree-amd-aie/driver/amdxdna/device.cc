@@ -119,8 +119,8 @@ static iree_status_t iree_hal_amdxdna_device_initialize_hal_resources(
     iree_hal_amdxdna_device* device) {
   IREE_ASSERT_ARGUMENT(device);
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_allocator_create(
-      device->host_allocator, device->native_device,
-      &device->device_allocator));
+      reinterpret_cast<iree_hal_device_t*>(device), device->host_allocator,
+      device->native_device, &device->device_allocator));
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_async_queue_create(
       &device->block_pool, device->host_allocator, &device->async_queue));
   return iree_ok_status();

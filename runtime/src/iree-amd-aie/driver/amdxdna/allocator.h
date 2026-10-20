@@ -12,8 +12,10 @@
 #include "iree/hal/api.h"
 
 // Creates a buffer allocator used for persistent allocations.
+// |parent_device| is recorded as the placement device of allocated buffers and
+// is not retained (the device owns the allocator).
 iree_status_t iree_hal_amdxdna_allocator_create(
-    iree_allocator_t host_allocator,
+    iree_hal_device_t* parent_device, iree_allocator_t host_allocator,
     iree_hal_amdxdna_native_device_t* native_device,
     iree_hal_allocator_t** out_allocator);
 

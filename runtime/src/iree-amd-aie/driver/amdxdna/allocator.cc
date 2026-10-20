@@ -39,13 +39,19 @@ static iree_status_t iree_hal_amdxdna_allocator_export_buffer(
 
 struct iree_hal_amdxdna_allocator {
   iree_hal_resource_t resource;
+  // 3DEV: parent device that this allocator is associated with. Unowned.
+  // Recorded as placement.device so other devices can find the owner.
+  iree_hal_device_t* parent_device;
   iree_allocator_t host_allocator;
   iree_hal_amdxdna_native_device_t* native_device;
   IREE_STATISTICS(iree_hal_allocator_statistics_t statistics;)
 
-  iree_hal_amdxdna_allocator(iree_allocator_t host_allocator,
+  iree_hal_amdxdna_allocator(iree_hal_device_t* parent_device,
+                             iree_allocator_t host_allocator,
                              iree_hal_amdxdna_native_device_t* native_device)
-      : host_allocator(host_allocator), native_device(native_device) {
+      : parent_device(parent_device),
+        host_allocator(host_allocator),
+        native_device(native_device) {
     IREE_TRACE_ZONE_BEGIN(z0);
 
     iree_hal_resource_initialize(&iree_hal_amdxdna_allocator_vtable,
@@ -138,7 +144,11 @@ static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
           allocator->native_device, allocation_size,
           iree_hal_amdxdna_native_buffer_type_t::host_only, &native_buffer));
   iree_hal_buffer_t* buffer = nullptr;
+  // 3DEV: record the owning device like other drivers do (Vulkan/HIP). Without
+  // it synchronously allocated BOs (constants, relocated inputs) look like
+  // host heap buffers to other devices and cannot be exported/imported.
   const iree_hal_buffer_placement_t placement = {
+      .device = allocator->parent_device,
       .queue_affinity = params->queue_affinity ? params->queue_affinity
                                                : IREE_HAL_QUEUE_AFFINITY_ANY,
       .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_NONE,
@@ -194,7 +204,7 @@ static void iree_hal_amdxdna_allocator_deallocate_buffer(
 }
 
 iree_status_t iree_hal_amdxdna_allocator_create(
-    iree_allocator_t host_allocator,
+    iree_hal_device_t* parent_device, iree_allocator_t host_allocator,
     iree_hal_amdxdna_native_device_t* native_device,
     iree_hal_allocator_t** out_allocator) {
   IREE_ASSERT_ARGUMENT(out_allocator);
@@ -204,8 +214,8 @@ iree_status_t iree_hal_amdxdna_allocator_create(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_allocator_malloc(host_allocator, sizeof(*allocator),
                                 reinterpret_cast<void**>(&allocator)));
-  allocator =
-      new (allocator) iree_hal_amdxdna_allocator(host_allocator, native_device);
+  allocator = new (allocator)
+      iree_hal_amdxdna_allocator(parent_device, host_allocator, native_device);
   iree_status_t status = iree_ok_status();
 
   if (iree_status_is_ok(status)) {
