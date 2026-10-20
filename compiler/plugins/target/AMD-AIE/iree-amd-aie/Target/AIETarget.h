@@ -67,6 +67,11 @@ struct AMDAIEOptions {
   // too. Harmless while every contraction is placed on the accelerator; revisit
   // if the placement rules change.
   bool demoteContractionInputsToBf16{false};
+  // Debug (default off): the Flow-phase device placement keeps device marks
+  // (an existing dispatch stream.affinity, or a stream.affinity on a linalg op
+  // inside the executable) instead of overwriting them round-robin. Lets
+  // hand-edited placement IR be compiled end to end.
+  bool respectAffinityMarks{false};
   bool enableCoalescingLoops{false};
   bool enableCollapsingUnitDims{false};
   OutliningStrategy enableFunctionOutlining{OutliningStrategy::Balanced};
@@ -176,6 +181,15 @@ struct AMDAIEOptions {
             "Demote the inputs of contraction ops (matmul + convolution) from "
             "f32 to bf16 during preprocessing (accumulation stays f32). Needed "
             "to run f32 models on npu4, which has no f32 vector path."));
+
+    binder.opt<bool>(
+        "iree-amdaie-respect-affinity-marks", respectAffinityMarks,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Debug: in the Flow-phase device placement, keep device marks "
+            "(an existing flow.dispatch stream.affinity, or a stream.affinity "
+            "on a linalg op inside the executable) instead of overwriting them "
+            "round-robin. Unmarked dispatches are placed as before."));
 
     binder.opt<bool>(
         "iree-amd-aie-enable-chess-for-ukernel", useChessForUKernel,

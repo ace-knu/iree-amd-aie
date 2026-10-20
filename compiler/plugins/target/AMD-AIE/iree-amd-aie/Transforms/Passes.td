@@ -85,6 +85,13 @@ def AMDAIEAssignDeviceAffinities :
   let summary = "Pin each flow.dispatch to a device (contraction/conv -> NPU, else -> CPU) for heterogeneous CPU+NPU execution.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
+  let options = [
+    Option<"respectMarks", "respect-marks", "bool", /*default=*/"false",
+      "Debug: keep device marks instead of overwriting them. A dispatch that "
+      "already has stream.affinity keeps it; otherwise a stream.affinity on a "
+      "linalg op inside its executable (the contraction/conv root first) pins "
+      "the dispatch. Unmarked dispatches are placed as before.">
+  ];
 }
 
 def AMDAIEResolveBufferOwner :

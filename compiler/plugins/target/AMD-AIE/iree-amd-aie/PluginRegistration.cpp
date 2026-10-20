@@ -84,7 +84,12 @@ struct AMDAIESession
     // Heterogeneous placement: pin contraction/conv dispatches to the amd-aie
     // (NPU) device and everything else (transposes, casts) to the CPU device.
     // No-op unless both an amd-aie and an llvm-cpu device are declared.
-    passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
+    // --iree-amdaie-respect-affinity-marks (debug, default off) keeps existing
+    // device marks instead of overwriting them.
+    AMDAIE::AMDAIEAssignDeviceAffinitiesOptions placementOptions;
+    placementOptions.respectMarks = options.respectAffinityMarks;
+    passManager.addPass(
+        AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(placementOptions));
     // With affinity known per-dispatch, pad NPU contraction operands up to the
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.
