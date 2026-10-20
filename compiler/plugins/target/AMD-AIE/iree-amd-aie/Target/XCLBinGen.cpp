@@ -184,6 +184,11 @@ FailureOr<std::vector<std::string>> makePeanoOptArgs(
       "-basic-aa-max-lookup-search-depth=10",
       //
       "-O3",
+      // No full unrolling. With Peano v22, fully unrolling the trip-count-8
+      // loops of scalar core code overflows the 16KB program memory (VGG bf16
+      // matmul core: 8304 -> 17680 bytes) and makes llc spill enough to
+      // overflow the core stack (f32 8x4x8 matmul: 128 -> 896 byte frame).
+      "-unroll-full-max-count=0",
       //
       "--inline-threshold=10",
       // missing from libc

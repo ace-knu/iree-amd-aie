@@ -43,6 +43,11 @@ TEST(XCLBinGenTest, makePeanoOptArgs) {
   // and --magic-flag to be appended at the end.
   EXPECT_EQ(optArgs.back(), "--magic-flag");
 
+  // Full unrolling stays disabled when additional flags are given.
+  EXPECT_EQ(std::count(optArgs.begin(), optArgs.end(),
+                       "-unroll-full-max-count=0"),
+            1);
+
   std::string additionalWithoutSemisStr{"--magic-flag"};
   mlir::FailureOr<std::vector<std::string>> maybeAdditionalFlagsWithoutSemis =
       detail::flagStringToVector(additionalWithoutSemisStr);
