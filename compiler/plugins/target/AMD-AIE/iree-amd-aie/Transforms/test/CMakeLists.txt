@@ -17,6 +17,7 @@ iree_lit_test_suite(
     "assign_channels.mlir"
     "assign_connection_types.mlir"
     "assign_device_affinities.mlir"
+    "assign_device_affinities_placement_map.mlir"
     "assign_device_affinities_respect_marks.mlir"
     "assign_logical_objectfifo_depth.mlir"
     "assign_npu_dma_bd_ids.mlir"

@@ -90,7 +90,16 @@ def AMDAIEAssignDeviceAffinities :
       "Debug: keep device marks instead of overwriting them. A dispatch that "
       "already has stream.affinity keeps it; otherwise a stream.affinity on a "
       "linalg op inside its executable (the contraction/conv root first) pins "
-      "the dispatch. Unmarked dispatches are placed as before.">
+      "the dispatch. Unmarked dispatches are placed as before.">,
+    Option<"placementMap", "placement-map", "std::string", /*default=*/"\"\"",
+      "Experiment: pin dispatches by rules '<selector>=<device>' separated by "
+      "';' (or '@<file>', one rule per line, '#' comments); the first "
+      "matching rule wins and takes precedence over respect-marks and the "
+      "round-robin. Selectors: dN, dN-dM, dA,dB (dispatch number from the "
+      "executable name '_dispatch_N'), ~substr (executable/export name), *. "
+      "Devices: npu, gpu, cpu (first amd-aie / vulkan-spirv / llvm-cpu "
+      "device) or @<device global>. Unmatched dispatches are placed as "
+      "before. Prints the placement to stderr. Empty = off.">
   ];
 }
 

@@ -72,6 +72,10 @@ struct AMDAIEOptions {
   // inside the executable) instead of overwriting them round-robin. Lets
   // hand-edited placement IR be compiled end to end.
   bool respectAffinityMarks{false};
+  // Experiment (default empty = off): pins dispatches to devices by dispatch
+  // number / name rules, e.g. "d2=npu;~matmul=gpu;*=cpu" or "@<file>". See the
+  // `placement-map` option of AMDAIEAssignDeviceAffinities.
+  std::string placementMap;
   bool enableCoalescingLoops{false};
   bool enableCollapsingUnitDims{false};
   OutliningStrategy enableFunctionOutlining{OutliningStrategy::Balanced};
@@ -190,6 +194,18 @@ struct AMDAIEOptions {
             "(an existing flow.dispatch stream.affinity, or a stream.affinity "
             "on a linalg op inside the executable) instead of overwriting them "
             "round-robin. Unmarked dispatches are placed as before."));
+
+    binder.opt<std::string>(
+        "iree-amdaie-placement-map", placementMap, llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Experiment: in the Flow-phase device placement, pin dispatches by "
+            "rules '<selector>=<device>' separated by ';' (or '@<file>', one "
+            "rule per line, '#' comments); the first matching rule wins. "
+            "Selectors: dN, dN-dM, dA,dB (dispatch number from the executable "
+            "name '_dispatch_N'), ~substr (executable/export name), *. "
+            "Devices: npu, gpu, cpu (first amd-aie / vulkan-spirv / llvm-cpu "
+            "device) or @<device global>. Unmatched dispatches are placed as "
+            "before. Prints the placement to stderr. Empty = off."));
 
     binder.opt<bool>(
         "iree-amd-aie-enable-chess-for-ukernel", useChessForUKernel,

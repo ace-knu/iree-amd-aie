@@ -85,9 +85,11 @@ struct AMDAIESession
     // (NPU) device and everything else (transposes, casts) to the CPU device.
     // No-op unless both an amd-aie and an llvm-cpu device are declared.
     // --iree-amdaie-respect-affinity-marks (debug, default off) keeps existing
-    // device marks instead of overwriting them.
+    // device marks instead of overwriting them. --iree-amdaie-placement-map
+    // (experiment, default empty) pins dispatches by number/name rules.
     AMDAIE::AMDAIEAssignDeviceAffinitiesOptions placementOptions;
     placementOptions.respectMarks = options.respectAffinityMarks;
+    placementOptions.placementMap = options.placementMap;
     passManager.addPass(
         AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(placementOptions));
     // With affinity known per-dispatch, pad NPU contraction operands up to the

@@ -33,6 +33,10 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "iree-amdaie-assign-device-affinities"
 
@@ -152,6 +156,191 @@ static FailureOr<SymbolRefAttr> readExecutableMark(
   return chosen;
 }
 
+//===----------------------------------------------------------------------===//
+// placement-map (experiment, default empty = off)
+//
+// A list of `<selector>=<device>` rules; the first rule matching a dispatch
+// pins it. Selectors: `dN`, `dN-dM`, `dA,dB,...` (the N of the executable name
+// `<func>_dispatch_N`, assigned by OutlineDispatchRegions before this pass and
+// so independent of placement; stable only for the same model and compile
+// flags), `~substr` (executable or export name contains substr) and `*`.
+// Devices: `npu` / `gpu` / `cpu` (first device global whose backend is amd-aie
+// / vulkan-spirv / llvm-cpu; `deviceRole` cannot tell npu from gpu since both
+// are accelerators) or `@<device global>`.
+//===----------------------------------------------------------------------===//
+
+struct PlacementRule {
+  enum class Kind { Numbers, Substring, All };
+  std::string text;  // as written, for diagnostics and the summary
+  Kind kind = Kind::All;
+  SmallVector<std::pair<int64_t, int64_t>> ranges;  // Numbers (inclusive)
+  std::string substring;                            // Substring
+  FlatSymbolRefAttr device;
+  StringRef backend;
+  unsigned matched = 0;
+};
+
+/// Short device label for the stderr summary: npu / gpu / cpu by backend.
+static std::string deviceLabel(StringRef backend) {
+  if (backend == "amd-aie") return "npu";
+  if (backend == "vulkan-spirv") return "gpu";
+  if (backend == "llvm-cpu") return "cpu";
+  return backend.str();
+}
+
+/// Dispatch number N from a `..._dispatch_N...` name, or -1.
+static int64_t dispatchNumber(StringRef name) {
+  size_t pos = name.find("_dispatch_");
+  if (pos == StringRef::npos) return -1;
+  StringRef digits = name.drop_front(pos + strlen("_dispatch_"))
+                         .take_while(llvm::isDigit);
+  int64_t num;
+  if (digits.empty() || digits.getAsInteger(10, num)) return -1;
+  return num;
+}
+
+/// Parses `dN` (`d` optional on the second end of a range).
+static bool parseDispatchRef(StringRef s, bool requireD, int64_t &num) {
+  s = s.trim();
+  if (s.consume_front("d")) requireD = false;
+  if (requireD) return false;
+  return !s.empty() && !s.getAsInteger(10, num) && num >= 0;
+}
+
+/// Parses `placementMap` (rules separated by ';', or `@<file>` with one rule
+/// per line and `#` comments) and resolves each device against `devices`.
+/// Emits an error on `moduleOp` and returns failure on any bad rule.
+static LogicalResult parsePlacementMap(StringRef placementMap,
+                                       ArrayRef<DeviceInfo> devices,
+                                       ModuleOp moduleOp,
+                                       SmallVectorImpl<PlacementRule> &rules) {
+  StringRef spec = placementMap.trim();
+  // Pass-pipeline syntax may keep the quotes around the value.
+  if (spec.size() >= 2 && (spec.front() == '\'' || spec.front() == '"') &&
+      spec.back() == spec.front())
+    spec = spec.drop_front().drop_back().trim();
+  std::unique_ptr<llvm::MemoryBuffer> file;
+  SmallVector<std::pair<StringRef, std::string>> entries;  // rule, where
+  if (spec.consume_front("@")) {
+    auto fileOrErr = llvm::MemoryBuffer::getFile(spec);
+    if (!fileOrErr) {
+      return moduleOp.emitError("placement-map: cannot read file '")
+             << spec << "': " << fileOrErr.getError().message();
+    }
+    file = std::move(*fileOrErr);
+    SmallVector<StringRef> lines;
+    file->getBuffer().split(lines, '\n');
+    for (auto [i, line] : llvm::enumerate(lines)) {
+      StringRef rule = line.split('#').first.trim();
+      if (!rule.empty())
+        entries.push_back(
+            {rule, (spec + ":" + std::to_string(i + 1)).str()});
+    }
+  } else {
+    SmallVector<StringRef> parts;
+    spec.split(parts, ';');
+    for (auto [i, part] : llvm::enumerate(parts)) {
+      StringRef rule = part.trim();
+      if (!rule.empty())
+        entries.push_back({rule, "rule " + std::to_string(i + 1)});
+    }
+  }
+  if (entries.empty())
+    return moduleOp.emitError("placement-map: no rules in '")
+           << placementMap << "'";
+
+  for (auto &entry : entries) {
+    StringRef ruleText = entry.first;
+    const std::string &where = entry.second;
+    auto fail = [&]() {
+      return moduleOp.emitError("placement-map ")
+             << where << " '" << ruleText << "': ";
+    };
+    PlacementRule rule;
+    rule.text = ruleText.str();
+    auto [selector, deviceName] = ruleText.split('=');
+    selector = selector.trim();
+    deviceName = deviceName.trim();
+    if (!ruleText.contains('=') || selector.empty() || deviceName.empty())
+      return fail() << "expected '<selector>=<device>'";
+
+    if (selector == "*") {
+      rule.kind = PlacementRule::Kind::All;
+    } else if (selector.consume_front("~")) {
+      if (selector.empty()) return fail() << "empty '~' substring";
+      rule.kind = PlacementRule::Kind::Substring;
+      rule.substring = selector.str();
+    } else {
+      rule.kind = PlacementRule::Kind::Numbers;
+      SmallVector<StringRef> items;
+      selector.split(items, ',');
+      for (StringRef item : items) {
+        auto [lo, hi] = item.split('-');
+        int64_t loNum, hiNum;
+        if (!parseDispatchRef(lo, /*requireD=*/true, loNum))
+          return fail() << "bad dispatch selector '" << item.trim()
+                        << "' (expected dN, dN-dM, dA,dB, ~substr or *)";
+        hiNum = loNum;
+        if (item.contains('-') &&
+            !parseDispatchRef(hi, /*requireD=*/false, hiNum))
+          return fail() << "bad dispatch range '" << item.trim() << "'";
+        if (hiNum < loNum)
+          return fail() << "reversed dispatch range '" << item.trim() << "'";
+        rule.ranges.push_back({loNum, hiNum});
+      }
+    }
+
+    const DeviceInfo *target = nullptr;
+    if (deviceName.consume_front("@")) {
+      for (const DeviceInfo &d : devices)
+        if (d.ref.getValue() == deviceName) target = &d;
+      if (!target)
+        return fail() << "device @" << deviceName
+                      << " is not a placement device of this module";
+    } else {
+      StringRef backend = llvm::StringSwitch<StringRef>(deviceName)
+                              .Case("npu", "amd-aie")
+                              .Case("gpu", "vulkan-spirv")
+                              .Case("cpu", "llvm-cpu")
+                              .Default("");
+      if (backend.empty())
+        return fail() << "unknown device '" << deviceName
+                      << "' (expected npu, gpu, cpu or @<device global>)";
+      for (const DeviceInfo &d : devices)
+        if (d.backend == backend) {
+          target = &d;
+          break;
+        }
+      if (!target)
+        return fail() << "no " << backend << " device ('" << deviceName
+                      << "') is declared in this module";
+    }
+    rule.device = target->ref;
+    rule.backend = target->backend;
+    rules.push_back(std::move(rule));
+  }
+  return success();
+}
+
+/// Returns true if `rule` matches a dispatch with number `num` (-1 if none)
+/// whose entry point is `exeName::exportName`.
+static bool ruleMatches(const PlacementRule &rule, int64_t num,
+                        StringRef exeName, StringRef exportName) {
+  switch (rule.kind) {
+    case PlacementRule::Kind::All:
+      return true;
+    case PlacementRule::Kind::Substring:
+      return exeName.contains(rule.substring) ||
+             exportName.contains(rule.substring);
+    case PlacementRule::Kind::Numbers:
+      if (num < 0) return false;
+      return llvm::any_of(rule.ranges, [&](auto range) {
+        return range.first <= num && num <= range.second;
+      });
+  }
+  return false;
+}
+
 class AMDAIEAssignDeviceAffinitiesPass
     : public impl::AMDAIEAssignDeviceAffinitiesBase<
           AMDAIEAssignDeviceAffinitiesPass> {
@@ -220,8 +409,51 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
       if (Attribute(d.ref) == Attribute(ref)) return true;
     return false;
   };
+  // placement-map (experiment, default empty): only consulted inside the
+  // `if (!placementMap.empty())` blocks below, so the default path is
+  // unchanged. Rules pin first; unmatched dispatches fall through.
+  SmallVector<PlacementRule> mapRules;
+  struct MapEntry {
+    IREE::Flow::DispatchOp dispatchOp;
+    int64_t num;
+    StringRef exportName;
+    int ruleIdx;  // -1: no rule matched
+  };
+  SmallVector<MapEntry> mapEntries;
+  if (!placementMap.empty()) {
+    SmallVector<DeviceInfo> devices(accelerators);
+    devices.append(hosts);
+    if (failed(parsePlacementMap(placementMap, devices, moduleOp, mapRules)))
+      return signalPassFailure();
+  }
   bool markFailed = false;
   moduleOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
+    if (!placementMap.empty()) {
+      SymbolRefAttr entryPoint = *dispatchOp.getEntryPointRefs().begin();
+      StringRef exeName = entryPoint.getRootReference().getValue();
+      StringRef exportName = entryPoint.getLeafReference().getValue();
+      int64_t num = dispatchNumber(exeName);
+      if (num < 0) num = dispatchNumber(exportName);
+      mapEntries.push_back({dispatchOp, num, exportName, -1});
+      for (auto [idx, rule] : llvm::enumerate(mapRules)) {
+        if (!ruleMatches(rule, num, exeName, exportName)) continue;
+        ++rule.matched;
+        mapEntries.back().ruleIdx = idx;
+        auto it = executableIsAccel.find(exeName);
+        if (rule.backend == "amd-aie" &&
+            (it == executableIsAccel.end() || !it->second)) {
+          dispatchOp.emitWarning("placement-map places a dispatch without a "
+                                 "contraction/convolution on amd-aie device ")
+              << rule.device << " (rule '" << rule.text
+              << "'); amd-aie may fail to lower it";
+        }
+        // Mapped dispatches do not advance the round-robin.
+        usedRefs.insert(rule.device);
+        dispatchOp->setAttr("stream.affinity", affinityFor(rule.device));
+        return;
+      }
+      // No rule matched: fall through to respect-marks / the default below.
+    }
     if (respectMarks) {
       // (1) An affinity already on the dispatch is kept.
       if (Attribute existing = dispatchOp->getAttr("stream.affinity")) {
@@ -274,6 +506,66 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   });
   if (markFailed) return signalPassFailure();
 
+  if (!placementMap.empty() && !mapEntries.empty()) {
+    // A number rule that matched nothing is a typo or is shadowed by an
+    // earlier rule. (Skipped without dispatches: the preprocessing run.)
+    bool deadRule = false;
+    for (auto [idx, rule] : llvm::enumerate(mapRules)) {
+      if (rule.kind != PlacementRule::Kind::Numbers || rule.matched) continue;
+      moduleOp.emitError("placement-map rule #")
+          << (idx + 1) << " '" << rule.text
+          << "' matches no dispatch (no such dispatch number, or every "
+             "match is taken by an earlier rule)";
+      deadRule = true;
+    }
+    if (deadRule) return signalPassFailure();
+
+    // Summary and per-dispatch placement on stderr (only with the flag).
+    DenseMap<Attribute, std::string> labels;
+    for (const DeviceInfo &d : accelerators)
+      labels[d.ref] = deviceLabel(d.backend);
+    for (const DeviceInfo &d : hosts) labels[d.ref] = deviceLabel(d.backend);
+    SmallVector<std::pair<std::string, unsigned>> perLabel = {
+        {"npu", 0}, {"gpu", 0}, {"cpu", 0}};
+    SmallVector<std::string> lines;
+    unsigned unmatched = 0;
+    for (const MapEntry &e : mapEntries) {
+      auto affinity = dyn_cast_if_present<IREE::HAL::DeviceAffinityAttr>(
+          e.dispatchOp->getAttr("stream.affinity"));
+      std::string device = "?", label = "?";
+      if (affinity) {
+        device = "@" + affinity.getDevice().getRootReference().getValue().str();
+        auto it = labels.find(affinity.getDevice());
+        if (it != labels.end()) label = it->second;
+      }
+      auto count =
+          llvm::find_if(perLabel, [&](auto &p) { return p.first == label; });
+      if (count == perLabel.end())
+        perLabel.push_back({label, 1});
+      else
+        ++count->second;
+      if (e.ruleIdx < 0) ++unmatched;
+      std::string rule =
+          e.ruleIdx < 0 ? std::string("(no rule: default placement)")
+                        : "rule#" + std::to_string(e.ruleIdx + 1) + " " +
+                              mapRules[e.ruleIdx].text;
+      std::string num =
+          e.num < 0 ? std::string("d?") : "d" + std::to_string(e.num);
+      lines.push_back(num + "\t" + e.exportName.str() + "\t" + rule + "\t" +
+                      device + " (" + label + ")");
+    }
+    llvm::raw_ostream &os = llvm::errs();
+    os << "[amdaie placement-map] rules=" << mapRules.size()
+       << " dispatches=" << mapEntries.size();
+    for (auto &[l, n] : perLabel) os << " " << l << "=" << n;
+    os << " unmatched=" << unmatched << "\n";
+    for (auto [idx, rule] : llvm::enumerate(mapRules))
+      os << "[amdaie placement-map] rule#" << (idx + 1) << " " << rule.text
+         << ": " << rule.matched << "\n";
+    for (const std::string &line : lines)
+      os << "[amdaie placement-map] " << line << "\n";
+  }
+
   // Inject the device topology over the devices we place work on so cross-device
   // boundary buffers resolve (ResolveTopologyQueries). Respect a user-provided
   // topology if present. Link flags come from the capability table.
@@ -291,6 +583,12 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
     for (const DeviceInfo &d : accelerators)
       if (!sawDispatch || usedRefs.contains(d.ref)) used.push_back(d);
     used.push_back(hostTarget);
+    // placement-map may also pin work on a host other than the first one.
+    if (!placementMap.empty()) {
+      for (const DeviceInfo &d : hosts)
+        if (d.ref != hostTarget.ref && usedRefs.contains(d.ref))
+          used.push_back(d);
+    }
     if (used.size() >= 2) {
       SmallVector<IREE::HAL::DeviceLinkAttr> links;
       for (const DeviceInfo &from : used)
