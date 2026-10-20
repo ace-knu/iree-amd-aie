@@ -125,6 +125,12 @@ uint64_t iree_hal_amdxdna_native_buffer_device_address(
 iree_device_size_t iree_hal_amdxdna_native_buffer_size(
     iree_hal_amdxdna_native_buffer_t* buffer);
 
+// Exports the buffer's underlying BO as a dma-buf file descriptor.
+// The returned fd is a duplicate owned by the caller, who must close it.
+iree_status_t iree_hal_amdxdna_native_buffer_export_fd(
+    iree_hal_amdxdna_native_buffer_t* buffer, int* out_fd);
+
+    
 iree_status_t iree_hal_amdxdna_native_context_open_cu(
     iree_hal_amdxdna_native_context_t* context, iree_string_view_t kernel_name,
     iree_hal_amdxdna_native_cu_index_t* out_cu_index);
