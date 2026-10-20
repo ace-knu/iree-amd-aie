@@ -16,7 +16,8 @@ namespace {
 TEST(AllocatorTest, CreateAndRelease) {
   iree_hal_allocator_t* allocator = nullptr;
   IREE_ASSERT_OK(iree_hal_amdxdna_allocator_create(
-      iree_allocator_system(), /*native_device=*/nullptr, &allocator));
+      /*parent_device=*/nullptr, iree_allocator_system(),
+      /*native_device=*/nullptr, &allocator));
   ASSERT_NE(allocator, nullptr);
   iree_hal_allocator_release(allocator);
 }
