@@ -122,6 +122,11 @@ SmallVector<std::array<Type, 3>> getSuportedAie2PTypes(MLIRContext *context) {
                                   /* A precision (bits)= */ 8,
                                   /* B precision (bits)= */ 8,
                                   /*C precision (bits)= */ 32, context));
+  // AIE2P has no native bf16 MAC. bf16 x bf16 -> f32 is lowered by promoting
+  // both operands through the bfp16 (block floating point) MAC pipeline; see
+  // the AIE2P branch of MatMulOpConversion in AIEVecToLLVM.cpp for the
+  // conversion sequence this shape triggers.
+  types.push_back(getBFloatMatmul(/* M= */ 8, /* N= */ 8, /* K= */ 8, context));
   return types;
 }
 
@@ -238,6 +243,15 @@ struct LowerVectorContractionOpToAIEVecMatMulPattern
 struct LowerVectorTransposeOpToAIEVecShuffleOpPattern
     : OpConversionPattern<vector::TransposeOp> {
   using OpConversionPattern::OpConversionPattern;
+
+ private:
+  AMDAIE::AMDAIEDevice device;
+
+ public:
+  LowerVectorTransposeOpToAIEVecShuffleOpPattern(MLIRContext *context,
+                                                 AMDAIE::AMDAIEDevice device)
+      : OpConversionPattern(context), device(device) {}
+
   LogicalResult matchAndRewrite(
       vector::TransposeOp transpOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
@@ -246,10 +260,6 @@ struct LowerVectorTransposeOpToAIEVecShuffleOpPattern
     auto elemTyBitWidth = resTy.getElementTypeBitWidth();
     auto vBitWidth = std::accumulate(resShape.begin(), resShape.end(),
                                      elemTyBitWidth, std::multiplies<>());
-    if (vBitWidth != 512) return failure();
-
-    if (elemTyBitWidth != 8 && elemTyBitWidth != 16 && elemTyBitWidth != 32)
-      return failure();
 
     // Verify leading dimensions are all 1.
     for (int64_t i = 0; i < static_cast<int64_t>(resShape.size() - 2); ++i)
@@ -260,6 +270,56 @@ struct LowerVectorTransposeOpToAIEVecShuffleOpPattern
     for (int64_t i = 0; i < static_cast<int64_t>(perm.size() - 2); ++i)
       if (perm[i] != i) return failure();
     if (perm.back() != static_cast<int64_t>(perm.size() - 2)) return failure();
+
+    // AIE2P's native bf16 register width for the 8x8x8 matmul shape is
+    // 1024 bits (vector<8x8xbf16>), twice AIE2's 512-bit shuffle below. There
+    // is no single shuffle mode at that width, so this mirrors the B-operand
+    // transpose used by the AIE2P bf16 matmul MAC pipeline
+    // (createAie2PBf16MatmulViaBfp16 in AIEVecToLLVM.cpp): split into two
+    // 512-bit halves, shuffle each (T16_4X8), then recombine the transposed
+    // halves (T64_2X8_LO / T64_2X8_HI).
+    if (AMDAIE::isAie2P(device) && elemTyBitWidth == 16 && vBitWidth == 1024 &&
+        resShape.back() == 8) {
+      Location loc = transpOp.getLoc();
+      Type elemTy = resTy.getElementType();
+      auto v32Ty = VectorType::get({32}, elemTy);
+      auto v64Ty = VectorType::get({64}, elemTy);
+      Value flat = rewriter.create<vector::ShapeCastOp>(loc, v64Ty,
+                                                        adaptor.getVector());
+      SmallVector<int64_t> loMask, hiMask, concatMask;
+      for (int64_t i = 0; i < 32; ++i) loMask.push_back(i);
+      for (int64_t i = 32; i < 64; ++i) hiMask.push_back(i);
+      for (int64_t i = 0; i < 64; ++i) concatMask.push_back(i);
+      Value lo = rewriter.create<vector::ShuffleOp>(loc, flat, flat, loMask);
+      Value hi = rewriter.create<vector::ShuffleOp>(loc, flat, flat, hiMask);
+      Value loT = rewriter.create<aievec::ShuffleOp>(
+          loc, v32Ty, lo, nullptr, aievec::ShuffleMode::T16_4X8);
+      Value hiT = rewriter.create<aievec::ShuffleOp>(
+          loc, v32Ty, hi, nullptr, aievec::ShuffleMode::T16_4X8);
+      // T64_2X8_LO/HI's mode verifier requires 64-bit elements; this
+      // second-stage shuffle only reassembles pre-transposed 4-bf16 (64-bit)
+      // chunks from the T16_4X8 outputs above, so reinterpreting as i64 here
+      // does not affect which bf16 lanes end up where.
+      auto v8i64Ty = VectorType::get({8}, rewriter.getI64Type());
+      Value loT64 = rewriter.create<vector::BitCastOp>(loc, v8i64Ty, loT);
+      Value hiT64 = rewriter.create<vector::BitCastOp>(loc, v8i64Ty, hiT);
+      Value resLo64 = rewriter.create<aievec::ShuffleOp>(
+          loc, v8i64Ty, loT64, hiT64, aievec::ShuffleMode::T64_2X8_LO);
+      Value resHi64 = rewriter.create<aievec::ShuffleOp>(
+          loc, v8i64Ty, loT64, hiT64, aievec::ShuffleMode::T64_2X8_HI);
+      Value resLo = rewriter.create<vector::BitCastOp>(loc, v32Ty, resLo64);
+      Value resHi = rewriter.create<vector::BitCastOp>(loc, v32Ty, resHi64);
+      Value resFlat =
+          rewriter.create<vector::ShuffleOp>(loc, resLo, resHi, concatMask);
+      rewriter.replaceOpWithNewOp<vector::ShapeCastOp>(transpOp, resTy,
+                                                       resFlat);
+      return success();
+    }
+
+    if (vBitWidth != 512) return failure();
+
+    if (elemTyBitWidth != 8 && elemTyBitWidth != 16 && elemTyBitWidth != 32)
+      return failure();
 
     auto shuffleMode = aievec::ShuffleMode::T32_4X4;
     if (elemTyBitWidth == 8) {
@@ -850,6 +910,13 @@ static void configureAIEVecCommonLegalizations(ConversionTarget &target) {
 static void configureAIEVecV2Legalizations(ConversionTarget &target) {
   target.addLegalOp<UnrealizedConversionCastOp>();
   target.addLegalOp<vector::ShapeCastOp>();
+  // Used by LowerVectorTransposeOpToAIEVecShuffleOpPattern's AIE2P (1024-bit
+  // bf16) case to split/concatenate halves, and to satisfy aievec.shuffle's
+  // per-mode element-bitwidth verifier (T64_2X8_LO/HI require 64-bit
+  // elements); both lower like any other vector op in the generic
+  // vector-to-llvm conversion later on.
+  target.addLegalOp<vector::ShuffleOp>();
+  target.addLegalOp<vector::BitCastOp>();
 
   // A set recording the vector lane size and element width supported
   llvm::SmallSet<std::pair<unsigned, unsigned>, 16> laneSizeElWidthPairSet;
@@ -1080,7 +1147,7 @@ struct LowerVectorToAIEVec : PassWrapper<LowerVectorToAIEVec, OperationPass<>> {
 
     // TODO: Reorder these alphabetically
     patterns.add<LowerVectorTransposeOpToAIEVecShuffleOpPattern>(
-        patterns.getContext());
+        patterns.getContext(), maybeDevice.value());
     patterns.add<LowerVectorContractionOpToAIEVecMatMulPattern>(
         patterns.getContext(), maybeDevice.value());
 

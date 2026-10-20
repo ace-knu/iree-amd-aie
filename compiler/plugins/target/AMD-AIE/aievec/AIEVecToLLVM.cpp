@@ -610,6 +610,158 @@ class SRSOpConversion : public mlir::ConvertOpToLLVMPattern<aievec::SRSOp> {
   }
 };
 
+//===----------------------------------------------------------------------===//
+// AIE2P bf16 matmul, emulated through the bfp16 MAC pipeline
+//===----------------------------------------------------------------------===//
+//
+// AIE2P has no MAC that takes bf16 operands directly (unlike AIE2's
+// `bf.mac16.conf`). The only floating-point-derived MAC format it has is
+// bfp16 (block floating point: a shared 8-bit exponent per 8-lane block plus
+// a per-lane mantissa), and there is no bf16 -> bfp16 intrinsic either:
+// every path to bfp16 goes through the f32 accumulator format first
+// (`...to.v32accfloat`, then `...to.v64bfp16ebs8`).
+//
+// These helpers are deliberately free functions, separate from
+// MatMulOpConversion's `isAie2P` branch: if a future generation (aie2ps?)
+// also lacks a native bf16 MAC but shares this promotion path, its branch
+// can call the same helpers; if it needs a different sequence, it gets its
+// own sibling helper instead of a growing conditional inside one method.
+//===----------------------------------------------------------------------===//
+
+// Emits the AIE2P lowering of `aievec.shuffle` directly (mirrors
+// `ShuffleOpConversion` below), for use as one step inside a larger
+// conversion sequence rather than converting a standalone `aievec.shuffle`
+// op. `rhs` may be null for single-operand shuffle modes.
+static Value createAie2PVShuffle(OpBuilder &builder, Location loc, Value lhs,
+                                 Value rhs, aievec::ShuffleMode mode,
+                                 Type resultType) {
+  Type i32ty = builder.getI32Type();
+  VectorType v16xi32ty = VectorType::get({16}, i32ty);
+  if (!rhs) rhs = LLVM::UndefOp::create(builder, loc, v16xi32ty).getResult();
+  Value modeVal = LLVM::ConstantOp::create(
+                      builder, loc, i32ty,
+                      builder.getI32IntegerAttr(static_cast<int32_t>(mode)))
+                      .getResult();
+  Value shuffled = xllvm::AIEVec2PVectorShuffleIntrOp::create(
+                       builder, loc, v16xi32ty,
+                       forceCastOperandsToSignature(
+                           builder, loc, {lhs, rhs, modeVal},
+                           {v16xi32ty, v16xi32ty, i32ty}))
+                       .getResult();
+  return forceCastValueToType(builder, loc, shuffled, resultType);
+}
+
+// Splits a flat vector<64xbf16> into its low/high vector<32xbf16> halves.
+static std::pair<Value, Value> splitV64Bf16ToHalves(OpBuilder &builder,
+                                                    Location loc, Value v64,
+                                                    Type halfTy) {
+  SmallVector<int32_t> loMask(32), hiMask(32);
+  std::iota(loMask.begin(), loMask.end(), 0);
+  std::iota(hiMask.begin(), hiMask.end(), 32);
+  Value lo =
+      LLVM::ShuffleVectorOp::create(builder, loc, halfTy, v64, v64, loMask)
+          .getResult();
+  Value hi =
+      LLVM::ShuffleVectorOp::create(builder, loc, halfTy, v64, v64, hiMask)
+          .getResult();
+  return {lo, hi};
+}
+
+// Promotes one vector<64xbf16> operand (already split into its low/high
+// vector<32xbf16> halves) to a bfp16 value, returned as
+// {mantissa: vector<64xi8>, exponent: vector<8xi8>}.
+//
+// Mirrors the npu4 ukernel's `load_v64bf16_as_bfp16[_T]`
+// (Target/uKernels/npu4/peano/matmul.cc):
+//   lo, hi : vector<32xbf16>
+//   accLo = v32bf16.to.v32accfloat(lo)           : vector<32xf32>
+//   accHi = v32bf16.to.v32accfloat(hi)           : vector<32xf32>
+//   acc64 = concat(accLo, accHi)                 : vector<64xf32>
+//   {mantissa, exponent} = v64accfloat.to.v64bfp16ebs8(acc64)
+static std::pair<Value, Value> promoteBf16HalvesToBfp16(OpBuilder &builder,
+                                                        Location loc, Value lo,
+                                                        Value hi) {
+  MLIRContext *context = builder.getContext();
+  Type i8Ty = builder.getI8Type();
+  VectorType v32f32Ty = VectorType::get({32}, builder.getF32Type());
+  VectorType v64f32Ty = VectorType::get({64}, builder.getF32Type());
+  VectorType v64i8Ty = VectorType::get({64}, i8Ty);
+  VectorType v8i8Ty = VectorType::get({8}, i8Ty);
+  auto bfp16StructTy =
+      LLVM::LLVMStructType::getLiteral(context, {v64i8Ty, v8i8Ty});
+
+  Value accLo = xllvm::AIEVec2PBF16ToV32AccFloatIntrOp::create(
+                    builder, loc, v32f32Ty, lo)
+                    .getResult();
+  Value accHi = xllvm::AIEVec2PBF16ToV32AccFloatIntrOp::create(
+                    builder, loc, v32f32Ty, hi)
+                    .getResult();
+
+  // v32f32 ++ v32f32 -> v64f32. No AIE2P concat intrinsic is wired up at
+  // this width yet (only AIE2's up-to-1024b ones are, in ConcatI1024I512
+  // above), so this is a plain `llvm.shufflevector`; the backend legalizes
+  // vector concatenation however it does so at this width.
+  SmallVector<int32_t> concatMask(64);
+  std::iota(concatMask.begin(), concatMask.end(), 0);
+  Value acc64 = LLVM::ShuffleVectorOp::create(builder, loc, v64f32Ty, accLo,
+                                              accHi, concatMask)
+                    .getResult();
+
+  Value bfp16 = xllvm::AIEVec2PAccFloatToBFP16IntrOp::create(
+                    builder, loc, bfp16StructTy, acc64)
+                    .getResult();
+  Value mantissa = LLVM::ExtractValueOp::create(builder, loc, v64i8Ty, bfp16,
+                                                ArrayRef<int64_t>{0})
+                       .getResult();
+  Value exponent = LLVM::ExtractValueOp::create(builder, loc, v8i8Ty, bfp16,
+                                                ArrayRef<int64_t>{1})
+                       .getResult();
+  return {mantissa, exponent};
+}
+
+// Lowers a bf16 x bf16 -> f32 `aievec.matmul` on AIE2P by promoting both
+// operands to bfp16 and issuing the bfp16 MAC. `lhs`/`rhs` are
+// vector<64xbf16>, `acc`/the result are vector<64xf32>; `confCst` is the
+// MAC configuration word the caller built for this bfp16 MAC specifically
+// (see the AIE2P branch of MatMulOpConversion: it is not the generic
+// `configuration` computed from the bf16 operand types, since bmode there
+// describes a 16x16 multiplication, not the bfp16 MAC actually issued here).
+static Value createAie2PBf16MatmulViaBfp16(OpBuilder &builder, Location loc,
+                                           Value lhs, Value rhs, Value acc,
+                                           Value confCst) {
+  VectorType v32bf16Ty = VectorType::get({32}, builder.getBF16Type());
+  VectorType v64i32Ty = VectorType::get({64}, builder.getI32Type());
+  VectorType v64f32Ty = VectorType::get({64}, builder.getF32Type());
+
+  // A: no transpose.
+  auto [aLo, aHi] = splitV64Bf16ToHalves(builder, loc, lhs, v32bf16Ty);
+  auto [aMantissa, aExponent] = promoteBf16HalvesToBfp16(builder, loc, aLo, aHi);
+
+  // B: transpose the 8x8 tile before promotion (empirically required -- see
+  // VGG16 e2e correlation history in the aie2p-bf16-vectorized branch: removing
+  // this made correlation against a torch reference WORSE, 0.77 -> 0.057, not
+  // better, so the MAC does consume B pre-transposed regardless of whatever
+  // layout a separate upstream `vector.transpose` may already have applied).
+  // Mirrors the ukernel's `load_v64bf16_as_bfp16_T`.
+  auto [bLo, bHi] = splitV64Bf16ToHalves(builder, loc, rhs, v32bf16Ty);
+  Value bLoT = createAie2PVShuffle(builder, loc, bLo, /*rhs=*/nullptr,
+                                   aievec::ShuffleMode::T16_4X8, v32bf16Ty);
+  Value bHiT = createAie2PVShuffle(builder, loc, bHi, /*rhs=*/nullptr,
+                                   aievec::ShuffleMode::T16_4X8, v32bf16Ty);
+  Value bTLo = createAie2PVShuffle(builder, loc, bLoT, bHiT,
+                                   aievec::ShuffleMode::T64_2X8_LO, v32bf16Ty);
+  Value bTHi = createAie2PVShuffle(builder, loc, bLoT, bHiT,
+                                   aievec::ShuffleMode::T64_2X8_HI, v32bf16Ty);
+  auto [bMantissa, bExponent] = promoteBf16HalvesToBfp16(builder, loc, bTLo, bTHi);
+
+  Value accI32 = bitcastValueToType(builder, loc, acc, v64i32Ty);
+  Value macResI32 = xllvm::AIEVec2PBFP16MacConfIntrOp::create(
+                        builder, loc, v64i32Ty, aMantissa, aExponent,
+                        bMantissa, bExponent, accI32, confCst)
+                        .getResult();
+  return bitcastValueToType(builder, loc, macResI32, v64f32Ty);
+}
+
 class MatMulOpConversion
     : public mlir::ConvertOpToLLVMPattern<aievec::MatMulOp> {
   using ConvertOpToLLVMPattern<aievec::MatMulOp>::ConvertOpToLLVMPattern;
@@ -667,13 +819,30 @@ class MatMulOpConversion
     Value matMulResVal;
 
     if (isa<Float32Type>(accVecTy.getElementType())) {
-      if (!AMDAIE::isAie2(device)) {
-        llvm_unreachable(
-            "no support for float matmul except for AIE2, for now");
+      if (AMDAIE::isAie2P(device)) {
+        // AIE2P has no native bf16 MAC (unlike AIE2's `bf.mac16.conf` used
+        // below), so this goes through the bfp16 MAC pipeline instead; see
+        // createAie2PBf16MatmulViaBfp16. The `configuration`/`confCst` built
+        // above describe a 16x16 multiplication (from the bf16 operand
+        // types) and do not apply to the bfp16 MAC actually issued here, so
+        // build that MAC's own configuration word: signed x/y, amode=2
+        // (32b float accumulator lanes), bmode=1 (the bfp16 MAC's mode).
+        DataPathConfiguration bfp16Configuration{/*xSigned=*/true,
+                                                 /*ySigned=*/true,
+                                                 /*aMode=*/2, /*bMode=*/1,
+                                                 /*cMode=*/0};
+        Value bfp16ConfCst = LLVM::ConstantOp::create(
+            rewriter, loc, i32ty,
+            rewriter.getI32IntegerAttr(bfp16Configuration.get()));
+        matMulResVal = createAie2PBf16MatmulViaBfp16(rewriter, loc, lhs, rhs,
+                                                     acc, bfp16ConfCst);
+      } else if (AMDAIE::isAie2(device)) {
+        matMulResVal =
+            forceCastOperandsAndCreateTarget<xllvm::AIEVec2MacConfBF16IntrOp>(
+                rewriter, loc, {lhs, rhs, acc, confCst});
+      } else {
+        llvm_unreachable("no support for float matmul on this device, for now");
       }
-      matMulResVal =
-          forceCastOperandsAndCreateTarget<xllvm::AIEVec2MacConfBF16IntrOp>(
-              rewriter, loc, {lhs, rhs, acc, confCst});
     } else {
       // In the case that it's i32 accumulation.
       if (AMDAIE::isAie2P(device)) {
@@ -741,27 +910,42 @@ class ShuffleOpConversion
   LogicalResult matchAndRewrite(
       aievec::ShuffleOp shuffleOp, OpAdaptor adaptor,
       ConversionPatternRewriter &rewriter) const override {
-    assert(AMDAIE::isAie2(device) && "ShuffleOp currently only supports AIE2.");
+    bool isAie2 = AMDAIE::isAie2(device);
+    bool isAie2P = AMDAIE::isAie2P(device);
+    if (!isAie2 && !isAie2P) {
+      return rewriter.notifyMatchFailure(
+          shuffleOp, "aievec.shuffle is only lowered for AIE2 and AIE2P");
+    }
     auto loc = shuffleOp.getLoc();
     auto lhs = adaptor.getLhs();
     auto rhs = adaptor.getRhs();
     auto i32ty = rewriter.getI32Type();
     auto v16xi32ty = VectorType::get({16}, i32ty);
     if (!rhs) {
-      rhs = xllvm::AIEVec2UndefV16I32IntrOp::create(rewriter, loc, v16xi32ty);
+      // Single-operand modes ignore the second operand. AIE2 has a dedicated
+      // undef intrinsic for it; AIE2P has none, so use a plain LLVM undef.
+      rhs = isAie2
+                ? xllvm::AIEVec2UndefV16I32IntrOp::create(rewriter, loc,
+                                                          v16xi32ty)
+                      .getResult()
+                : LLVM::UndefOp::create(rewriter, loc, v16xi32ty).getResult();
     }
 
     auto modeAttrVal =
         LLVM::ConstantOp::create(rewriter, loc, i32ty,
                                  static_cast<int32_t>(shuffleOp.getMode()))
             .getResult();
-    auto vShuffleVal = xllvm::AIEVec2VectorShuffleIntrOp::create(
-                           rewriter, loc, v16xi32ty,
-                           forceCastOperandsToSignature(
-                               rewriter, loc,
-                               /*operands=*/{lhs, rhs, modeAttrVal},
-                               /*signature=*/{v16xi32ty, v16xi32ty, i32ty}))
-                           .getResult();
+    SmallVector<Value> operands = forceCastOperandsToSignature(
+        rewriter, loc,
+        /*operands=*/{lhs, rhs, modeAttrVal},
+        /*signature=*/{v16xi32ty, v16xi32ty, i32ty});
+    Value vShuffleVal =
+        isAie2 ? xllvm::AIEVec2VectorShuffleIntrOp::create(rewriter, loc,
+                                                          v16xi32ty, operands)
+                     .getResult()
+               : xllvm::AIEVec2PVectorShuffleIntrOp::create(
+                     rewriter, loc, v16xi32ty, operands)
+                     .getResult();
 
     vShuffleVal = forceCastValueToType(rewriter, loc, vShuffleVal,
                                        shuffleOp.getResult().getType());
