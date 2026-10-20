@@ -66,15 +66,12 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
   //    row must be false.
   if (srcBackend == "llvm-cpu" && dstBackend == "vulkan-spirv")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
-  //  - vulkan-spirv -> llvm-cpu is declared true as the target behavior: the
-  //    Vulkan allocator can import a host pointer (HOST_ALLOCATION via
-  //    VK_EXT_external_memory_host).
-  //    TODO: not honored at runtime yet. The dispatch binding bridge in
-  //    vulkan/direct_command_buffer.cc only requests OPAQUE_FD from the
-  //    owning allocator; the heap allocator cannot export that, so a
-  //    CPU-owned buffer bound to a GPU dispatch fails ("export failed",
-  //    segfault; cpu_gpu_reduce with lead=0). Add a HOST_ALLOCATION fallback
-  //    there before relying on this row.
+  //  - vulkan-spirv -> llvm-cpu is true. The Vulkan allocator imports a host
+  //    pointer (HOST_ALLOCATION via VK_EXT_external_memory_host), and the
+  //    shared buffer bridge (resolve_buffer_ref in
+  //    vulkan/direct_command_buffer.cc, used by dispatch/copy/fill/update)
+  //    maps a local-task/heap buffer for its host pointer and imports it.
+  //    Verified: cg_topo with lead=0 (CPU-owned buffer read by the GPU) -> 2.
   if (srcBackend == "vulkan-spirv" && dstBackend == "llvm-cpu")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
 
