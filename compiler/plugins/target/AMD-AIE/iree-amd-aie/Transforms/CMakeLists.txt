@@ -50,6 +50,7 @@ iree_cc_library(
     "AMDAIEAssignConnectionTypes.cpp"
     "AMDAIEAssignDeviceAffinities.cpp"
     "AMDAIEResolveBufferOwner.cpp"
+    "AMDAIEAnnotateInputDevices.cpp"
     "AMDAIEAssignLogicalObjectFifoDepth.cpp"
     "AMDAIEAssignNpuDmaBdIds.cpp"
     "AMDAIEAssignPacketIds.cpp"

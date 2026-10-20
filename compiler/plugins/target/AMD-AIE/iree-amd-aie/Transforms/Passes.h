@@ -85,6 +85,10 @@ std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass();
 std::unique_ptr<Pass> createAMDAIEResolveBufferOwnerPass();
 
+/// Create a pass that records per-argument input device IDs
+/// (`amdaie.input_devices`) in the reflection of public entry points.
+std::unique_ptr<Pass> createAMDAIEAnnotateInputDevicesPass();
+
 /// Create a pass to pad the operands of NPU contraction dispatches up to the
 /// target's pack-peel tile multiples (so divisibility holds inside the
 /// dispatch), inserting the padding at the Flow dispatch boundary.

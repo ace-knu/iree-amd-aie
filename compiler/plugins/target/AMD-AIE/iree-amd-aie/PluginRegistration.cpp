@@ -74,6 +74,10 @@ struct AMDAIESession
     // Resolve optimal<[...]> buffer owners from stream.topology (replaces the
     // runtime "amdxdna" rule). No-op without a topology or on ties.
     passManager.addPass(AMDAIE::createAMDAIEResolveBufferOwnerPass());
+    // Record per-argument input devices (amdaie.input_devices reflection) from
+    // the now-final stream.tensor.import affinities, so tooling can place
+    // inputs without --input_device. Attribute-only; no-op without topology.
+    passManager.addPass(AMDAIE::createAMDAIEAnnotateInputDevicesPass());
   }
 
   void extendFlowTransformPassPipeline(OpPassManager &passManager) override {

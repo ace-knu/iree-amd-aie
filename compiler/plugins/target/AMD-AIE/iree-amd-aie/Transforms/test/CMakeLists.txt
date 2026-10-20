@@ -10,6 +10,7 @@ iree_lit_test_suite(
   SRCS
     "access_to_acquire_release.mlir"
     "aie_link_executables.mlir"
+    "annotate_input_devices.mlir"
     "acquire_release_to_use_lock.mlir"
     "assign_bd_ids.mlir"
     "assign_buffer_address.mlir"

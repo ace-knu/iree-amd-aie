@@ -94,6 +94,13 @@ def AMDAIEResolveBufferOwner :
       "mlir::iree_compiler::AMDAIE::createAMDAIEResolveBufferOwnerPass()";
 }
 
+def AMDAIEAnnotateInputDevices :
+    Pass<"iree-amdaie-annotate-input-devices", "ModuleOp"> {
+  let summary = "Record per-argument input device IDs (amdaie.input_devices) in the iree.reflection of public entry points, chosen from the stream.tensor.import affinities with the stream.topology owner rule, so tooling can place inputs without --input_device.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEAnnotateInputDevicesPass()";
+}
+
 def AMDAIEPadContractionDispatches :
     Pass<"iree-amdaie-pad-contraction-dispatches", "ModuleOp"> {
   let summary = "Pad NPU contraction dispatch operands up to the target pack-peel tile multiples at the Flow dispatch boundary (target-known, via each dispatch's device affinity).";
