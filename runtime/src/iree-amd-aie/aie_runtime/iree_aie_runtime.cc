@@ -620,6 +620,18 @@ std::optional<std::string> AMDAIEDeviceModel::getTargetArchString() const {
   }
 }
 
+std::optional<uint32_t> AMDAIEDeviceModel::getRoundingModeCtrlReg() const {
+  // `crRnd` from Peano's aiev2_defines.h / aie2p_defines.h.
+  switch (configPtr.AieGen) {
+    case XAIE_DEV_GEN_AIE2IPU:
+      return 6;
+    case XAIE_DEV_GEN_AIE2P_STRIX_B0:
+      return 1;
+    default:
+      return std::nullopt;
+  }
+}
+
 uint32_t AMDAIEDeviceModel::getColumnShift() const {
   return configPtr.ColShift;
 }

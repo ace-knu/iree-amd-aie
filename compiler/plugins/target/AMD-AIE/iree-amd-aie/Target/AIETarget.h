@@ -40,6 +40,10 @@ struct AMDAIEOptions {
   // some flags may replace existing flags if they conflict.
   std::string additionalPeanoOptFlags;
 
+  // Rounding mode written to the rounding control register (crRnd) at the
+  // start of every core (peano only). See `amdaie-standard-lowering`.
+  std::string coreRoundingMode{"auto"};
+
   // Print IR after all MLIR passes run in aie2xclbin (to stderr).
   bool aie2xclbinPrintIrAfterAll{false};
 
@@ -121,6 +125,16 @@ struct AMDAIEOptions {
         llvm::cl::cat(category),
         llvm::cl::desc("Additional flags for peano's opt. Example: "
                        "\"-O3 --magic-flag\"."));
+
+    binder.opt<std::string>(
+        "iree-amdaie-core-rounding-mode", coreRoundingMode,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Rounding mode written to the core rounding control register "
+            "(crRnd) as the first operation of every core (peano only). "
+            "'auto' (default): conv_even on AIE2P, nothing on AIE2. 'none': "
+            "never written. Otherwise one of floor, ceil, sym_floor, sym_ceil, "
+            "neg_inf, pos_inf, sym_zero, sym_inf, conv_even, conv_odd."));
 
     binder.opt<std::string>(
         "iree-amd-aie-install-dir", amdAieInstallDir, llvm::cl::cat(category),

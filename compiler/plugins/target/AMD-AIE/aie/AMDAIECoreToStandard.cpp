@@ -7,6 +7,7 @@
 #include "AIEDialect.h"
 #include "Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -114,8 +115,35 @@ static void bufferToStd(ModuleOp module, BufferOp buffer,
   rewriter.eraseOp(buffer);
 }
 
+/// Value to write to the rounding control register (`crRnd`) at the start of
+/// every core function. `setCtrlReg` is the `llvm.<arch>.set.ctrl.reg`
+/// declaration.
+struct CoreRoundingMode {
+  func::FuncOp setCtrlReg;
+  uint32_t ctrlReg;
+  uint32_t value;
+};
+
+/// Rounding mode encodings, shared by AIE2 and AIE2P (`rnd_*` in Peano's
+/// aiev2_defines.h / aie2p_defines.h).
+static std::optional<uint32_t> getRoundingModeValue(StringRef mode) {
+  return llvm::StringSwitch<std::optional<uint32_t>>(mode)
+      .Case("floor", 0)
+      .Case("ceil", 1)
+      .Case("sym_floor", 2)
+      .Case("sym_ceil", 3)
+      .Case("neg_inf", 8)
+      .Case("pos_inf", 9)
+      .Case("sym_zero", 10)
+      .Case("sym_inf", 11)
+      .Case("conv_even", 12)
+      .Case("conv_odd", 13)
+      .Default(std::nullopt);
+}
+
 static void coreToStd(CoreOp coreOp, IRRewriter &rewriter, int tileCol,
-                      int tileRow) {
+                      int tileRow,
+                      const std::optional<CoreRoundingMode> &roundingMode) {
   TileOp t = getTileOp(*coreOp);
   int col = t.getCol();
   int row = t.getRow();
@@ -138,6 +166,21 @@ static void coreToStd(CoreOp coreOp, IRRewriter &rewriter, int tileCol,
   IRMapping mapper;
   rewriter.cloneRegionBefore(coreOp.getBody(), coreFunc.getBody(),
                              coreFunc.getBody().begin(), mapper);
+
+  // Set the rounding mode before anything else runs on the core, so that every
+  // SRS / float-to-bf16 / float-to-bfp16 conversion in the core (including
+  // those in linked ukernels) sees it.
+  if (roundingMode.has_value()) {
+    rewriter.setInsertionPointToStart(&coreFunc.getBody().front());
+    Location loc = coreOp.getLoc();
+    IntegerType i32 = rewriter.getI32Type();
+    SmallVector<Value, 2> args{
+        rewriter.create<arith::ConstantOp>(
+            loc, i32, rewriter.getI32IntegerAttr(roundingMode->ctrlReg)),
+        rewriter.create<arith::ConstantOp>(
+            loc, i32, rewriter.getI32IntegerAttr(roundingMode->value))};
+    rewriter.create<func::CallOp>(loc, roundingMode->setCtrlReg, args);
+  }
 
   // Rewrite the AIE.end op
   coreFunc.getBody().walk([&](EndOp endOp) {
@@ -230,6 +273,42 @@ struct AMDAIECoreToStandardPass
     std::string targetArchStr =
         lowerToChess ? "aie2" : StringRef(targetArch.value()).lower();
 
+    // Resolve the core rounding mode: 'auto' is conv_even on AIE2P (whose
+    // bf16 matmul lowering converts operands to bfp16, which reads crRnd) and
+    // nothing on AIE2.
+    std::optional<uint32_t> roundingValue;
+    StringRef mode = roundingMode;
+    bool explicitMode = mode != "auto" && mode != "none";
+    if (explicitMode) {
+      roundingValue = getRoundingModeValue(mode);
+      if (!roundingValue.has_value()) {
+        deviceOp.emitError() << "unknown rounding mode '" << mode
+                             << "' (expected auto, none, floor, ceil, "
+                                "sym_floor, sym_ceil, neg_inf, pos_inf, "
+                                "sym_zero, sym_inf, conv_even or conv_odd)";
+        return signalPassFailure();
+      }
+    } else if (mode == "auto" && isAie2P(deviceModel.device)) {
+      roundingValue = getRoundingModeValue("conv_even");
+    }
+    std::optional<uint32_t> roundingCtrlReg =
+        deviceModel.getRoundingModeCtrlReg();
+    if (roundingValue.has_value() && lowerToChess) {
+      // Not supported on the chess path: chess uses its own intrinsic names.
+      if (explicitMode) {
+        deviceOp.emitWarning()
+            << "rounding mode '" << mode
+            << "' is ignored when lowering to chess";
+      }
+      roundingValue = std::nullopt;
+    }
+    if (roundingValue.has_value() && !roundingCtrlReg.has_value()) {
+      deviceOp.emitError()
+          << "has no rounding control register; rounding mode '" << mode
+          << "' cannot be set";
+      return signalPassFailure();
+    }
+
     MLIRContext *ctx = &getContext();
     IRRewriter rewriter(ctx);
     rewriter.setInsertionPointToEnd(m.getBody());
@@ -249,7 +328,21 @@ struct AMDAIECoreToStandardPass
 
     if (!coresAreIsolated(m)) return signalPassFailure();
 
-    m.walk([&](CoreOp coreOp) { coreToStd(coreOp, rewriter, -1, -1); });
+    std::optional<CoreRoundingMode> coreRoundingMode;
+    if (roundingValue.has_value()) {
+      rewriter.setInsertionPointToEnd(m.getBody());
+      auto setCtrlReg = rewriter.create<func::FuncOp>(
+          rewriter.getUnknownLoc(), "llvm." + targetArchStr + ".set.ctrl.reg",
+          FunctionType::get(ctx, {rewriter.getI32Type(), rewriter.getI32Type()},
+                            {}),
+          StringAttr::get(ctx, "private"), ArrayAttr{}, ArrayAttr{});
+      coreRoundingMode =
+          CoreRoundingMode{setCtrlReg, *roundingCtrlReg, *roundingValue};
+    }
+
+    m.walk([&](CoreOp coreOp) {
+      coreToStd(coreOp, rewriter, -1, -1, coreRoundingMode);
+    });
 
     // Move all the func.func ops and memref.globals from device to module.
     outlineOps<memref::GlobalOp>(deviceOp);
