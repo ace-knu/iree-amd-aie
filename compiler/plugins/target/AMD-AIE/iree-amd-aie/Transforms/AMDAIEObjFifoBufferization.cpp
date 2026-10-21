@@ -4,16 +4,73 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <numeric>
+
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEDmaUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree-amd-aie/aie_runtime/Utils/LockIdGenerator.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 
 #define DEBUG_TYPE "iree-amdaie-obj-fifo-bufferization"
 
 namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
+
+/// Whether the producers of `logicalObjFifo` write slices that tile its single
+/// consumer's transfer contiguously and in increasing offset order: their base
+/// offsets are `consumerOffset + i * sliceLength`. This mirrors the check in
+/// `connectionToAIE` (AMDAIELowerToAIE.cpp) that guards splitting the
+/// consumer's transfer into one BD per producer slice. Layouts that fail it,
+/// like the interleaved slices of 4-level tiling, keep the shared lock pair.
+static bool producersTileConsumerInOrder(
+    AMDAIE::LogicalObjectFifoFromMemrefOp logicalObjFifo,
+    ArrayRef<CopyOpInterface> producers, CopyOpInterface consumer) {
+  SmallVector<size_t> offsets;
+  for (CopyOpInterface producer : producers) {
+    auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(producer.getOperation());
+    if (!connectionOp) return false;
+    FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> dmaOp =
+        connectionOp.getNpuCircularDmaCpyNdUser();
+    if (failed(dmaOp)) return false;
+    std::optional<size_t> offset = dmaOp->getTargetStaticBaseOffset();
+    if (!offset) return false;
+    offsets.push_back(offset.value());
+  }
+  llvm::sort(offsets);
+  offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+  if (offsets.size() != producers.size()) return false;
+
+  auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(consumer.getOperation());
+  if (!connectionOp) return false;
+  FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> dmaOp =
+      connectionOp.getNpuCircularDmaCpyNdUser();
+  if (failed(dmaOp)) return false;
+  std::optional<size_t> consumerOffset = dmaOp->getSourceStaticBaseOffset();
+  if (!consumerOffset) return false;
+  FailureOr<size_t> repetitionCount = getRepetitionCount(
+      cast<LogicalObjFifoOpInterface>(logicalObjFifo.getOperation()));
+  if (failed(repetitionCount)) return false;
+  SmallVector<OpFoldResult> sizes = dmaOp->getSourceMixedSizes();
+  SmallVector<OpFoldResult> strides = dmaOp->getSourceMixedStrides();
+  if (failed(foldRepetitionCount(logicalObjFifo.getContext(), sizes, strides,
+                                 repetitionCount.value())))
+    return false;
+  std::optional<SmallVector<int64_t>> staticSizes = getConstantIntValues(sizes);
+  if (!staticSizes) return false;
+  int64_t totalLength =
+      std::accumulate(staticSizes->begin(), staticSizes->end(), int64_t{1},
+                      std::multiplies<>());
+  int64_t numProducers = static_cast<int64_t>(producers.size());
+  if (totalLength % numProducers != 0) return false;
+  size_t sliceLength = static_cast<size_t>(totalLength / numProducers);
+  for (auto [i, offset] : llvm::enumerate(offsets)) {
+    if (offset != consumerOffset.value() + i * sliceLength) return false;
+  }
+  return true;
+}
 
 LogicalResult bufferize(AMDAIE::WorkgroupOp workgroupOp) {
   IRRewriter rewriter(workgroupOp->getContext());
@@ -86,10 +143,15 @@ LogicalResult bufferize(AMDAIE::WorkgroupOp workgroupOp) {
         //
         // The mirrored single-producer/multi-consumer case keeps the scaled
         // single pair; it has the same weakness, but is not exercised by the
-        // workloads this was written for.
+        // workloads this was written for. So do producers whose slices don't
+        // tile the consumer's transfer contiguously (see
+        // `producersTileConsumerInOrder`).
         size_t numProducers = copyLikeProducers.size();
         size_t numConsumers = copyLikeConsumers.size();
-        bool lockPairPerProducer = numProducers > 1 && numConsumers == 1;
+        bool lockPairPerProducer =
+            numProducers > 1 && numConsumers == 1 &&
+            producersTileConsumerInOrder(logicalObjFifo, copyLikeProducers,
+                                         copyLikeConsumers[0]);
         size_t numLockPairs = lockPairPerProducer ? numProducers : 1;
         int8_t consumerLockInitValue{0};
         int8_t producerLockInitValue =

@@ -163,3 +163,85 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
     return
   }
 }
+
+// -----
+
+// Two cores each write one contiguous half of a memtile buffer that a single
+// DMA reads back in order, so every core gets its own lock pair of `depth`
+// credits.
+// CHECK-LABEL: @multi_producer_contiguous
+// CHECK:         %[[TILE_0_1:tile_0_1]] = amdaie.tile
+// CHECK:         amdaie.lock(%[[TILE_0_1]](0), 2)
+// CHECK-NEXT:    amdaie.lock(%[[TILE_0_1]](1), 0)
+// CHECK-NEXT:    amdaie.lock(%[[TILE_0_1]](2), 2)
+// CHECK-NEXT:    amdaie.lock(%[[TILE_0_1]](3), 0)
+// CHECK-NEXT:    amdaie.tile
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @multi_producer_contiguous(%arg0: memref<1024xi32>, %arg1: memref<1024xi32, 1 : i32>, %arg2: memref<512xi32, 2 : i32>, %arg3: memref<512xi32, 2 : i32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    amdaie.workgroup {
+      %tile_0_0 = amdaie.tile(%c0, %c0)
+      %tile_0_1 = amdaie.tile(%c0, %c1)
+      %tile_0_2 = amdaie.tile(%c0, %c2)
+      %tile_0_3 = amdaie.tile(%c0, %c3)
+      %0 = amdaie.logicalobjectfifo.from_memref %arg0, {%tile_0_0} : memref<1024xi32> -> !amdaie.logicalobjectfifo<memref<1024xi32>, 2>
+      %1 = amdaie.logicalobjectfifo.from_memref %arg1, {%tile_0_1} : memref<1024xi32, 1 : i32> -> !amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>
+      %2 = amdaie.logicalobjectfifo.from_memref %arg2, {%tile_0_2} : memref<512xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>
+      %3 = amdaie.logicalobjectfifo.from_memref %arg3, {%tile_0_3} : memref<512xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>
+      %4 = amdaie.connection(%1, %2) : (!amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>)
+      %5 = amdaie.connection(%1, %3) : (!amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>)
+      %6 = amdaie.connection(%0, %1) : (!amdaie.logicalobjectfifo<memref<1024xi32>, 2>, !amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>)
+      amdaie.controlcode {
+        %7 = amdaie.npu.circular_dma_cpy_nd %4([0] [512] [1], [0] [512] [1])
+        %8 = amdaie.npu.circular_dma_cpy_nd %5([512] [512] [1], [0] [512] [1])
+        %9 = amdaie.npu.circular_dma_cpy_nd %6([] [] [], [0] [1024] [1])
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// The same two cores write interleaved chunks instead (as 4-level tiling
+// does). One BD per core can't read those back in order, so the cores keep
+// sharing a single lock pair scaled by the producer count.
+// CHECK-LABEL: @multi_producer_interleaved
+// CHECK:         %[[TILE_0_1:tile_0_1]] = amdaie.tile
+// CHECK:         amdaie.lock(%[[TILE_0_1]](0), 4)
+// CHECK-NEXT:    amdaie.lock(%[[TILE_0_1]](1), 0)
+// CHECK-NEXT:    amdaie.tile
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @multi_producer_interleaved(%arg0: memref<1024xi32>, %arg1: memref<1024xi32, 1 : i32>, %arg2: memref<512xi32, 2 : i32>, %arg3: memref<512xi32, 2 : i32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    amdaie.workgroup {
+      %tile_0_0 = amdaie.tile(%c0, %c0)
+      %tile_0_1 = amdaie.tile(%c0, %c1)
+      %tile_0_2 = amdaie.tile(%c0, %c2)
+      %tile_0_3 = amdaie.tile(%c0, %c3)
+      %0 = amdaie.logicalobjectfifo.from_memref %arg0, {%tile_0_0} : memref<1024xi32> -> !amdaie.logicalobjectfifo<memref<1024xi32>, 2>
+      %1 = amdaie.logicalobjectfifo.from_memref %arg1, {%tile_0_1} : memref<1024xi32, 1 : i32> -> !amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>
+      %2 = amdaie.logicalobjectfifo.from_memref %arg2, {%tile_0_2} : memref<512xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>
+      %3 = amdaie.logicalobjectfifo.from_memref %arg3, {%tile_0_3} : memref<512xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>
+      %4 = amdaie.connection(%1, %2) : (!amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>)
+      %5 = amdaie.connection(%1, %3) : (!amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<512xi32, 2 : i32>, 2>)
+      %6 = amdaie.connection(%0, %1) : (!amdaie.logicalobjectfifo<memref<1024xi32>, 2>, !amdaie.logicalobjectfifo<memref<1024xi32, 1 : i32>, 2>)
+      amdaie.controlcode {
+        %7 = amdaie.npu.circular_dma_cpy_nd %4([0, 0] [2, 256] [512, 1], [0] [512] [1])
+        %8 = amdaie.npu.circular_dma_cpy_nd %5([0, 256] [2, 256] [512, 1], [0] [512] [1])
+        %9 = amdaie.npu.circular_dma_cpy_nd %6([] [] [], [0] [1024] [1])
+        amdaie.end
+      }
+    }
+    return
+  }
+}
