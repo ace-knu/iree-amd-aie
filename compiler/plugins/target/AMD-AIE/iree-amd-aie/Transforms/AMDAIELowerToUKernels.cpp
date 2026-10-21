@@ -44,16 +44,24 @@ struct FnNameAndDefAttrs {
 };
 
 /// Returns the function name and attributes to use for a ukernel with given
-/// `ukernelName` on the target described by `targetAttr`.
-static FnNameAndDefAttrs getFnNameAndDefAttrs(RewriterBase &rewriter,
-                                              std::string ukernelName,
-                                              std::string inputOutputElemType,
-                                              std::string ukernelObjectFile) {
+/// `ukernelName` on the target described by `targetAttr`. `instanceArgs` are
+/// the template arguments the ukernel source needs to define this function;
+/// they are recorded with the name in a `ukernel_instance` attribute, which the
+/// ukernel compilation turns into the instance list of the source file.
+static FnNameAndDefAttrs getFnNameAndDefAttrs(
+    RewriterBase &rewriter, std::string ukernelName,
+    std::string inputOutputElemType, std::string ukernelObjectFile,
+    ArrayRef<std::string> instanceArgs) {
   FnNameAndDefAttrs result;
   std::string ukernelSuffix = "";
   result.name = ukernelName + ukernelSuffix + "_" + inputOutputElemType;
   result.defAttrs.emplace_back(rewriter.getStringAttr("link_with"),
                                rewriter.getStringAttr(ukernelObjectFile));
+  SmallVector<Attribute> instance{rewriter.getStringAttr(result.name)};
+  for (const std::string &arg : instanceArgs)
+    instance.push_back(rewriter.getStringAttr(arg));
+  result.defAttrs.emplace_back(rewriter.getStringAttr("ukernel_instance"),
+                               rewriter.getArrayAttr(instance));
   return result;
 }
 
@@ -96,7 +104,17 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
   if (!linalgOp) {
     return rewriter.notifyMatchFailure(op, "is not a linalg operation");
   }
-  if (!isMatmul(linalgOp)) {
+  // A transposed B is read as [n][k] blocks. Each element type combination has
+  // its own ukernel template, and each template supports a transposed B on its
+  // own, so this is limited to what the ukernel sources implement: only the
+  // bf16 x bf16 -> f32 template of npu4 for now. Any other combination stays on
+  // the non-ukernel path instead of failing the ukernel compilation.
+  // TODO: The goal is every element type combination the hardware supports,
+  // with and without a transposed B. When a template is added or gains
+  // transposed B support in uKernels/<npu>/peano/matmul.cc, extend the check
+  // below to match.
+  bool transposeB = isMatmulTransposeB(linalgOp);
+  if (!isMatmul(linalgOp) && !transposeB) {
     return rewriter.notifyMatchFailure(op, "is not a matmul-like operation");
   }
 
@@ -122,6 +140,15 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
     return rewriter.notifyMatchFailure(
         op, "tile needs an even number of vector instructions in M and N");
   }
+  if (transposeB) {
+    std::optional<AMDAIEDevice> device =
+        getConfigAMDAIEDevice(IREE::HAL::ExecutableTargetAttr::lookup(op));
+    if (!device || !isAie2P(*device) || !lhsElemType.isBF16() ||
+        !rhsElemType.isBF16() || !outElemType.isF32()) {
+      return rewriter.notifyMatchFailure(
+          op, "transposed B is only supported for bf16 x bf16 -> f32 on npu4");
+    }
+  }
   std::string inputOutputElemTypeAndSize =
       typeToString(lhsElemType) + "_" + typeToString(rhsElemType) + "_" +
       typeToString(outElemType) + "_" + std::to_string(M) + "x" +
@@ -129,7 +156,12 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
       "x" + std::to_string(s) + "x" + std::to_string(t);
 
   FnNameAndDefAttrs fn = getFnNameAndDefAttrs(
-      rewriter, ukernelName, inputOutputElemTypeAndSize, ukernelObjectName);
+      rewriter, transposeB ? ukernelName + "_tb" : ukernelName,
+      inputOutputElemTypeAndSize, ukernelObjectName,
+      {typeToString(lhsElemType), typeToString(rhsElemType),
+       typeToString(outElemType), std::to_string(M), std::to_string(N),
+       std::to_string(K), std::to_string(r), std::to_string(s),
+       std::to_string(t), transposeB ? "true" : "false"});
 
   // Create UKernel for AMD-AIE.
   Location loc = linalgOp.getLoc();
@@ -173,7 +205,8 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
                                 std::to_string(M) + "x" + std::to_string(N);
 
   FnNameAndDefAttrs fn = getFnNameAndDefAttrs(
-      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName);
+      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName,
+      {typeToString(outElemType), std::to_string(M), std::to_string(N)});
 
   // Create UKernel for AMD-AIE.
   Location loc = fillOp.getLoc();
@@ -248,7 +281,9 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchTruncIDAGForUKernel(
                                 std::to_string(M) + "x" + std::to_string(N);
 
   FnNameAndDefAttrs fn = getFnNameAndDefAttrs(
-      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName);
+      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName,
+      {typeToString(inElemType), typeToString(outElemType), std::to_string(M),
+       std::to_string(N)});
 
   // Create UKernel for AMD-AIE.
   Location loc = linalgOp.getLoc();
@@ -278,7 +313,9 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchSoftmaxDAGForUKernel(
                                 std::to_string(outType.getDimSize(1));
 
   FnNameAndDefAttrs fn = getFnNameAndDefAttrs(
-      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName);
+      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName,
+      {typeToString(outElemType), std::to_string(outType.getDimSize(0)),
+       std::to_string(outType.getDimSize(1))});
 
   // Create UKernel for AMD-AIE.
   Location loc = softmaxOp.getLoc();

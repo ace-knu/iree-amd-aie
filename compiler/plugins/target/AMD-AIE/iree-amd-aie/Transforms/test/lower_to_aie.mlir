@@ -898,8 +898,8 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
 // -----
 
 // CHECK:   aie.device
-// CHECK:     func.func private @ukernel_B(memref<i32, 2 : i32>, index, memref<f32, 2 : i32>, index) attributes {llvm.bareptr = true}
-// CHECK:     func.func private @ukernel_A(memref<i32, 2 : i32>, index) attributes {llvm.bareptr = true}
+// CHECK:     func.func private @ukernel_B(memref<i32, 2 : i32>, index, memref<f32, 2 : i32>, index) attributes {link_with = "ukernelB.o", llvm.bareptr = true, ukernel_instance = ["ukernel_B", "i32", "f32"]}
+// CHECK:     func.func private @ukernel_A(memref<i32, 2 : i32>, index) attributes {link_with = "ukernelA.o", llvm.bareptr = true}
 // CHECK:     %[[TILE_0_2:.*]] = aie.tile(0, 2)
 // CHECK:     %[[BUFFER_0_2:.*]] = aie.buffer(%[[TILE_0_2]]) {sym_name = "buff_0"} : memref<4096xi32, 2 : i32>
 // CHECK:     %[[LOCK_0_2:.*]] = aie.lock(%[[TILE_0_2]], 0) {init = 1 : i8, sym_name = "lock_0"}
@@ -924,7 +924,7 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
 #executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
 module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
   func.func private @ukernel_A(memref<i32, 2 : i32>, index) attributes {link_with = "ukernelA.o", llvm.bareptr = true}
-  func.func private @ukernel_B(memref<i32, 2 : i32>, index, memref<f32, 2 : i32>, index) attributes {link_with = "ukernelB.o", llvm.bareptr = true}
+  func.func private @ukernel_B(memref<i32, 2 : i32>, index, memref<f32, 2 : i32>, index) attributes {link_with = "ukernelB.o", llvm.bareptr = true, ukernel_instance = ["ukernel_B", "i32", "f32"]}
   func.func @core_ukernel() {
     amdaie.workgroup {
       %c0 = arith.constant 0 : index

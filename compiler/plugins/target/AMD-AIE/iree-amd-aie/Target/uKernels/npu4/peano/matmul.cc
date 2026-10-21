@@ -137,7 +137,7 @@ void matmul_vectorized_i8_i32(const int8 *__restrict pA, unsigned offsetA,
   }
 }
 
-template <unsigned m, unsigned k, unsigned n>
+template <unsigned m, unsigned k, unsigned n, bool TransposeB>
 void matmul_vectorized_8x8x8_i8_i8_i32(const int8 *__restrict pA,
                                        unsigned offsetA,
                                        const int8 *__restrict pB,
@@ -146,6 +146,7 @@ void matmul_vectorized_8x8x8_i8_i8_i32(const int8 *__restrict pA,
   constexpr int r = 8;
   constexpr int s = 8;
   constexpr int t = 8;
+  static_assert(!TransposeB, "The i8 ukernel has no transposed B support.");
   static_assert(m / r > 0,
                 "There should be at least one iteration on the M dimension.");
   static_assert(
@@ -183,14 +184,31 @@ v64bfp16ebs8 load_v64bf16_as_bfp16_T(const bfloat16 *__restrict p) {
   return to_v64bfp16ebs8(accum);
 }
 
+// A B block is [k][n] without a transposed B, which `mac_8x8_8x8T` needs
+// transposed, and already [n][k] with one.
+template <bool TransposeB>
+v64bfp16ebs8 load_B_v64bf16_as_bfp16(const bfloat16 *__restrict p) {
+  if constexpr (TransposeB)
+    return load_v64bf16_as_bfp16(p);
+  else
+    return load_v64bf16_as_bfp16_T(p);
+}
+
+// TODO: The goal is every element type combination the hardware supports, each
+// with and without a transposed B. Only this template supports a transposed B
+// for now. When a template is added or gains it, extend the check in
+// AMDAIELowerToUKernels.cpp (matchMatmulDAGForUKernel) to match.
 template <unsigned rowA, unsigned colA, unsigned colB, unsigned L0_M,
-          unsigned L0_K, unsigned L0_N>
+          unsigned L0_K, unsigned L0_N, bool TransposeB>
 void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
                                 const bfloat16 *__restrict pB, unsigned offsetB,
                                 float *__restrict pC, unsigned offsetC) {
   const unsigned size_A = L0_M * L0_K;
   const unsigned size_B = L0_K * L0_N;
   const unsigned size_C = L0_M * L0_N;
+  // The B blocks are ordered [n][k] without a transposed B and [k][n] with one.
+  const unsigned stepB_n = TransposeB ? size_B : colA * size_B;
+  const unsigned stepB_k = TransposeB ? colB * size_B : size_B;
 
   v64bfp16ebs8 A0;
   v64bfp16ebs8 A1;
@@ -211,20 +229,19 @@ void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
       const bfloat16 *__restrict pA1 =
           (bfloat16 *)(pA + offsetA + ((z + 1)) * size_A);
 
-      const bfloat16 *__restrict pB0 =
-          (bfloat16 *)(pB + offsetB + (j)*colA * size_B);
+      const bfloat16 *__restrict pB0 = (bfloat16 *)(pB + offsetB + (j)*stepB_n);
       const bfloat16 *__restrict pB1 =
-          (bfloat16 *)(pB + offsetB + ((j + 1)) * colA * size_B);
+          (bfloat16 *)(pB + offsetB + ((j + 1)) * stepB_n);
 
       A0 = load_v64bf16_as_bfp16(pA0);
       pA0 += rowA * size_A;
       A1 = load_v64bf16_as_bfp16(pA1);
       pA1 += rowA * size_A;
 
-      B0 = load_v64bf16_as_bfp16_T(pB0);
-      pB0 += size_B;
-      B1 = load_v64bf16_as_bfp16_T(pB1);
-      pB1 += size_B;
+      B0 = load_B_v64bf16_as_bfp16<TransposeB>(pB0);
+      pB0 += stepB_k;
+      B1 = load_B_v64bf16_as_bfp16<TransposeB>(pB1);
+      pB1 += stepB_k;
 
       acc_C00 = *pC0;
       acc_C01 = *(pC0 + rowA);
@@ -243,10 +260,10 @@ void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
         A1 = load_v64bf16_as_bfp16(pA1);
         pA1 += rowA * size_A;
 
-        B0 = load_v64bf16_as_bfp16_T(pB0);
-        pB0 += size_B;
-        B1 = load_v64bf16_as_bfp16_T(pB1);
-        pB1 += size_B;
+        B0 = load_B_v64bf16_as_bfp16<TransposeB>(pB0);
+        pB0 += stepB_k;
+        B1 = load_B_v64bf16_as_bfp16<TransposeB>(pB1);
+        pB1 += stepB_k;
 
         acc_C00 = mac_8x8_8x8T(A0, B0, acc_C00);
         acc_C01 = mac_8x8_8x8T(A0, B1, acc_C01);
@@ -277,7 +294,7 @@ void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
   }
 }
 
-template <unsigned m, unsigned k, unsigned n>
+template <unsigned m, unsigned k, unsigned n, bool TransposeB>
 void matmul_vectorized_8x8x8_bf16_bf16_f32(const bfloat16 *__restrict pA,
                                            unsigned offsetA,
                                            const bfloat16 *__restrict pB,
@@ -293,40 +310,39 @@ void matmul_vectorized_8x8x8_bf16_bf16_f32(const bfloat16 *__restrict pA,
   static_assert(m / r % 2 == 0 && n / t % 2 == 0,
                 "The ukernel is manually unrolled 2x2 in the M and N "
                 "iterations, so their counts should be multiples of 2.");
-  return matmul_vectorized_bf16_f32<m / r, k / s, n / t, r, s, t>(
+  return matmul_vectorized_bf16_f32<m / r, k / s, n / t, r, s, t, TransposeB>(
       pA, offsetA, pB, offsetB, pC, offsetC);
 }
 
 // clang-format off
 extern "C" {
 
-#define matmul_combos_i8(X, M, N, K)                                  \
-  X(int8, i8, int8, i8, int32, i32, M, N, K, 8, 8, 8)
-
-#define matmul_combos_bfp16(X, M, N, K)                                     \
-  X(bfloat16, bf16, bfloat16, bf16, float, f32, M, N, K, 8, 8, 8)
-
-#define matmul_vectorized_c_func(lhs_ctype_in, lhs_mlir_type_in,                                                 \
-                                 rhs_ctype_in, rhs_mlir_type_in,                                                 \
-                                 acc_ctype_out, acc_mlir_type_out, M, N, K, r, s, t)                             \
-  void matmul_##lhs_mlir_type_in##_##rhs_mlir_type_in##_##acc_mlir_type_out##_##M##x##N##x##K##_##r##x##s##x##t( \
+#define matmul_named_c_func(name, lhs_ctype_in, lhs_mlir_type_in,                                                \
+                            rhs_ctype_in, rhs_mlir_type_in,                                                      \
+                            acc_ctype_out, acc_mlir_type_out, M, N, K, r, s, t,                                  \
+                            transpose_b)                                                                         \
+  void name(                                                                                                     \
       lhs_ctype_in *a_in, unsigned offsetA, rhs_ctype_in *b_in, unsigned offsetB,                                \
       acc_ctype_out *c_out, unsigned offsetC) {                                                                  \
     matmul_vectorized_##r##x##s##x##t##_##lhs_mlir_type_in##_##rhs_mlir_type_in##_##acc_mlir_type_out<           \
-        M, K, N>(a_in, offsetA, b_in, offsetB, c_out, offsetC);                                                  \
+        M, K, N, transpose_b>(a_in, offsetA, b_in, offsetB, c_out, offsetC);                                     \
   }
 
-matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 32)
-matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 64)
-matmul_combos_i8(matmul_vectorized_c_func, 64, 32, 128)
-matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 128)
-matmul_combos_i8(matmul_vectorized_c_func, 64, 64, 128)
+// The compiler passes the functions a device calls as `UK_INSTANCES`, a list
+// of `UK_INSTANCE(name, lhs, rhs, acc, M, N, K, r, s, t, transpose_b)` with
+// MLIR element type names.
+#define UK_CTYPE_i8 int8
+#define UK_CTYPE_i32 int32
+#define UK_CTYPE_bf16 bfloat16
+#define UK_CTYPE_f32 float
+#define UK_INSTANCE(name, lhs, rhs, acc, M, N, K, r, s, t, transpose_b)        \
+  matmul_named_c_func(name, UK_CTYPE_##lhs, lhs, UK_CTYPE_##rhs, rhs,           \
+                      UK_CTYPE_##acc, acc, M, N, K, r, s, t, transpose_b)
 
-matmul_combos_bfp16(matmul_vectorized_c_func, 16, 16, 32)
-matmul_combos_bfp16(matmul_vectorized_c_func, 32, 32, 32)
-matmul_combos_bfp16(matmul_vectorized_c_func, 32, 32, 64)
-matmul_combos_bfp16(matmul_vectorized_c_func, 32, 16, 128)
-matmul_combos_bfp16(matmul_vectorized_c_func, 32, 32, 128)
+#ifndef UK_INSTANCES
+#error "UK_INSTANCES must list the functions to define"
+#endif
+UK_INSTANCES
 
 }  // extern "C"
 // clang-format on

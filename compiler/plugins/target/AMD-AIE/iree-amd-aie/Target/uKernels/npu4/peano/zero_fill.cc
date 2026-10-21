@@ -27,26 +27,23 @@ void zero_fill_vectorized(v16float *__restrict pC, unsigned offsetC) {
 // clang-format off
 extern "C" {
 
-#define zero_fill_combos_i32(X, M, N)  \
-  X(v16int32, i32, M, N, 16, 8)
-
-#define zero_fill_combos_f32(X, M, N)  \
-  X(v16float, f32, M, N, 16, 8)
-
 // A vectorized zeroization function on a buffer of size M * N with vectorization size
 // 'r' and unrolling factor 'u'. The unrolling factor is typically found experimentally.
-#define zero_fill_vectorized_c_func(ctype_out, mlir_type_out, M, N, r, u)             \
-  void zero_fill_##mlir_type_out##_##M##x##N(ctype_out *c_out, unsigned offsetC) { \
-    zero_fill_vectorized<M, N, r, u>(c_out, offsetC);                      \
+#define zero_fill_named_c_func(name, ctype_out, M, N, r, u)  \
+  void name(ctype_out *c_out, unsigned offsetC) {             \
+    zero_fill_vectorized<M, N, r, u>(c_out, offsetC);         \
   }
 
-zero_fill_combos_i32(zero_fill_vectorized_c_func, 32, 32)
-zero_fill_combos_i32(zero_fill_vectorized_c_func, 64, 32)
-zero_fill_combos_i32(zero_fill_vectorized_c_func, 64, 64)
+// The compiler passes the functions a device calls as `UK_INSTANCES`, a list
+// of `UK_INSTANCE(name, type, M, N)` with MLIR element type names.
+#define zero_fill_instance_i32(name, M, N) zero_fill_named_c_func(name, v16int32, M, N, 16, 8)
+#define zero_fill_instance_f32(name, M, N) zero_fill_named_c_func(name, v16float, M, N, 16, 8)
+#define UK_INSTANCE(name, type, M, N) zero_fill_instance_##type(name, M, N)
 
-zero_fill_combos_f32(zero_fill_vectorized_c_func, 16, 8)
-zero_fill_combos_f32(zero_fill_vectorized_c_func, 16, 16)
-zero_fill_combos_f32(zero_fill_vectorized_c_func, 32, 32)
+#ifndef UK_INSTANCES
+#error "UK_INSTANCES must list the functions to define"
+#endif
+UK_INSTANCES
 
 }  // extern "C"
 // clang-format on

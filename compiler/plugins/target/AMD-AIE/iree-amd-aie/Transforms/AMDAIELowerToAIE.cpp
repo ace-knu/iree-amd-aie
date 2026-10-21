@@ -412,6 +412,11 @@ LogicalResult AIEDeviceBuilder::coreFuncCallOpToAIE(
     SymbolTable::setSymbolVisibility(newFnDecl,
                                      SymbolTable::Visibility::Private);
     newFnDecl->setAttr("llvm.bareptr", rewriter.getBoolAttr(true));
+    // Keep what the ukernel compilation needs to define this function.
+    for (StringRef name : {"link_with", "ukernel_instance"}) {
+      if (Attribute attr = fnDecl->getAttr(name))
+        newFnDecl->setAttr(name, attr);
+    }
 
     fnDecl.getBody().cloneInto(&(newFnDecl.getBody()), mapper);
     if (ArrayAttr oldAttrs = fnDecl.getAllArgAttrs()) {

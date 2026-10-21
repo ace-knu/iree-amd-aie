@@ -56,7 +56,7 @@ func.func @generic_matmul_i32i32i32_pad_pack(%arg0 : tensor<8x16x4x8xi32>, %arg1
 //      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_i32_i32_i32_64x64x64_4x8x4"
 // CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
 // CHECK-SAME:       outs(%[[ARG2]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = ["matmul_i32_i32_i32_64x64x64_4x8x4", "i32", "i32", "i32", "64", "64", "64", "4", "8", "4", "false"]}
 //      CHECK:   return %[[MICRO_KERNEL]]
 
 // -----
@@ -91,7 +91,7 @@ module {
 //      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_bf16_bf16_f32_64x64x64_4x8x4"
 // CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
 // CHECK-SAME:       outs(%[[ARG2]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = [
 //      CHECK:   return %[[MICRO_KERNEL]]
 
 // -----
@@ -129,7 +129,7 @@ module {
 //      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_bf16_bf16_f32_64x64x64_4x8x4"
 // CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
 // CHECK-SAME:       outs(%[[ARG2]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = [
 //      CHECK:   return %[[MICRO_KERNEL]]
 
 // -----
@@ -167,8 +167,74 @@ module {
 //      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_bf16_bf16_f32_32x32x32_4x8x4"
 // CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
 // CHECK-SAME:       outs(%[[ARG2]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = [
 //      CHECK:   return %[[MICRO_KERNEL]]
+
+// -----
+
+// A matmul with a transposed B, which the npu4 bf16 ukernel reads as [n][k]
+// blocks.
+#map_a = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d0, d2, d5, d3, d6, d8)>
+#map_b = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d1, d2, d5, d4, d7, d8)>
+#map_c = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d1, d0, d4, d3, d6, d7)>
+func.func @generic_matmul_transpose_b_bf16bf16f32(%arg0: tensor<1x1x16x2x8x8xbf16>, %arg1: tensor<1x1x16x4x8x8xbf16>,
+    %arg2: tensor<1x1x4x2x8x8xf32>) -> tensor<1x1x4x2x8x8xf32> attributes {
+  hal.executable.target = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
+} {
+  %0 = linalg.generic {indexing_maps = [#map_a, #map_b, #map_c],
+                       iterator_types = ["parallel", "parallel", "reduction",
+                                         "parallel", "parallel", "reduction",
+                                         "parallel", "parallel", "reduction"]
+                      } ins(%arg0, %arg1 : tensor<1x1x16x2x8x8xbf16>, tensor<1x1x16x4x8x8xbf16>)
+                        outs(%arg2 : tensor<1x1x4x2x8x8xf32>) {
+  ^bb0(%in: bf16, %in_0: bf16, %out: f32):
+    %1 = arith.extf %in : bf16 to f32
+    %2 = arith.extf %in_0 : bf16 to f32
+    %3 = arith.mulf %1, %2 : f32
+    %4 = arith.addf %out, %3 : f32
+    linalg.yield %4 : f32
+  } -> tensor<1x1x4x2x8x8xf32>
+  return %0 : tensor<1x1x4x2x8x8xf32>
+}
+//      CHECK: func @generic_matmul_transpose_b_bf16bf16f32(
+// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: tensor<1x1x16x2x8x8xbf16>
+// CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: tensor<1x1x16x4x8x8xbf16>
+// CHECK-SAME:     %[[ARG2:[a-zA-Z0-9]+]]: tensor<1x1x4x2x8x8xf32>)
+//  CHECK-NOT:   linalg.generic
+//      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_tb_bf16_bf16_f32_16x32x128_8x8x8"
+// CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
+// CHECK-SAME:       outs(%[[ARG2]] :
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = ["matmul_tb_bf16_bf16_f32_16x32x128_8x8x8", "bf16", "bf16", "f32", "16", "32", "128", "8", "8", "8", "true"]}
+//      CHECK:   return %[[MICRO_KERNEL]]
+
+// -----
+
+// Only npu4 has a ukernel for a transposed B.
+#map_a = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d0, d2, d5, d3, d6, d8)>
+#map_b = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d1, d2, d5, d4, d7, d8)>
+#map_c = affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d1, d0, d4, d3, d6, d7)>
+func.func @generic_matmul_transpose_b_npu1(%arg0: tensor<1x1x16x2x8x8xbf16>, %arg1: tensor<1x1x16x4x8x8xbf16>,
+    %arg2: tensor<1x1x4x2x8x8xf32>) -> tensor<1x1x4x2x8x8xf32> attributes {
+  hal.executable.target = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "all"}>
+} {
+  %0 = linalg.generic {indexing_maps = [#map_a, #map_b, #map_c],
+                       iterator_types = ["parallel", "parallel", "reduction",
+                                         "parallel", "parallel", "reduction",
+                                         "parallel", "parallel", "reduction"]
+                      } ins(%arg0, %arg1 : tensor<1x1x16x2x8x8xbf16>, tensor<1x1x16x4x8x8xbf16>)
+                        outs(%arg2 : tensor<1x1x4x2x8x8xf32>) {
+  ^bb0(%in: bf16, %in_0: bf16, %out: f32):
+    %1 = arith.extf %in : bf16 to f32
+    %2 = arith.extf %in_0 : bf16 to f32
+    %3 = arith.mulf %1, %2 : f32
+    %4 = arith.addf %out, %3 : f32
+    linalg.yield %4 : f32
+  } -> tensor<1x1x4x2x8x8xf32>
+  return %0 : tensor<1x1x4x2x8x8xf32>
+}
+//      CHECK: func @generic_matmul_transpose_b_npu1(
+//  CHECK-NOT:   iree_codegen.ukernel.generic
+//      CHECK:   linalg.generic
 
 // -----
 
@@ -184,7 +250,7 @@ func.func @zero_fill(%arg0 : tensor<16x16x4x4xbf16>) -> tensor<16x16x4x4xbf16> a
 //  CHECK-NOT:   linalg.fill
 //      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "zero_fill_bf16_64x64"
 // CHECK-SAME:       outs(%[[ARG0]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "zero_fill.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "zero_fill.o", ukernel_instance = ["zero_fill_bf16_64x64", "bf16", "64", "64"]}
 //      CHECK:   return %[[MICRO_KERNEL]]
 
 // -----
@@ -230,12 +296,12 @@ func.func @zero_fill_with_matmul(%arg0 : tensor<8x16x4x8xbf16>, %arg1 : tensor<1
 //  CHECK-NOT:   linalg.fill
 //      CHECK:   %[[ZERO_FILL_MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "zero_fill_bf16_64x64"
 // CHECK-SAME:       outs(%[[ARG2]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "zero_fill.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "zero_fill.o", ukernel_instance = [
 //  CHECK-NOT:   linalg.generic
 //      CHECK:   %[[MATMUL_MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_bf16_bf16_bf16_64x64x64_4x8x4"
 // CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
 // CHECK-SAME:       outs(%[[ZERO_FILL_MICRO_KERNEL]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = [
 //      CHECK:   return %[[MATMUL_MICRO_KERNEL]]
 
 // -----
@@ -330,7 +396,7 @@ module {
 //      CHECK:   %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "matmul_bf16_bf16_f32_32x32x32_8x8x8"
 // CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] :
 // CHECK-SAME:       outs(%[[ARG2]] :
-// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "matmul.o", ukernel_instance = [
 //      CHECK:   return %[[MICRO_KERNEL]]
 
 // -----
@@ -356,7 +422,7 @@ func.func @shift_trunci(%arg0 : tensor<16x16x4x4xi32>) -> tensor<16x16x4x4xi8> a
 // CHECK-NOT:    linalg.generic
 // CHECK:        %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "trunci_i32_i8_64x64"
 // CHECK-SAME:       ins(%[[ARG0]], %[[C5]] : tensor<16x16x4x4xi32>, i32
-// CHECK-SAME:       fn_def_attrs {link_with = "trunci.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "trunci.o", ukernel_instance = ["trunci_i32_i8_64x64", "i32", "i8", "64", "64"]}
 // CHECK-SAME:       -> tensor<16x16x4x4xi8>
 // CHECK:        return %[[MICRO_KERNEL]]
 
@@ -381,7 +447,7 @@ func.func @trunci(%arg0 : tensor<16x16x4x4xi16>) -> tensor<16x16x4x4xi8> attribu
 // CHECK-NOT:    linalg.generic
 // CHECK:        %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "trunci_i16_i8_64x64"
 // CHECK-SAME:       ins(%[[ARG0]], %[[C0]] : tensor<16x16x4x4xi16>, i16
-// CHECK-SAME:       fn_def_attrs {link_with = "trunci.o"}
+// CHECK-SAME:       fn_def_attrs {link_with = "trunci.o", ukernel_instance = [
 // CHECK-SAME:       -> tensor<16x16x4x4xi8>
 // CHECK:        return %[[MICRO_KERNEL]]
 

@@ -23,6 +23,7 @@
 #include "iree-dialects/Dialect/LinalgTransform/Passes.h"
 #include "iree/compiler/Utils/ToolUtils.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
@@ -41,6 +42,7 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorTransforms.h"
@@ -728,6 +730,28 @@ FailureOr<uint32_t> getMaxStackSizeFromExecutable(const std::string &outputFile,
   return mlir::iree_compiler::AMDAIE::detail::getMaxStackSize(stackSizes);
 }
 
+/// Returns the instance list that the ukernel source of `objectName` has to
+/// define: one `UK_INSTANCE(<name>,<args>...)` per function declared in
+/// `deviceOp` that links with that object, taken from the `ukernel_instance`
+/// attribute that names the function and its template arguments.
+static std::string getUkernelInstances(AIE::DeviceOp deviceOp,
+                                       StringRef objectName) {
+  llvm::StringSet<> seen;
+  std::string instances;
+  deviceOp.walk([&](func::FuncOp funcOp) {
+    auto linkWith = funcOp->getAttrOfType<StringAttr>("link_with");
+    auto instance = funcOp->getAttrOfType<ArrayAttr>("ukernel_instance");
+    if (!linkWith || linkWith.getValue() != objectName || !instance) return;
+    // Define a function once, however many declarations name it.
+    if (!seen.insert(funcOp.getSymName()).second) return;
+    SmallVector<StringRef> args = llvm::map_to_vector(
+        instance,
+        [](mlir::Attribute a) { return cast<StringAttr>(a).getValue(); });
+    instances += "UK_INSTANCE(" + llvm::join(args, ",") + ") ";
+  });
+  return instances;
+}
+
 // Generate the elf files for the core
 LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
                                    const std::string &objFile, Path &tempDir,
@@ -823,6 +847,11 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
         std::string targetLower = StringRef(targetArch).lower();
         std::vector<std::string> extraArgs{"--target=" + targetLower +
                                            "-none-unknown-elf"};
+        // Define only the functions this device calls.
+        std::string instances =
+            getUkernelInstances(deviceOp, ukernelObjectName);
+        if (!instances.empty())
+          extraArgs.push_back("-DUK_INSTANCES=" + instances);
         ukernelObjectFilePath = assembleStringUsingPeano(
             /*inputFileStr=*/*ukernelFileContent,
             /*inputFileName=*/ukernelFileName,
