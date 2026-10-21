@@ -397,6 +397,30 @@ LogicalResult foldDimsAndReturnAsStatic(
     size_t repetitionCount, uint8_t memSpace,
     function_ref<InFlightDiagnostic()> emitError);
 
+/// The region of an L2 logical objectFifo written by one producer connection
+/// of a join. `offset` and `length` are in elements of the objectFifo buffer.
+struct JoinSlice {
+  AMDAIE::ConnectionOp producer;
+  int64_t offset;
+  int64_t length;
+};
+
+/// Detects a join that can be synchronized per producer: an L2 logical
+/// objectFifo on a single tile that several producer connections write into
+/// disjoint contiguous regions, and that a single consumer connection reads
+/// back contiguously over exactly those regions, in address order. Returns the
+/// producer regions sorted by offset, or std::nullopt if `op` is not such a
+/// join.
+///
+/// Sharing one lock pair between all producers of a join is unsafe: the
+/// counting semaphore cannot tell which producer filled which buffer, so a
+/// producer that runs ahead can overwrite its region of a buffer that hasn't
+/// been drained yet. Producer and consumer DMAs of a detected join get one
+/// lock pair per producer instead (see `AMDAIEObjFifoBufferization` and
+/// `AMDAIELowerToAIE`).
+std::optional<SmallVector<JoinSlice>> getContiguousJoinSlices(
+    LogicalObjFifoOpInterface op);
+
 }  // namespace mlir::iree_compiler::AMDAIE
 
 #endif

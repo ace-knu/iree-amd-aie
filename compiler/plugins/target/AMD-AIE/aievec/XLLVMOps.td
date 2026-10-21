@@ -68,6 +68,56 @@ let extraClassDeclaration = [{
 }];
 }
 
+// ----- SHUFFLE -----
+
+// AIE2P's `vshuffle` takes the same (lhs, rhs, mode) shape as AIE2's. The mode
+// is an ordinary register operand of the instruction rather than part of its
+// encoding, so the intrinsic signature carries it as a plain i32.
+def AIEVec2PVectorShuffleIntrOp :
+    AIEVec2P_IntrOp<"vshuffle",
+        [TypeIs<"res", VectorOfLengthAndType<[16], [I32]>>]>,
+    Arguments<(ins VectorOfLengthAndType<[16], [I32]>:$lhs,
+                   VectorOfLengthAndType<[16], [I32]>:$rhs,
+                   I32:$mode)>;
+
+// ----- BF16 MATMUL (via bfp16; AIE2P has no native bf16 MAC) -----
+
+// Promotes 32 bf16 lanes to 32 f32 accumulator lanes. Two calls plus a
+// concatenation build the 64-wide accumulator that
+// `AIEVec2PAccFloatToBFP16IntrOp` below consumes.
+def AIEVec2PBF16ToV32AccFloatIntrOp :
+    AIEVec2P_IntrOp<"v32bf16.to.v32accfloat",
+        [TypeIs<"res", VectorOfLengthAndType<[32], [F32]>>]>,
+    Arguments<(ins VectorOfLengthAndType<[32], [BF16]>:$src)>;
+
+// Converts a 64-wide f32 accumulator into block-floating-point16 (bfp16):
+// a 64-byte mantissa vector and an 8-byte exponent vector (one exponent per
+// 8-lane block). The real instruction has two results; that is modelled
+// here as the single LLVM struct {vector<64xi8>, vector<8xi8>}, which
+// callers unpack with two `llvm.extractvalue`s (there is no bf16 -> bfp16
+// intrinsic that skips this f32 accumulator step).
+def AIEVec2PAccFloatToBFP16IntrOp :
+    AIEVec2P_IntrOp<"v64accfloat.to.v64bfp16ebs8",
+        [TypeIs<"res", LLVM_StructOf<[VectorOfLengthAndType<[64], [I8]>,
+                                     VectorOfLengthAndType<[8], [I8]>]>>]>,
+    Arguments<(ins VectorOfLengthAndType<[64], [F32]>:$src)>;
+
+// bfp16 x bfp16 -> i32 accumulator MAC. Each bfp16 operand is a
+// (mantissa, exponent) pair produced by `AIEVec2PAccFloatToBFP16IntrOp`
+// above. The accumulator and result are declared i32 because that is this
+// intrinsic's LLVM signature; the bits are the same f32 accumulator used
+// elsewhere in the bf16 matmul lowering, reached by a bitcast at the call
+// site (see the AIE2P branch of MatMulOpConversion in AIEVecToLLVM.cpp).
+def AIEVec2PBFP16MacConfIntrOp :
+    AIEVec2P_IntrOp<"BFP576.BFP576.ACC2048.mac.conf",
+        [TypeIs<"res", VectorOfLengthAndType<[64], [I32]>>]>,
+    Arguments<(ins VectorOfLengthAndType<[64], [I8]>:$lhsMantissa,
+                   VectorOfLengthAndType<[8], [I8]>:$lhsExponent,
+                   VectorOfLengthAndType<[64], [I8]>:$rhsMantissa,
+                   VectorOfLengthAndType<[8], [I8]>:$rhsExponent,
+                   VectorOfLengthAndType<[64], [I32]>:$acc,
+                   I32:$conf)>;
+
 /////////////////////////////////////
 // Intrinsics for AIE2 ('phoenix') //
 /////////////////////////////////////

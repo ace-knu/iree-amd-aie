@@ -27,6 +27,7 @@
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -960,6 +961,12 @@ void addMLIRAIELoweringPasses(OpPassManager &pm,
   pm.addPass(createCSEPass());
   pm.addPass(aievec::createConvertAIEVecToLLVMPass());
   pm.addPass(createConvertVectorToLLVMPass());
+  // Vector-to-LLVM's shuffle/insert lowering can leave `ub.poison` behind as
+  // a placeholder (e.g. for the AIE2P bf16 vector.transpose sequence); it has
+  // no LLVMIR translation of its own and must be converted to `llvm.mlir.
+  // poison` before translateModuleToLLVMIR, unlike the rest of this pipeline
+  // which only ever produced ops that already had one.
+  pm.addPass(createUBToLLVMConversionPass());
   pm.addPass(memref::createExpandStridedMetadataPass());
   pm.addPass(createLowerAffinePass());
   pm.addPass(createConvertMathToLLVMPass());

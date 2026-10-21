@@ -194,6 +194,56 @@ LogicalResult AIEDeviceBuilder::createDMABlocks(
   return success();
 }
 
+LogicalResult AIEDeviceBuilder::createJoinConsumerDMABlocks(
+    Operation *memOp, int channelIndex,
+    const SmallVector<AIE::BufferOp> &bufferOps, ArrayRef<JoinSlice> slices,
+    ArrayRef<AIE::LockOp> producerLocks, ArrayRef<AIE::LockOp> consumerLocks,
+    std::optional<uint8_t> pktId) {
+  assert(slices.size() == producerLocks.size() &&
+         slices.size() == consumerLocks.size() &&
+         "expected one lock pair per join slice");
+  OpBuilder::InsertionGuard g(rewriter);
+  Location loc = rewriter.getUnknownLoc();
+
+  Block &endBlock = memOp->getRegion(0).getBlocks().back();
+  assert(!endBlock.getOps<AIE::EndOp>().empty() &&
+         "expected last block to have aie.end");
+  Block *lastDmaBlock = endBlock.getSinglePredecessor(),
+        *dmaBlock = rewriter.createBlock(&endBlock),
+        *bdBlock = rewriter.createBlock(&endBlock);
+
+  rewriter.setInsertionPointToStart(dmaBlock);
+  rewriter.create<AIE::DMAStartOp>(loc, AIE::DMAChannelDir::MM2S, channelIndex,
+                                   /*repeatCount=*/1, bdBlock, &endBlock);
+  if (lastDmaBlock) lastDmaBlock->getTerminator()->setSuccessor(dmaBlock, 1);
+
+  Block *curr = bdBlock;
+  for (size_t bufferIndex = 0; bufferIndex < bufferOps.size(); ++bufferIndex) {
+    for (size_t sliceIndex = 0; sliceIndex < slices.size(); ++sliceIndex) {
+      bool isLastBd = bufferIndex == bufferOps.size() - 1 &&
+                      sliceIndex == slices.size() - 1;
+      Block *succ = isLastBd ? bdBlock : rewriter.createBlock(&endBlock);
+      rewriter.setInsertionPointToStart(curr);
+      AIE::LockOp acqLock = consumerLocks[sliceIndex];
+      AIE::LockOp relLock = producerLocks[sliceIndex];
+      AIE::BufferOp bufferOp = bufferOps[bufferIndex];
+      rewriter.create<AIE::UseLockOp>(loc, acqLock,
+                                      AIE::LockAction::AcquireGreaterEqual, 1);
+      if (pktId.has_value()) {
+        rewriter.create<AIE::DMABDPACKETOp>(loc, /*pkt_type*/ 0,
+                                            /*pkt_id*/ pktId.value());
+      }
+      rewriter.create<AIE::DMABDOp>(loc, bufferOp, slices[sliceIndex].offset,
+                                    slices[sliceIndex].length);
+      rewriter.create<AIE::UseLockOp>(loc, relLock, AIE::LockAction::Release,
+                                      1);
+      rewriter.create<AIE::NextBDOp>(loc, succ);
+      curr = succ;
+    }
+  }
+  return success();
+}
+
 SmallVector<Operation *> AIEDeviceBuilder::createFlowOps(
     AMDAIE::FlowOp flowOp, ArrayRef<AMDAIE::ChannelOp> producerChannels,
     ArrayRef<AMDAIE::ChannelOp> consumerChannels) {
@@ -572,6 +622,8 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
       assert(objFifoProducers.size() % objFifoConsumers.size() == 0);
       acqNum = objFifoProducers.size() / objFifoConsumers.size();
     }
+    std::optional<SmallVector<JoinSlice>> joinSlices = getContiguousJoinSlices(
+        cast<LogicalObjFifoOpInterface>(sourceObjFifo.getOperation()));
     for (AMDAIE::ChannelOp channel : producerChannels) {
       Operation *memOp = tileToMemOpMap.at(channel.getTile());
       AMDAIE::TileOp tileOp = channel.getTileOp();
@@ -590,6 +642,23 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
           [&](AMDAIE::LockOp lockOp) {
             return cast<AIE::LockOp>(mapper.lookup(lockOp.getOperation()));
           });
+      if (joinSlices) {
+        if (producerLocks.size() != joinSlices->size() ||
+            consumerLocks.size() != joinSlices->size()) {
+          return sourceObjFifo.emitOpError()
+                 << "expected one lock pair per join producer on tile: "
+                 << channel.getTile();
+        }
+        rewriter.moveOpBefore(memOp, deviceBlock,
+                              deviceBlock->without_terminator().end());
+        if (failed(createJoinConsumerDMABlocks(
+                memOp, channel.getValue(), buffers, *joinSlices, producerLocks,
+                consumerLocks, packetId))) {
+          return sourceObjFifo.emitOpError()
+                 << "could not create join DMA operations";
+        }
+        continue;
+      }
       if (producerLocks.size() != 1) {
         return sourceObjFifo.emitOpError()
                << "expected a single producer lock for tile: "
@@ -677,6 +746,21 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
       assert(objFifoConsumers.size() % objFifoProducers.size() == 0);
       acqNum = objFifoConsumers.size() / objFifoProducers.size();
     }
+    size_t expectedLockPairs = 1;
+    size_t lockPairIndex = 0;
+    if (std::optional<SmallVector<JoinSlice>> joinSlices =
+            getContiguousJoinSlices(
+                cast<LogicalObjFifoOpInterface>(targetObjFifo.getOperation()))) {
+      auto it = llvm::find_if(*joinSlices, [&](const JoinSlice &slice) {
+        return slice.producer == connectionOp;
+      });
+      if (it == joinSlices->end()) {
+        return connectionOp.emitOpError()
+               << "is not a producer of the join it writes into";
+      }
+      expectedLockPairs = joinSlices->size();
+      lockPairIndex = std::distance(joinSlices->begin(), it);
+    }
     for (AMDAIE::ChannelOp channel : consumerChannels) {
       Operation *memOp = tileToMemOpMap.at(channel.getTile());
       AMDAIE::TileOp tileOp = channel.getTileOp();
@@ -695,18 +779,18 @@ LogicalResult AIEDeviceBuilder::connectionToAIE(
           [&](AMDAIE::LockOp lockOp) {
             return cast<AIE::LockOp>(mapper.lookup(lockOp.getOperation()));
           });
-      if (producerLocks.size() != 1) {
+      if (producerLocks.size() != expectedLockPairs) {
         return targetObjFifo.emitOpError()
-               << "expected a single producer lock for tile: "
-               << channel.getTile();
+               << "expected " << expectedLockPairs
+               << " producer lock(s) for tile: " << channel.getTile();
       }
-      if (consumerLocks.size() != 1) {
+      if (consumerLocks.size() != expectedLockPairs) {
         return targetObjFifo.emitOpError()
-               << "expected a single consumer lock for tile: "
-               << channel.getTile();
+               << "expected " << expectedLockPairs
+               << " consumer lock(s) for tile: " << channel.getTile();
       }
-      std::pair<AIE::LockOp, AIE::LockOp> lockPair =
-          std::make_pair(producerLocks[0], consumerLocks[0]);
+      std::pair<AIE::LockOp, AIE::LockOp> lockPair = std::make_pair(
+          producerLocks[lockPairIndex], consumerLocks[lockPairIndex]);
       SmallVector<int64_t> canonicalizedSizes, canonicalizedStrides;
       if (failed(foldDimsAndReturnAsStatic(
               rewriter, deviceModel, maybeNpuDmaUserOp->getTargetMixedSizes(),

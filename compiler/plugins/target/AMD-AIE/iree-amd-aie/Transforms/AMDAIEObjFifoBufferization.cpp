@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEDmaUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree-amd-aie/aie_runtime/Utils/LockIdGenerator.h"
 
@@ -70,6 +71,17 @@ LogicalResult bufferize(AMDAIE::WorkgroupOp workgroupOp) {
             copyLikeProducers.size() >= copyLikeConsumers.size()
                 ? copyLikeProducers.size() * depth
                 : copyLikeConsumers.size() * depth;
+        // A join whose producers write disjoint regions gets one lock pair per
+        // producer, each guarding only that producer's region, instead of one
+        // shared pair. The pairs are created in the order of
+        // `getContiguousJoinSlices`, which `AMDAIELowerToAIE` relies on.
+        int64_t numLockPairs = 1;
+        if (std::optional<SmallVector<JoinSlice>> joinSlices =
+                getContiguousJoinSlices(cast<LogicalObjFifoOpInterface>(
+                    logicalObjFifo.getOperation()))) {
+          numLockPairs = joinSlices->size();
+          producerLockInitValue = depth;
+        }
 
         SmallVector<Value> buffers;
         SmallVector<Value> producerLocks;
@@ -83,32 +95,33 @@ LogicalResult bufferize(AMDAIE::WorkgroupOp workgroupOp) {
             buffers.push_back(bufferOp.getResult());
           }
 
-          // Every set of buffers needs one producer and one consumer lock.
           int64_t col = getConstantIndexOrAssert(tileOp.getCol());
           int64_t row = getConstantIndexOrAssert(tileOp.getRow());
-          std::optional<uint32_t> producerLock =
-              lockGenerator.getAndAssignLockId(col, row);
-          if (!producerLock) {
-            logicalObjFifo.emitOpError()
-                << "could not find an available producer lock";
-            return WalkResult::interrupt();
-          }
-          auto producerLockOp = rewriter.create<AMDAIE::LockOp>(
-              rewriter.getUnknownLoc(), tileOp, producerLock.value(),
-              rewriter.getI8IntegerAttr(producerLockInitValue));
-          producerLocks.push_back(producerLockOp.getResult());
+          for (int64_t pair = 0; pair < numLockPairs; ++pair) {
+            std::optional<uint32_t> producerLock =
+                lockGenerator.getAndAssignLockId(col, row);
+            if (!producerLock) {
+              logicalObjFifo.emitOpError()
+                  << "could not find an available producer lock";
+              return WalkResult::interrupt();
+            }
+            auto producerLockOp = rewriter.create<AMDAIE::LockOp>(
+                rewriter.getUnknownLoc(), tileOp, producerLock.value(),
+                rewriter.getI8IntegerAttr(producerLockInitValue));
+            producerLocks.push_back(producerLockOp.getResult());
 
-          std::optional<uint32_t> consumerLock =
-              lockGenerator.getAndAssignLockId(col, row);
-          if (!consumerLock) {
-            logicalObjFifo.emitOpError()
-                << "could not find an available consumer lock";
-            return WalkResult::interrupt();
+            std::optional<uint32_t> consumerLock =
+                lockGenerator.getAndAssignLockId(col, row);
+            if (!consumerLock) {
+              logicalObjFifo.emitOpError()
+                  << "could not find an available consumer lock";
+              return WalkResult::interrupt();
+            }
+            auto consumerLockOp = rewriter.create<AMDAIE::LockOp>(
+                rewriter.getUnknownLoc(), tileOp, consumerLock.value(),
+                rewriter.getI8IntegerAttr(consumerLockInitValue));
+            consumerLocks.push_back(consumerLockOp.getResult());
           }
-          auto consumerLockOp = rewriter.create<AMDAIE::LockOp>(
-              rewriter.getUnknownLoc(), tileOp, consumerLock.value(),
-              rewriter.getI8IntegerAttr(consumerLockInitValue));
-          consumerLocks.push_back(consumerLockOp.getResult());
         }
 
         rewriter.setInsertionPoint(logicalObjFifo);
