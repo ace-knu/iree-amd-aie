@@ -31,6 +31,10 @@
 // (already working) connection-reuse behavior for free, and the two
 // workaround flags become unnecessary for this pattern.
 //
+// That limit belongs to the amd-aie target, so the pass does nothing unless
+// the module declares an amd-aie device: for any other target the fold only
+// adds K work and a weight copy, with nothing to gain.
+//
 // `linalg.conv_2d_nchw_fchw` is handled the same way: one extra *input
 // channel*, held at the constant 1.0 across the whole (already-padded) input,
 // with a filter tap of `bias` at a single (kh=0, kw=0) position (0 elsewhere)
@@ -43,6 +47,7 @@
 // matched -- an already-channels-last conv falls through unmatched.
 
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -810,6 +815,9 @@ struct AMDAIEFoldBiasIntoContractionPass
   using AMDAIEFoldBiasIntoContractionBase::AMDAIEFoldBiasIntoContractionBase;
 
   void runOnOperation() override {
+    // See file header: the fold only pays off on an amd-aie device.
+    if (!getFirstDeviceWithRole(getOperation(), DeviceRole::Accelerator))
+      return;
     SmallVector<linalg::MatmulOp> matmuls;
     SmallVector<linalg::LinalgOp> convs;
     getOperation()->walk([&](Operation *op) {

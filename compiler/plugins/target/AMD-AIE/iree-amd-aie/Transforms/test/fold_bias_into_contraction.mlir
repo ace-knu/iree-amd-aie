@@ -2,6 +2,9 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{fold-rhs-transpose=false})' %s | FileCheck %s --check-prefix=NOTRANSPOSE
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{k-align=1})' %s | FileCheck %s --check-prefix=KALIGN1
 
+// Every case below declares an amd-aie device (`@npu`); the pass is a no-op
+// without one (see the last two cases).
+
 // A conv2d (NCHW/FCHW: no channels-last conversion) whose accumulator is a
 // `linalg.broadcast` of a 1-D bias is folded into a single conv with one
 // extra input channel: the channel holds the constant 1.0 across the whole
@@ -27,6 +30,7 @@
 // CHECK: %[[ZERO_FILL:.+]] = linalg.fill
 // CHECK: %[[RESULT:.+]] = linalg.conv_2d_nchw_fchw {{.*}} ins(%[[IN_AUG]], %[[FILT_AUG]] : tensor<1x4x18x18xf32>, tensor<8x4x3x3xf32>) outs(%[[ZERO_FILL]] : tensor<1x8x16x16xf32>)
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @conv_bias_nchw(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x3x3x3xf32>,
                           %bias: tensor<8xf32>) -> tensor<1x8x16x16xf32> {
   %empty = tensor.empty() : tensor<1x8x16x16xf32>
@@ -66,6 +70,7 @@ func.func @conv_bias_nchw(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x3x3x3
 // CHECK: %[[ZERO_FILL:.+]] = linalg.fill
 // CHECK: %[[RESULT:.+]] = linalg.conv_2d_nhwc_hwcf {{.*}} ins(%[[IN_AUG]], %[[FILT_AUG]] : tensor<1x18x18x4xf32>, tensor<3x3x4x8xf32>) outs(%[[ZERO_FILL]] : tensor<1x16x16x8xf32>)
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @conv_bias_nhwc(%input: tensor<1x18x18x3xf32>, %filter: tensor<3x3x3x8xf32>,
                           %bias: tensor<8xf32>) -> tensor<1x16x16x8xf32> {
   %empty_nchw = tensor.empty() : tensor<1x8x16x16xf32>
@@ -89,6 +94,7 @@ func.func @conv_bias_nhwc(%input: tensor<1x18x18x3xf32>, %filter: tensor<3x3x3x8
 // CHECK-SAME: outs(%[[FILL]]
 // CHECK-NOT: tensor.insert_slice
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @conv_only(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x3x3x3xf32>) -> tensor<1x8x16x16xf32> {
   %empty = tensor.empty() : tensor<1x8x16x16xf32>
   %zero = arith.constant 0.0 : f32
@@ -164,6 +170,7 @@ func.func @matmul_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
 // CHECK: tensor.insert_slice %[[LHS]]
 // CHECK: %[[RESULT:.+]] = linalg.matmul
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_post_add_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
                                  %bias: tensor<128xf32>) -> tensor<64x128xf32> {
   %empty = tensor.empty() : tensor<64x128xf32>
@@ -195,6 +202,7 @@ func.func @matmul_post_add_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf
 // CHECK-SAME: outs(%[[FILL]]
 // CHECK-NOT: tensor.insert_slice
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_only(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>) -> tensor<64x128xf32> {
   %empty = tensor.empty() : tensor<64x128xf32>
   %zero = arith.constant 0.0 : f32
@@ -214,6 +222,7 @@ func.func @matmul_only(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>) -> t
 // CHECK: %[[RESULT:.+]] = linalg.matmul
 // CHECK-NOT: tensor.insert_slice
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_row_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
                             %bias: tensor<64xf32>) -> tensor<64x128xf32> {
   %empty = tensor.empty() : tensor<64x128xf32>
@@ -248,6 +257,7 @@ func.func @matmul_row_bias(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
 // CHECK: %[[RESULT:.+]] = linalg.matmul
 // CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<64x256xf32>, tensor<128x256xf32>)
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf32>,
                                %bias: tensor<128xf32>) -> tensor<64x128xf32> {
   %empty_t = tensor.empty() : tensor<128x128xf32>
@@ -280,6 +290,7 @@ func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf3
 // NOTRANSPOSE: linalg.transpose
 // NOTRANSPOSE: %[[RESULT:.+]] = linalg.matmul
 // NOTRANSPOSE: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf32>,
                                %bias: tensor<128xf32>) -> tensor<64x128xf32> {
   %empty_t = tensor.empty() : tensor<128x128xf32>
@@ -330,6 +341,7 @@ func.func @matmul_transpose_b(%lhs: tensor<64x128xf32>, %rhsT: tensor<128x128xf3
 // CHECK: %[[RESULT:.+]] = linalg.generic
 // CHECK-SAME: ins(%[[MM]],
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_post_add_bias_nonzero_acc(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
                                              %acc: tensor<64x128xf32>,
                                              %bias: tensor<128xf32>) -> tensor<64x128xf32> {
@@ -362,6 +374,7 @@ func.func @matmul_post_add_bias_nonzero_acc(%lhs: tensor<64x128xf32>, %rhs: tens
 // CHECK: %[[RESULT:.+]] = linalg.matmul
 // CHECK-NOT: linalg.generic
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_post_add_bias_defined_late(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
                                               %bias2d: tensor<1x128xf32>) -> tensor<64x128xf32> {
   %empty = tensor.empty() : tensor<64x128xf32>
@@ -395,6 +408,7 @@ func.func @matmul_post_add_bias_defined_late(%lhs: tensor<64x128xf32>, %rhs: ten
 // CHECK: %[[RESULT:.+]] = linalg.matmul
 // CHECK-NOT: tensor.insert_slice
 // CHECK: return %[[RESULT]]
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_bias_transposed_broadcast(%lhs: tensor<128x128xf32>, %rhs: tensor<128x128xf32>,
                                              %bias: tensor<128xf32>) -> tensor<128x128xf32> {
   %empty = tensor.empty() : tensor<128x128xf32>
@@ -419,6 +433,7 @@ func.func @matmul_bias_transposed_broadcast(%lhs: tensor<128x128xf32>, %rhs: ten
 // CHECK-LABEL: @matmul_bias_dynamic_m
 // CHECK:       linalg.generic
 // CHECK:       linalg.matmul {{.*}} tensor<?x128xf32>, tensor<128x128xf32>
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_bias_dynamic_m(%lhs: tensor<?x128xf32>, %rhs: tensor<128x128xf32>,
                                  %bias: tensor<128xf32>) -> tensor<?x128xf32> {
   %c0 = arith.constant 0 : index
@@ -449,6 +464,7 @@ func.func @matmul_bias_dynamic_m(%lhs: tensor<?x128xf32>, %rhs: tensor<128x128xf
 // CHECK: %[[ONE:.+]] = arith.constant 1 : i32
 // CHECK: %[[ONES:.+]] = linalg.fill ins(%[[ONE]] : i32) outs({{.*}} : tensor<1x1x18x18xi32>)
 // CHECK: linalg.conv_2d_nchw_fchw {{.*}} ins({{.*}} : tensor<1x4x18x18xi32>, tensor<8x4x3x3xi32>)
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @conv_bias_nchw_i32(%input: tensor<1x3x18x18xi32>, %filter: tensor<8x3x3x3xi32>,
                               %bias: tensor<8xi32>) -> tensor<1x8x16x16xi32> {
   %empty = tensor.empty() : tensor<1x8x16x16xi32>
@@ -466,6 +482,7 @@ func.func @conv_bias_nchw_i32(%input: tensor<1x3x18x18xi32>, %filter: tensor<8x3
 // CHECK: %[[ONE:.+]] = arith.constant 1 : i32
 // CHECK: %[[ONES:.+]] = linalg.fill ins(%[[ONE]] : i32) outs({{.*}} : tensor<64x1xi32>)
 // CHECK: linalg.matmul ins({{.*}} : tensor<64x256xi32>, tensor<256x128xi32>)
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_bias_i32(%lhs: tensor<64x128xi32>, %rhs: tensor<128x128xi32>,
                            %bias: tensor<128xi32>) -> tensor<64x128xi32> {
   %empty = tensor.empty() : tensor<64x128xi32>
@@ -490,6 +507,7 @@ func.func @matmul_bias_i32(%lhs: tensor<64x128xi32>, %rhs: tensor<128x128xi32>,
 // CHECK-LABEL: @matmul_bias_i8_i32
 // CHECK: linalg.generic
 // CHECK: linalg.matmul ins({{.*}} : tensor<64x128xi8>, tensor<128x128xi8>)
+util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
 func.func @matmul_bias_i8_i32(%lhs: tensor<64x128xi8>, %rhs: tensor<128x128xi8>,
                               %bias: tensor<128xi32>) -> tensor<64x128xi32> {
   %empty = tensor.empty() : tensor<64x128xi32>
@@ -504,4 +522,46 @@ func.func @matmul_bias_i8_i32(%lhs: tensor<64x128xi8>, %rhs: tensor<128x128xi8>,
   %result = linalg.matmul ins(%lhs, %rhs : tensor<64x128xi8>, tensor<128x128xi8>)
                           outs(%bias_bcast : tensor<64x128xi32>) -> tensor<64x128xi32>
   return %result : tensor<64x128xi32>
+}
+
+// -----
+
+// Only a CPU device is declared: the shim-channel limit the fold works around
+// does not exist there, so the bias accumulator is left as is.
+
+// CHECK-LABEL: @matmul_bias_cpu_only
+// CHECK: linalg.generic
+// CHECK: linalg.matmul ins({{.*}} : tensor<64x128xf32>, tensor<128x128xf32>)
+util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+func.func @matmul_bias_cpu_only(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
+                                %bias: tensor<128xf32>) -> tensor<64x128xf32> {
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      linalg.yield %in : f32
+  } -> tensor<64x128xf32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                          outs(%bias_bcast : tensor<64x128xf32>) -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
+}
+
+// -----
+
+// No device declared at all: same, left as is.
+
+// CHECK-LABEL: @conv_bias_no_device
+// CHECK: linalg.broadcast
+// CHECK: linalg.conv_2d_nchw_fchw {{.*}} ins({{.*}} : tensor<1x3x18x18xf32>, tensor<8x3x3x3xf32>)
+func.func @conv_bias_no_device(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x3x3x3xf32>,
+                               %bias: tensor<8xf32>) -> tensor<1x8x16x16xf32> {
+  %empty = tensor.empty() : tensor<1x8x16x16xf32>
+  %broadcasted = linalg.broadcast ins(%bias : tensor<8xf32>) outs(%empty : tensor<1x8x16x16xf32>) dimensions = [0, 2, 3]
+  %result = linalg.conv_2d_nchw_fchw {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x3x18x18xf32>, tensor<8x3x3x3xf32>)
+      outs(%broadcasted : tensor<1x8x16x16xf32>) -> tensor<1x8x16x16xf32>
+  return %result : tensor<1x8x16x16xf32>
 }
