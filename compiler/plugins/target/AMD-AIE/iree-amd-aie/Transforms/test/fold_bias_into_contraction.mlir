@@ -4,7 +4,7 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{k-align=1})' %s | FileCheck %s --check-prefix=KALIGN1
 
 // Every case below declares an amd-aie device (`@npu`); the pass is a no-op
-// without one (see the last two cases).
+// without one (see the CPU-only and no-device cases at the end).
 //
 // The conv fold is opt-in (`fold-conv-bias`, default false, like
 // --iree-amdaie-fold-conv-bias-into-contraction), so the main CHECK run turns
@@ -577,4 +577,55 @@ func.func @conv_bias_no_device(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x
       ins(%input, %filter : tensor<1x3x18x18xf32>, tensor<8x3x3x3xf32>)
       outs(%broadcasted : tensor<1x8x16x16xf32>) -> tensor<1x8x16x16xf32>
   return %result : tensor<1x8x16x16xf32>
+}
+
+// -----
+
+// amd-aie is not the device's first executable target: still an amd-aie
+// compile, so the fold runs.
+
+// CHECK-LABEL: @matmul_bias_aie_second_target
+// CHECK-NOT: linalg.generic
+// CHECK: linalg.matmul ins({{.*}} : tensor<64x256xf32>, tensor<256x128xf32>)
+util.global private @dev = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>, #hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device
+func.func @matmul_bias_aie_second_target(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
+                                         %bias: tensor<128xf32>) -> tensor<64x128xf32> {
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      linalg.yield %in : f32
+  } -> tensor<64x128xf32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                          outs(%bias_bcast : tensor<64x128xf32>) -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
+}
+
+// -----
+
+// amd-aie is one candidate of a runtime device selection: the fold runs (it
+// is module-wide, so it also applies if the CPU candidate is picked; same
+// result, only the extra K work).
+
+// CHECK-LABEL: @matmul_bias_select
+// CHECK-NOT: linalg.generic
+// CHECK: linalg.matmul ins({{.*}} : tensor<64x256xf32>, tensor<256x128xf32>)
+util.global private @dev = #hal.device.select<[#hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device, #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {target_device = "npu4"}>]> : !hal.device]> : !hal.device
+func.func @matmul_bias_select(%lhs: tensor<64x128xf32>, %rhs: tensor<128x128xf32>,
+                              %bias: tensor<128xf32>) -> tensor<64x128xf32> {
+  %empty = tensor.empty() : tensor<64x128xf32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xf32>) outs(%empty : tensor<64x128xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      linalg.yield %in : f32
+  } -> tensor<64x128xf32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<64x128xf32>, tensor<128x128xf32>)
+                          outs(%bias_bcast : tensor<64x128xf32>) -> tensor<64x128xf32>
+  return %result : tensor<64x128xf32>
 }

@@ -815,9 +815,12 @@ struct AMDAIEFoldBiasIntoContractionPass
   using AMDAIEFoldBiasIntoContractionBase::AMDAIEFoldBiasIntoContractionBase;
 
   void runOnOperation() override {
-    // See file header: the fold only pays off on an amd-aie device.
-    if (!getFirstDeviceWithRole(getOperation(), DeviceRole::Accelerator))
-      return;
+    // See file header: the fold only pays off on an amd-aie device. Any
+    // declared one counts, including a later executable target or a
+    // `#hal.device.select` candidate: missing it leaves a third contraction
+    // operand the NPU cannot bind, while folding for a device that turns out
+    // not to be the NPU only costs the extra K work.
+    if (!anyDeviceHasRole(getOperation(), DeviceRole::Accelerator)) return;
     SmallVector<linalg::MatmulOp> matmuls;
     SmallVector<linalg::LinalgOp> convs;
     getOperation()->walk([&](Operation *op) {

@@ -63,4 +63,29 @@ IREE::HAL::DeviceAffinityAttr getFirstDeviceWithRole(ModuleOp module,
   return {};
 }
 
+static bool deviceAttrHasRole(Attribute attr, DeviceRole role) {
+  if (auto target = dyn_cast_if_present<IREE::HAL::DeviceTargetAttr>(attr)) {
+    return llvm::any_of(target.getExecutableTargets(),
+                        [&](IREE::HAL::ExecutableTargetAttr executable) {
+                          return deviceRole(
+                                     executable.getBackend().getValue()) ==
+                                 role;
+                        });
+  }
+  if (auto select = dyn_cast_if_present<IREE::HAL::DeviceSelectAttr>(attr)) {
+    return llvm::any_of(select.getDevices(), [&](Attribute candidate) {
+      return deviceAttrHasRole(candidate, role);
+    });
+  }
+  return false;
+}
+
+bool anyDeviceHasRole(ModuleOp module, DeviceRole role) {
+  return llvm::any_of(
+      module.getOps<IREE::Util::GlobalOpInterface>(),
+      [&](IREE::Util::GlobalOpInterface global) {
+        return deviceAttrHasRole(global.getGlobalInitialValue(), role);
+      });
+}
+
 }  // namespace mlir::iree_compiler::AMDAIE

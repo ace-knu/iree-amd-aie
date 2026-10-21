@@ -53,6 +53,13 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend);
 IREE::HAL::DeviceAffinityAttr getFirstDeviceWithRole(ModuleOp module,
                                                      DeviceRole role);
 
+/// Whether any device global in `module` can run a backend with `role`,
+/// looking at every executable target of a `#hal.device.target` and every
+/// candidate of a `#hal.device.select` -- unlike `getDeviceBackend`, which
+/// reads only a plain target's first executable target. For a module-wide
+/// question ("is this compile for amd-aie at all?") rather than placement.
+bool anyDeviceHasRole(ModuleOp module, DeviceRole role);
+
 }  // namespace mlir::iree_compiler::AMDAIE
 
 #endif  // IREE_AMD_AIE_TRANSFORMS_UTILS_AMDAIEDEVICEPLACEMENTUTILS_H_
