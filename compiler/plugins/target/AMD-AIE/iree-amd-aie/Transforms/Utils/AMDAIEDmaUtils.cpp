@@ -9,6 +9,7 @@
 #include "AMDAIEUtils.h"
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -920,6 +921,85 @@ LogicalResult foldDimsAndReturnAsStatic(
   newSizes = std::move(maybeStaticSizes.value());
   newStrides = std::move(maybeStaticStrides.value());
   return success();
+}
+
+/// Returns the number of elements an access pattern covers if, after its
+/// leading repetition dimensions (stride 0), it walks a contiguous range in
+/// increasing address order. Returns std::nullopt otherwise.
+static std::optional<int64_t> getContiguousLength(
+    ArrayRef<OpFoldResult> sizes, ArrayRef<OpFoldResult> strides) {
+  if (sizes.empty() || sizes.size() != strides.size()) return std::nullopt;
+  std::optional<SmallVector<int64_t>> staticSizes = getConstantIntValues(sizes);
+  std::optional<SmallVector<int64_t>> staticStrides =
+      getConstantIntValues(strides);
+  if (!staticSizes || !staticStrides) return std::nullopt;
+  size_t firstDataDim = 0;
+  while (firstDataDim < staticStrides->size() &&
+         (*staticStrides)[firstDataDim] == 0) {
+    ++firstDataDim;
+  }
+  int64_t expectedStride = 1;
+  for (int64_t i = static_cast<int64_t>(staticSizes->size()) - 1;
+       i >= static_cast<int64_t>(firstDataDim); --i) {
+    int64_t size = (*staticSizes)[i];
+    if (size == 1) continue;
+    if ((*staticStrides)[i] != expectedStride) return std::nullopt;
+    expectedStride *= size;
+  }
+  return expectedStride;
+}
+
+std::optional<SmallVector<JoinSlice>> getContiguousJoinSlices(
+    LogicalObjFifoOpInterface op) {
+  if (op.getMemorySpaceAsUInt() != 1) return std::nullopt;
+  llvm::SmallDenseSet<Value> tiles;
+  for (Value tile : op.getTiles()) tiles.insert(tile);
+  if (tiles.size() != 1) return std::nullopt;
+  SmallVector<CopyOpInterface> producers = op.getCopyLikeProducers();
+  SmallVector<CopyOpInterface> consumers = op.getCopyLikeConsumers();
+  if (producers.size() < 2 || consumers.size() != 1) return std::nullopt;
+  // Producers and the consumer must repeat the same number of times, so that
+  // the i-th fill of a buffer region pairs with the i-th drain.
+  if (failed(getRepetitionCount(op))) return std::nullopt;
+
+  SmallVector<JoinSlice> slices;
+  for (CopyOpInterface producer : producers) {
+    auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(producer.getOperation());
+    if (!connectionOp) return std::nullopt;
+    FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> dmaOp =
+        connectionOp.getNpuCircularDmaCpyNdUser();
+    if (failed(dmaOp)) return std::nullopt;
+    std::optional<int64_t> offset = dmaOp->getTargetStaticBaseOffset();
+    std::optional<int64_t> length = getContiguousLength(
+        dmaOp->getTargetMixedSizes(), dmaOp->getTargetMixedStrides());
+    if (!offset || !length) return std::nullopt;
+    slices.push_back({connectionOp, *offset, *length});
+  }
+  llvm::sort(slices, [](const JoinSlice &a, const JoinSlice &b) {
+    return a.offset < b.offset;
+  });
+  for (size_t i = 1; i < slices.size(); ++i) {
+    if (slices[i - 1].offset + slices[i - 1].length != slices[i].offset)
+      return std::nullopt;
+  }
+
+  auto consumerOp = dyn_cast<AMDAIE::ConnectionOp>(consumers[0].getOperation());
+  if (!consumerOp) return std::nullopt;
+  FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> consumerDmaOp =
+      consumerOp.getNpuCircularDmaCpyNdUser();
+  if (failed(consumerDmaOp)) return std::nullopt;
+  std::optional<int64_t> consumerOffset =
+      consumerDmaOp->getSourceStaticBaseOffset();
+  std::optional<int64_t> consumerLength = getContiguousLength(
+      consumerDmaOp->getSourceMixedSizes(),
+      consumerDmaOp->getSourceMixedStrides());
+  int64_t joinedLength =
+      slices.back().offset + slices.back().length - slices.front().offset;
+  if (consumerOffset != slices.front().offset ||
+      consumerLength != joinedLength) {
+    return std::nullopt;
+  }
+  return slices;
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

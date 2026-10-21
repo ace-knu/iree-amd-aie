@@ -18,6 +18,7 @@
 #include "aie/AIEXDialect.h"
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/IR/AMDAIEOps.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEDmaUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
@@ -82,6 +83,17 @@ class AIEDeviceBuilder {
       const SmallVector<AIE::BufferOp> &bufferOps,
       const std::pair<AIE::LockOp, AIE::LockOp> &locks,
       std::optional<uint8_t> pktId);
+
+  /// Utility to create the consumer-side MM2S DMA blocks of a join (see
+  /// `getContiguousJoinSlices`) and add them to `memOp`. Every buffer is
+  /// drained as one BD per producer region, in region order, each guarded by
+  /// that producer's own lock pair. `slices`, `producerLocks` and
+  /// `consumerLocks` are index-aligned.
+  LogicalResult createJoinConsumerDMABlocks(
+      Operation *memOp, int channelIndex,
+      const SmallVector<AIE::BufferOp> &bufferOps,
+      ArrayRef<JoinSlice> slices, ArrayRef<AIE::LockOp> producerLocks,
+      ArrayRef<AIE::LockOp> consumerLocks, std::optional<uint8_t> pktId);
 
   /// Utility to create flow ops from connection ops.
   SmallVector<Operation *> createFlowOps(

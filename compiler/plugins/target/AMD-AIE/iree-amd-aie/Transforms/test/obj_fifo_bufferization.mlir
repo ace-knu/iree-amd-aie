@@ -163,3 +163,90 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
     return
   }
 }
+
+// -----
+
+// Two producers write disjoint, contiguous halves of an L2 buffer that a single
+// consumer drains in order: every producer gets its own lock pair.
+// CHECK-LABEL: @join_per_producer_lock_pairs
+// CHECK:         %[[TILE_0_1:.+]] = amdaie.tile
+// CHECK-NEXT:    %[[BUFFER:.+]] = amdaie.buffer(%[[TILE_0_1]]) : memref<2048xi32, 1 : i32>
+// CHECK-NEXT:    %[[BUFFER_1:.+]] = amdaie.buffer(%[[TILE_0_1]]) : memref<2048xi32, 1 : i32>
+// CHECK-NEXT:    %[[PROD_0:.+]] = amdaie.lock(%[[TILE_0_1]](0), 2)
+// CHECK-NEXT:    %[[CONS_0:.+]] = amdaie.lock(%[[TILE_0_1]](1), 0)
+// CHECK-NEXT:    %[[PROD_1:.+]] = amdaie.lock(%[[TILE_0_1]](2), 2)
+// CHECK-NEXT:    %[[CONS_1:.+]] = amdaie.lock(%[[TILE_0_1]](3), 0)
+// CHECK:         amdaie.logicalobjectfifo.from_buffers({%[[BUFFER]], %[[BUFFER_1]]}, {%[[PROD_0]], %[[PROD_1]]}, {%[[CONS_0]], %[[CONS_1]]})
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @join_per_producer_lock_pairs(%arg0: memref<1024xi32, 2 : i32>, %arg1: memref<1024xi32, 2 : i32>, %arg2: memref<2048xi32, 1 : i32>, %arg3: memref<2048xi32, 2 : i32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    amdaie.workgroup {
+      %tile_0_1 = amdaie.tile(%c0, %c1)
+      %tile_0_2 = amdaie.tile(%c0, %c2)
+      %tile_0_3 = amdaie.tile(%c0, %c3)
+      %tile_0_4 = amdaie.tile(%c0, %c4)
+      %0 = amdaie.logicalobjectfifo.from_memref %arg0, {%tile_0_2} : memref<1024xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>
+      %1 = amdaie.logicalobjectfifo.from_memref %arg1, {%tile_0_3} : memref<1024xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>
+      %2 = amdaie.logicalobjectfifo.from_memref %arg2, {%tile_0_1} : memref<2048xi32, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>
+      %3 = amdaie.logicalobjectfifo.from_memref %arg3, {%tile_0_4} : memref<2048xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<2048xi32, 2 : i32>, 2>
+      %4 = amdaie.connection(%2, %0) : (!amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>)
+      %5 = amdaie.connection(%2, %1) : (!amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>)
+      %6 = amdaie.connection(%3, %2) : (!amdaie.logicalobjectfifo<memref<2048xi32, 2 : i32>, 2>, !amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>)
+      amdaie.controlcode {
+        %7 = amdaie.npu.circular_dma_cpy_nd %4([0] [1024] [1], [] [] [])
+        %8 = amdaie.npu.circular_dma_cpy_nd %5([1024] [1024] [1], [] [] [])
+        %9 = amdaie.npu.circular_dma_cpy_nd %6([] [] [], [0] [2048] [1])
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// Producer regions overlap, so the join can't be synchronized per producer and
+// keeps one lock pair shared by both producers.
+// CHECK-LABEL: @join_overlapping_regions_shared_lock
+// CHECK:         %[[TILE_0_1:.+]] = amdaie.tile
+// CHECK-NEXT:    %[[BUFFER:.+]] = amdaie.buffer(%[[TILE_0_1]]) : memref<2048xi32, 1 : i32>
+// CHECK-NEXT:    %[[BUFFER_1:.+]] = amdaie.buffer(%[[TILE_0_1]]) : memref<2048xi32, 1 : i32>
+// CHECK-NEXT:    %[[PROD:.+]] = amdaie.lock(%[[TILE_0_1]](0), 4)
+// CHECK-NEXT:    %[[CONS:.+]] = amdaie.lock(%[[TILE_0_1]](1), 0)
+// CHECK-NEXT:    amdaie.tile
+// CHECK:         amdaie.logicalobjectfifo.from_buffers({%[[BUFFER]], %[[BUFFER_1]]}, {%[[PROD]]}, {%[[CONS]]})
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @join_overlapping_regions_shared_lock(%arg0: memref<1024xi32, 2 : i32>, %arg1: memref<1024xi32, 2 : i32>, %arg2: memref<2048xi32, 1 : i32>, %arg3: memref<2048xi32, 2 : i32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    amdaie.workgroup {
+      %tile_0_1 = amdaie.tile(%c0, %c1)
+      %tile_0_2 = amdaie.tile(%c0, %c2)
+      %tile_0_3 = amdaie.tile(%c0, %c3)
+      %tile_0_4 = amdaie.tile(%c0, %c4)
+      %0 = amdaie.logicalobjectfifo.from_memref %arg0, {%tile_0_2} : memref<1024xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>
+      %1 = amdaie.logicalobjectfifo.from_memref %arg1, {%tile_0_3} : memref<1024xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>
+      %2 = amdaie.logicalobjectfifo.from_memref %arg2, {%tile_0_1} : memref<2048xi32, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>
+      %3 = amdaie.logicalobjectfifo.from_memref %arg3, {%tile_0_4} : memref<2048xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<2048xi32, 2 : i32>, 2>
+      %4 = amdaie.connection(%2, %0) : (!amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>)
+      %5 = amdaie.connection(%2, %1) : (!amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>, !amdaie.logicalobjectfifo<memref<1024xi32, 2 : i32>, 2>)
+      %6 = amdaie.connection(%3, %2) : (!amdaie.logicalobjectfifo<memref<2048xi32, 2 : i32>, 2>, !amdaie.logicalobjectfifo<memref<2048xi32, 1 : i32>, 2>)
+      amdaie.controlcode {
+        %7 = amdaie.npu.circular_dma_cpy_nd %4([0] [1024] [1], [] [] [])
+        %8 = amdaie.npu.circular_dma_cpy_nd %5([512] [1024] [1], [] [] [])
+        %9 = amdaie.npu.circular_dma_cpy_nd %6([] [] [], [0] [2048] [1])
+        amdaie.end
+      }
+    }
+    return
+  }
+}
