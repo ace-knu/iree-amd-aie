@@ -605,6 +605,38 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
 
 // -----
 
+// A loop that moves the access is subsumed even past the max repeat count (256),
+// as it becomes a dimension with a non-zero stride, not a repeat.
+// CHECK-LABEL: @exceed_max_repeat_count_with_dependency
+// CHECK:       %[[CONNECTION:.+]] = amdaie.connection
+// CHECK:       amdaie.controlcode
+// CHECK-NOT:   scf.for
+// CHECK:       %[[NPU_DMA:.+]] = amdaie.npu.dma_cpy_nd async_source %[[CONNECTION]]([] [] [], [0, 0, 0] [300, 8, 16] [128, 16, 1])
+// CHECK:       amdaie.npu.dma_wait(%[[NPU_DMA]] : !amdaie.async_source_token)
+#map = affine_map<(d0) -> (d0 * 8)>
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @exceed_max_repeat_count_with_dependency(%arg0: !amdaie.logicalobjectfifo<memref<1x1x8x16xi32, 1>>, %arg1: !amdaie.logicalobjectfifo<memref<2400x16xi32>>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c300 = arith.constant 300 : index
+    amdaie.workgroup {
+      %0 = amdaie.connection(%arg0, %arg1) : (!amdaie.logicalobjectfifo<memref<1x1x8x16xi32, 1>>, !amdaie.logicalobjectfifo<memref<2400x16xi32>>)
+      amdaie.controlcode {
+        scf.for %arg2 = %c0 to %c300 step %c1 {
+          %1 = affine.apply #map(%arg2)
+          %2 = amdaie.npu.dma_cpy_nd async_source %0([] [] [], [%1, 0] [8, 16] [16, 1])
+          amdaie.npu.dma_wait(%2 : !amdaie.async_source_token)
+        }
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
 // Don't subsume if inter stride (dim 0 in a four dimensional size array) or intra stride
 // (dim 1, 2, 3 in a four dimensional size array) is too large.
 // CHECK:       #[[$MAP:.+]] = affine_map<(d0) -> (d0 * 1048577)>

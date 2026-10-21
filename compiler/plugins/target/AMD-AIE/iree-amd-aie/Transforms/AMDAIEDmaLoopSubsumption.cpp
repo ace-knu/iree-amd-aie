@@ -184,8 +184,6 @@ struct SubsumeLoopIntoDMA
     SmallVector<OpFoldResult> newTargetSizes = op.getTargetMixedSizes();
     SmallVector<OpFoldResult> newTargetStrides = op.getTargetMixedStrides();
 
-    uint32_t maxRepeatCount =
-        deviceModel.getMaxRepeatCount(AMDAIE::AMDAIETileType::SHIMNOC);
     // Verify number of dimensions needed to subsume this loop into the strided
     // access pattern and fail early if there aren't enough dimensions.
     size_t nbNonUnitIterations{0};
@@ -193,13 +191,25 @@ struct SubsumeLoopIntoDMA
       const int64_t nbIterations = calculateNbIterations(lb, ub, step);
       // We should not do any rewrite if we encounter a loop with no iterations.
       if (nbIterations == 0) return failure();
-      // We should not do any rewrite if the total loop iteration is greater
-      // than the maximum repeat count allowed and the op in concern is a
-      // non-circular DmaCpyNd op.
-      if (nbIterations > maxRepeatCount && isa<AMDAIE::NpuDmaCpyNdOp>(op))
-        return failure();
       if (nbIterations > 1) nbNonUnitIterations++;
     }
+
+    // A dimension with a zero stride repeats the data of the dimensions inside
+    // it, which a non-circular DmaCpyNd op does with the buffer descriptor
+    // repeat count. `isValidAccessPattern` skips such dimensions, so check
+    // their sizes against the maximum repeat count here. A loop that moves
+    // the access instead becomes a dimension with a non-zero stride, which
+    // `isValidAccessPattern` checks against the wrap limits.
+    uint32_t maxRepeatCount =
+        deviceModel.getMaxRepeatCount(AMDAIE::AMDAIETileType::SHIMNOC);
+    auto exceedsRepeatCount = [&](ArrayRef<int64_t> sizes,
+                                  ArrayRef<int64_t> strides) {
+      if (!isa<AMDAIE::NpuDmaCpyNdOp>(op)) return false;
+      return llvm::any_of(llvm::zip(sizes, strides), [&](auto sizeAndStride) {
+        auto [size, stride] = sizeAndStride;
+        return stride == 0 && size > maxRepeatCount;
+      });
+    };
 
     std::optional<SmallVector<int64_t>> staticSourceSizes =
         getConstantIntValues(newSourceSizes);
@@ -300,7 +310,8 @@ struct SubsumeLoopIntoDMA
         SmallVector<int64_t> newSourceStridesInt =
             insertInFront(newSourceStrides, insertSourceStrides);
         if (!sourceDmaDimConfig.isValidAccessPattern(newSourceSizesInt,
-                                                     newSourceStridesInt)) {
+                                                     newSourceStridesInt) ||
+            exceedsRepeatCount(newSourceSizesInt, newSourceStridesInt)) {
           return failure();
         }
       }
@@ -320,7 +331,8 @@ struct SubsumeLoopIntoDMA
         SmallVector<int64_t> newTargetStridesInt =
             insertInFront(newTargetStrides, insertTargetStrides);
         if (!targetDmaDimConfig.isValidAccessPattern(newTargetSizesInt,
-                                                     newTargetStridesInt)) {
+                                                     newTargetStridesInt) ||
+            exceedsRepeatCount(newTargetSizesInt, newTargetStridesInt)) {
           return failure();
         }
       }
