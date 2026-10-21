@@ -118,6 +118,23 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | N08 | `third_party/iree/runtime/src/iree/hal/drivers/vulkan/{access,, memory_type,, memory_types.dispatch_idx, type, type,, usage,}` (0바이트 6개, 8/27 21:04) | **출처 불명**(전임자 시기). 이름이 C 코드 조각이라 셸 리다이렉트 실수로 생긴 파일로 **추정** | 없음 | 9/28 01 `untracked_files.txt` | 커밋 제외 |
 | N09 | `docs/` 아래 날짜 폴더(9/28~10/20), `docs/regression/`, `docs/CHANGES.md` | 우리 | 작업 문서·회귀 스크립트 | — | 커밋 여부는 챕터 04 결정 |
 
+### 2-4. 통합 브랜치 변경 (`integrate/3devices-f32+aie2p-bf16`, 규민 merge `fe7f132e` 이후)
+
+줄 번호는 통합 브랜치 worktree 기준이다(`+시작,길이`). 위 2-1~2-3과 달리 기준은 merge `fe7f132e`다.
+
+| ID | 파일 | 덩어리 | 내용 | 출처(세션·챕터) | 이유 문서 | 명세 |
+|---|---|---|---|---|---|---|
+| R01 | `runtime/…/aie_runtime/iree_aie_runtime.h` | +609,6 | `getRoundingModeCtrlReg()` 선언 | 10/21 세션1 챕터04(10/22 작업) | `docs/2026-10-21/1_규민브랜치_통합/03b_반올림_설계초안/`, `04_반올림_구현/` | S11 |
+| R02 | `runtime/…/aie_runtime/iree_aie_runtime.cc` | +623,12 | 정의: AIE2 6, AIE2P 1, 그 밖 `nullopt` | 같음 | 같음 | S11 |
+| R03 | `compiler/…/aie/Passes.td` | +56,7 | `AMDAIECoreToStandard` 옵션 `rounding-mode`(기본 `auto`) | 같음 | 같음 | S11 |
+| R04 | `compiler/…/aie/AMDAIECoreToStandard.cpp` | +10 / +118,26 / +145,2 / +170,15 / +276,36 / +331,15 | include, 모드 값 표·`CoreRoundingMode`, `coreToStd` 진입부 `call @llvm.<arch>.set.ctrl.reg`, 모드 결정(auto·none·이름·오류·chess 경고), 선언 생성 | 같음 | 같음 | S11 |
+| R05 | `iree-amd-aie/Target/XCLBinGen.h` | +32,2 | `aie2xclbin` 끝 인자 `coreRoundingMode = "auto"` | 같음 | 같음 | S11 |
+| R06 | `iree-amd-aie/Target/XCLBinGen.cpp` | +1300,2 / +1311 / +1568,2 / +1588 | `generateUnifiedObject`·`aie2xclbin`에 전달, `options.roundingMode` | 같음 | 같음 | S11 |
+| R07 | `iree-amd-aie/Target/AIETarget.h` | +43,4 / +138,10 | 필드 `coreRoundingMode{"auto"}`, CLI `--iree-amdaie-core-rounding-mode` | 같음 | 같음 | S11 |
+| R08 | `iree-amd-aie/Target/AIETarget.cpp` | +656,2 | `aie2xclbin` 호출에 옵션 전달 | 같음 | 같음 | S11 |
+| R09 | `compiler/…/aie/test/core_rounding_mode.mlir` | 새 파일 | lit(RUN 6줄) | 같음 | 같음 | S11 |
+| R10 | `docs/specs/S11_코어_반올림_설정.md`, `docs/specs/README.md`, 이 파일 | 새 파일·행 추가 | 명세·장부 | 같음 | — | — |
+
 ## 3. 전임자 변경 — 덩어리별 (HEAD → 9/28 기준선)
 
 줄 번호는 **9/28 기준선 patch의 hunk 머리**(그때 작업 트리 줄)다. "현존" = 그 덩어리의 추가 줄이 지금 파일에 남아 있는 정도(확인함, 줄 문자열 대조). "분류": 기능 / 디버그(로그만) / 기능+디버그(한 덩어리에 섞임). 내용 설명과 판정(동작·로그·보류)은 `docs/2026-09-28/01_인수인계_코드현황_파악/README.md` 3-2(파일 목록), 3-4(디버그 인벤토리 A·B·C)를 따른다.
@@ -332,4 +349,5 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | 날짜 | 세션 | 바뀐 것 |
 |---|---|---|
 | 2026-10-20 | 세션 1 챕터 01 | 첫 판(9/28 기준선 대비 우리 56덩어리, 전임자 108덩어리, 새 파일 9묶음, 디버그 11묶음, 우회 목록) |
+| 2026-10-22 | 10/21 세션 1 챕터 04 | **통합 브랜치** 2-4절 R01~R10: 코어 반올림 모드 설정(S11). AIE2P 기본 conv_even, AIE2 기본 넣지 않음. 회귀 26×2·VGG16 2·3장치 출력 그대로, vmfb는 바뀜(NPU 코어 명령 1개). 작업 폴더(`3devices-f32`)에는 없다 |
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |

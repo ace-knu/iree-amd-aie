@@ -16,4 +16,5 @@ CLAUDE.md 1-4의 2(구현 명세) 형식의 주제별 명세다. 변경 장부�
 | S7 | `placement-map` | 수정 Pass(실험 옵션) |
 | S8 | 전임자 `ResolveBufferOwner` + stream hook + 링크 표 | 인수인계 기준선 |
 | S9 | 전임자 런타임 공유 경로 | 인수인계 기준선 |
-| S10 | ukernel bf16 반올림 | **커밋 보류**(백엔드 담당과 상의) |
+| S10 | ukernel bf16 반올림 | **커밋 보류**(백엔드 담당과 상의). S11이 들어가면 Peano 경로에서 중복 → 넣지 않음(10/22) |
+| S11 | 코어 반올림 모드(crRnd) 설정 `rounding-mode` | 수정 Pass(옵션) + 장치 모델. **통합 브랜치**(10/22) |

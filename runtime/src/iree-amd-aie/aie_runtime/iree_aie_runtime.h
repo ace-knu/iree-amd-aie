@@ -606,6 +606,12 @@ struct AMDAIEDeviceModel {
   /// The returned string is used by `peano` to identify the device.
   std::optional<std::string> getTargetArchString() const;
 
+  /// Index of the core control register that selects the rounding mode used
+  /// by SRS, float-to-bf16 and float-to-bfp16 conversions (`crRnd` in the
+  /// Peano `<arch>_defines.h` headers): 6 on AIE2, 1 on AIE2P. Returns
+  /// std::nullopt for architectures without such a register in this model.
+  std::optional<uint32_t> getRoundingModeCtrlReg() const;
+
   uint32_t getColumnShift() const;
   uint32_t getRowShift() const;
 

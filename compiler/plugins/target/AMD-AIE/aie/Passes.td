@@ -53,6 +53,13 @@ def AMDAIECoreToStandard :
   let options = [
     Option<"lowerToChess", "lower-to-chess", "bool", /*default=*/"false",
       "Whether to lower to chess instead of peano.">,
+    Option<"roundingMode", "rounding-mode", "std::string", /*default=*/"\"auto\"",
+      "Rounding mode written to the core rounding control register (crRnd) "
+      "as the first operation of every core function (Peano only). 'auto': "
+      "conv_even on AIE2P, nothing on AIE2. 'none': never written. Otherwise "
+      "one of floor, ceil, sym_floor, sym_ceil, neg_inf, pos_inf, sym_zero, "
+      "sym_inf, conv_even, conv_odd (written on any architecture that has "
+      "the register).">,
   ];
 }
 

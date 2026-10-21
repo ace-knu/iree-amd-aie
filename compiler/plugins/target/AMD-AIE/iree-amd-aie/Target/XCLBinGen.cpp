@@ -1297,7 +1297,8 @@ LogicalResult generateUnifiedObject(
     bool printIRBeforeAll, bool printIRAfterAll, bool printIRModuleScope,
     bool timing, bool useChess, bool verbose, Path &tempDir,
     std::optional<Path> vitisDir, const std::string &targetArch, Path &peanoDir,
-    const std::string &npuVersion, const std::string &additionalPeanoOptFlags) {
+    const std::string &npuVersion, const std::string &additionalPeanoOptFlags,
+    const std::string &coreRoundingMode) {
   assert(deviceOp->getParentOp() && isa<ModuleOp>(deviceOp->getParentOp()) &&
          "DeviceOp must be in a module parent");
 
@@ -1307,6 +1308,7 @@ LogicalResult generateUnifiedObject(
 
   mlir::iree_compiler::AMDAIE::AMDAIECoreToStandardOptions options;
   options.lowerToChess = useChess;
+  options.roundingMode = coreRoundingMode;
   pm.addPass(
       mlir::iree_compiler::AMDAIE::createAMDAIECoreToStandardPass(options));
   addLowerToLLVMPasses(pm);
@@ -1563,7 +1565,8 @@ LogicalResult aie2xclbin(
     const std::string &xclBinKernelID, const std::string &xclBinKernelName,
     const std::string &xclBinInstanceName, const std::string &amdAIEInstallDir,
     const std::optional<std::string> &InputXCLBin,
-    const std::string &additionalPeanoOptFlags, bool enableCtrlPkt) {
+    const std::string &additionalPeanoOptFlags, bool enableCtrlPkt,
+    const std::string &coreRoundingMode) {
   if (outputNpuInstPath.has_value() &&
       failed(emitDenseArrayAttrToFile(deviceOp, "npu_instructions",
                                       outputNpuInstPath.value()))) {
@@ -1582,7 +1585,7 @@ LogicalResult aie2xclbin(
           ctx, deviceOp, unifiedObj.string(), printIRBeforeAll, printIRAfterAll,
           printIRModuleScope, timing, useChess, verbose, tempDirPath,
           vitisDirPath, targetArch, peanoDirPath, npuVersion,
-          additionalPeanoOptFlags))) {
+          additionalPeanoOptFlags, coreRoundingMode))) {
     llvm::errs() << "Failed to generate unified object\n";
     return failure();
   }

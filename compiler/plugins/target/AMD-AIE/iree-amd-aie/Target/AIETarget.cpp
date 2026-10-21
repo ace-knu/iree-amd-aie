@@ -653,7 +653,8 @@ LogicalResult AIETargetBackend::serializeExecutable(
             /*amdAIEInstallDir=*/options.amdAieInstallDir,
             /*InputXCLBin=*/std::nullopt,
             /*additionalPeanoOptFlags=*/options.additionalPeanoOptFlags,
-            /*enableCtrlPkt=*/options.enableCtrlPkt))) {
+            /*enableCtrlPkt=*/options.enableCtrlPkt,
+            /*coreRoundingMode=*/options.coreRoundingMode))) {
       return failure();
     }
 
