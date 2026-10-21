@@ -32,8 +32,8 @@ struct AMDAIEOptions {
   // Use the chess compiler. The default is to use peano.
   bool useChess{false};
 
-  // Use the chess compiler for ukernel. The default is to use chess.
-  bool useChessForUKernel{true};
+  // Use the chess compiler for ukernel. The default is to use peano.
+  bool useChessForUKernel{false};
 
   // Additional flags to run peano's opt with (if peano is the backend compiler
   // selected). These are mostly appended on the end of the default flags, but
