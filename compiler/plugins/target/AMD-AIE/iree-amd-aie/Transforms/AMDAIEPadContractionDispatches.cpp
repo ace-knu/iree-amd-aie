@@ -575,7 +575,7 @@ static Value createBiasOnesPad(OpBuilder &b, Location loc,
   ++onesShape[kDim];
   Value withOnes = tensor::createPadHighOp(
       RankedTensorType::get(onesShape, elemType), src,
-      b.create<arith::ConstantOp>(loc, b.getFloatAttr(elemType, 1.0)),
+      b.create<arith::ConstantOp>(loc, b.getOneAttr(elemType)),
       /*nofold=*/false, loc, b);
   if (ArrayRef<int64_t>(onesShape) == dstType.getShape()) return withOnes;
   return tensor::createPadHighOp(
