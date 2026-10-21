@@ -400,6 +400,11 @@ static LogicalResult foldBiasIntoConv2d(RewriterBase &rewriter,
         conv, "input/filter/bias element types differ; augmenting would "
               "need a cast, not implemented");
   }
+  // The ones channel needs a multiplicative identity of the element type.
+  if (!inputType.getElementType().isIntOrFloat()) {
+    return rewriter.notifyMatchFailure(conv,
+                                       "element type is not integer or float");
+  }
   // The augmented tensors below are built from these shapes with
   // `tensor.empty` and no dynamic sizes, so every dim must be static.
   if (!inputType.hasStaticShape() || !filterType.hasStaticShape()) {
@@ -423,8 +428,8 @@ static LogicalResult foldBiasIntoConv2d(RewriterBase &rewriter,
   onesChannelShape[dims->inputCPos] = 1;
   Value onesEmpty =
       tensor::EmptyOp::create(rewriter, loc, onesChannelShape, elemType);
-  Value one = arith::ConstantOp::create(rewriter, loc,
-                                        rewriter.getFloatAttr(elemType, 1.0));
+  Value one =
+      arith::ConstantOp::create(rewriter, loc, rewriter.getOneAttr(elemType));
   Value onesSlice =
       linalg::FillOp::create(rewriter, loc, one, onesEmpty).getResult(0);
   SmallVector<int64_t> onesOffsets4(4, 0);
@@ -667,6 +672,11 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
         matmul, "lhs/rhs/bias element types differ; augmenting would need a "
                 "cast, not implemented");
   }
+  // The ones column needs a multiplicative identity of the element type.
+  if (!lhsType.getElementType().isIntOrFloat()) {
+    return rewriter.notifyMatchFailure(matmul,
+                                       "element type is not integer or float");
+  }
   // The augmented tensors below are built from these shapes with
   // `tensor.empty` and no dynamic sizes, so every dim must be static.
   if (!lhsType.hasStaticShape() || !rhsType.hasStaticShape()) {
@@ -750,8 +760,8 @@ static LogicalResult foldBiasIntoMatmul(RewriterBase &rewriter,
   onesSliceShape[*lhsKPos] = 1;
   Value onesEmpty =
       tensor::EmptyOp::create(rewriter, loc, onesSliceShape, elemType);
-  Value one = arith::ConstantOp::create(rewriter, loc,
-                                        rewriter.getFloatAttr(elemType, 1.0));
+  Value one =
+      arith::ConstantOp::create(rewriter, loc, rewriter.getOneAttr(elemType));
   Value onesSlice =
       linalg::FillOp::create(rewriter, loc, one, onesEmpty).getResult(0);
   SmallVector<int64_t> onesOffsets(2, 0);

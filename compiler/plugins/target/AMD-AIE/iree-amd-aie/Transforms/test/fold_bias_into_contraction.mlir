@@ -436,3 +436,72 @@ func.func @matmul_bias_dynamic_m(%lhs: tensor<?x128xf32>, %rhs: tensor<128x128xf
                           outs(%bias_bcast : tensor<?x128xf32>) -> tensor<?x128xf32>
   return %result : tensor<?x128xf32>
 }
+
+// -----
+
+// Integer element types fold the same way (the identity holds exactly in
+// two's-complement arithmetic): the ones channel is the integer constant 1,
+// not a float 1.0 -- building the latter for an integer type used to crash
+// (`getFloatAttr` asserts a float type).
+
+// CHECK-LABEL: @conv_bias_nchw_i32
+// CHECK-NOT: linalg.broadcast
+// CHECK: %[[ONE:.+]] = arith.constant 1 : i32
+// CHECK: %[[ONES:.+]] = linalg.fill ins(%[[ONE]] : i32) outs({{.*}} : tensor<1x1x18x18xi32>)
+// CHECK: linalg.conv_2d_nchw_fchw {{.*}} ins({{.*}} : tensor<1x4x18x18xi32>, tensor<8x4x3x3xi32>)
+func.func @conv_bias_nchw_i32(%input: tensor<1x3x18x18xi32>, %filter: tensor<8x3x3x3xi32>,
+                              %bias: tensor<8xi32>) -> tensor<1x8x16x16xi32> {
+  %empty = tensor.empty() : tensor<1x8x16x16xi32>
+  %broadcasted = linalg.broadcast ins(%bias : tensor<8xi32>) outs(%empty : tensor<1x8x16x16xi32>) dimensions = [0, 2, 3]
+  %result = linalg.conv_2d_nchw_fchw {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>}
+      ins(%input, %filter : tensor<1x3x18x18xi32>, tensor<8x3x3x3xi32>)
+      outs(%broadcasted : tensor<1x8x16x16xi32>) -> tensor<1x8x16x16xi32>
+  return %result : tensor<1x8x16x16xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @matmul_bias_i32
+// CHECK-NOT: linalg.generic
+// CHECK: %[[ONE:.+]] = arith.constant 1 : i32
+// CHECK: %[[ONES:.+]] = linalg.fill ins(%[[ONE]] : i32) outs({{.*}} : tensor<64x1xi32>)
+// CHECK: linalg.matmul ins({{.*}} : tensor<64x256xi32>, tensor<256x128xi32>)
+func.func @matmul_bias_i32(%lhs: tensor<64x128xi32>, %rhs: tensor<128x128xi32>,
+                           %bias: tensor<128xi32>) -> tensor<64x128xi32> {
+  %empty = tensor.empty() : tensor<64x128xi32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xi32>) outs(%empty : tensor<64x128xi32>) {
+    ^bb0(%in: i32, %out: i32):
+      linalg.yield %in : i32
+  } -> tensor<64x128xi32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<64x128xi32>, tensor<128x128xi32>)
+                          outs(%bias_bcast : tensor<64x128xi32>) -> tensor<64x128xi32>
+  return %result : tensor<64x128xi32>
+}
+
+// -----
+
+// Quantized form (i8 x i8 accumulating into an i32 bias): the bias does not
+// fit the i8 operands' type, so the K+1 row cannot hold it. Left untouched.
+
+// CHECK-LABEL: @matmul_bias_i8_i32
+// CHECK: linalg.generic
+// CHECK: linalg.matmul ins({{.*}} : tensor<64x128xi8>, tensor<128x128xi8>)
+func.func @matmul_bias_i8_i32(%lhs: tensor<64x128xi8>, %rhs: tensor<128x128xi8>,
+                              %bias: tensor<128xi32>) -> tensor<64x128xi32> {
+  %empty = tensor.empty() : tensor<64x128xi32>
+  %bias_bcast = linalg.generic {
+      indexing_maps = [affine_map<(d0, d1) -> (d1)>,
+                        affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%bias : tensor<128xi32>) outs(%empty : tensor<64x128xi32>) {
+    ^bb0(%in: i32, %out: i32):
+      linalg.yield %in : i32
+  } -> tensor<64x128xi32>
+  %result = linalg.matmul ins(%lhs, %rhs : tensor<64x128xi8>, tensor<128x128xi8>)
+                          outs(%bias_bcast : tensor<64x128xi32>) -> tensor<64x128xi32>
+  return %result : tensor<64x128xi32>
+}
