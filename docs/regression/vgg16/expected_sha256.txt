@@ -1,0 +1,6 @@
+# v9 회귀 full F1~F3 기준 출력 sha256 (VGG16 logits npy). 판정은 이 값과 같아야 PASS. vmfb sha256은 지표로만 찍는다.
+# 바꿀 때(D6, 2026-10-22 세션 2): 의도한 수치 변경 근거(세션 문서 경로·원인)를 README 버전 이력에 적고, 사용자 승인을 받은 뒤 이 파일만 고친다.
+# 이름                 sha256                                                             근거
+vgg_2dev_novec   d5f1ebb9c7bdfa96b47423157425bb928e539bfd0fb6ba486cb98bf95fc5d5ff  팀 bf16 2장치 레시피(flags_b.txt), 9/29 팀 원본 빌드와 같음. CLAUDE.md 0절
+vgg_2dev_vec     6ccb1a0aa2e5b131b586cfada7f591c5e9fc25efa73df0d20954d517147e1366  flags_b_vec.txt(벡터화 켬, 반올림 기본 conv_even), 10/22 세션 1 챕터 01. CLAUDE.md 0절
+vgg_3dev_npu9    e4dcc1a0c28b7d145abce2f000d7c59568f6a0b5b101a6e2dce2ae01d075beaa  우회 레시피(-unroll-threshold=0 + placement-map npu9_gpu4.map) 기준, 10/18. CLAUDE.md 0절

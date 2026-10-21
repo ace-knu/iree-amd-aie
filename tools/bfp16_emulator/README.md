@@ -28,8 +28,8 @@ python3 bfp_strict_v3.py <NPU 출력.npy> <A.npy> <B.npy> <floor|half_even> [이
 
 ## 함수로 쓰기
 ```python
-ns = {}; exec(open("bfp_strict_v3.py").read().split("\ndef main")[0], ns)
-bf16, bfp, bfp_exp, acc_hw = ns["bf16"], ns["bfp"], ns["bfp_exp"], ns["acc_hw"]
+import sys; sys.path.insert(0, "<저장소>/tools/bfp16_emulator")
+from bfp_strict_v3 import bf16, bfp, bfp_exp, acc_hw     # 2026-10-22부터 import 가능(__main__ 보호)
 a, b = bf16(A_f32), bf16(B_f32)                       # (M,K), (K,N)
 out = acc_hw(bfp(a, 1, "half_even"), bfp(b, 0, "half_even"), bfp_exp(a, 1, "half_even"), bfp_exp(b, 0, "half_even"))   # (M,N) f32
 ```
@@ -51,6 +51,7 @@ K 블록마다:  S = Σ qA·qB (정확)
 
 ## 이력
 - 파일 내용은 2026-10-22 세션(로컬 기록 `docs/2026-10-22/1_반올림_검증과_미해결조사/04_…/bfp_strict_v3.py`)에서 검증한 파일과 **바이트 동일**하다. sha256 `9b2d3337dcd0baa0cf64894b19a36c76722a20badec792ad56d45f361ea53941`.
+- **2026-10-22 세션 2**: 마지막 줄 `main()`을 `if __name__ == "__main__":` 보호 안으로 옮겼다(회귀 `docs/regression/ext/judge.py`가 import해서 쓰게). 규칙·계산은 그대로이고, CLI 출력이 바이트 동일함을 3경우로 확인했다. 그래서 위 sha256은 보호를 넣기 전 판의 값이다.
 - 파일 머리 주석의 "챕터"·"E2·E6" 같은 이름은 그 세션의 시험 이름이다.
 - 판 이력:
   - V1: 2026-10-21, f32 RNE 누산

@@ -91,4 +91,5 @@ def main():
               f"차이 max {dd.max():.3g} median {np.median(dd):.3g}, ULP max {ulp.max()} median {np.median(ulp):.0f}, "
               f"앞 5개 {[tuple(int(v) for v in r) for r in idx[:5]]}")
 
-main()
+if __name__ == "__main__":   # 2026-10-22 세션 2: import 가능하게 (회귀 judge.py가 import). CLI 동작은 같다
+    main()

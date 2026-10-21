@@ -79,7 +79,7 @@
 | fc6 | 95% | 58.7% |
 
 ## 4. 사용법
-`tools/bfp16_emulator/README.md` 참고. 요약하면 다음과 같다.
+`tools/bfp16_emulator/README.md` 참고. 함수는 `from bfp_strict_v3 import bfp, bfp_exp, acc_hw`로 import한다(2026-10-22 세션 2에 `__main__` 보호 추가, CLI 동작 같음. 회귀 V1·V2가 이렇게 쓴다). 요약하면 다음과 같다.
 - `python3 bfp_strict_v3.py <NPU 출력.npy> <A.npy> <B.npy> <floor|half_even>`
 - `V3.1(하드웨어 규칙) 100.0000%`이면 통과다.
 - K가 8의 배수가 아니면 0으로 채운다. B가 전치형이면 `.T`를 쓴다.

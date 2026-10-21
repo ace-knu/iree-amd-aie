@@ -1,0 +1,17 @@
+--iree-hal-target-device=amdxdna
+--iree-hal-target-device=vulkan
+--iree-hal-target-device=local
+--iree-hal-local-target-device-backends=llvm-cpu
+--iree-llvmcpu-target-cpu=host
+--iree-amdaie-target-device=npu4
+--iree-amd-aie-peano-install-dir=/workspace/llvm-aie
+--iree-amdaie-stack-size=2048
+--iree-vulkan-target=gfx1150
+--iree-hal-external-resources-mappable=true
+--iree-global-opt-use-im2col-for-convs
+--iree-amdaie-enable-vectorization-passes=false
+--iree-dispatch-creation-no-fuse-into-contraction-conv-roots
+--iree-global-opt-detach-elementwise-through-reshape
+--iree-flow-enable-executable-deduplication=false
+--iree-preprocessing-pass-pipeline=builtin.module(iree-preprocessing-convert-conv-to-channels-last)
+--iree-amd-aie-additional-peano-opt-flags="-unroll-threshold=0"

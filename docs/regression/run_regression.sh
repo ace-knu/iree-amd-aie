@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # 3-device (CPU + NPU + GPU) 회귀 테스트.
 #
-# 위치: docs/regression/run_regression.sh (v6 부터 여기서 관리, 현재 v8(기본 실행 = 수동+자동). 케이스 목록·버전 이력은
+# 위치: docs/regression/run_regression.sh (v6 부터 여기서 관리, 현재 v9. 케이스 목록·판정·버전 이력은
 #       같은 폴더 README.md). v1~v6 의 이전 사본은 docs/2026-09-28/02_회귀테스트_기준선_재현/.
+#
+# 단계 (v9, REG_LEVEL):
+#   base  : 아래 26케이스를 수동·자동 두 모드로 (v8 과 같음. 이전 결과와 비교용)
+#   quick : base + V0(26케이스를 난수 입력·출력 전체 원소별 CPU 기준 비교로 한 번 더) + ext V1~V6 (기본)
+#   full  : quick + ext F1~F3 (VGG16)
+#   REG_INPUT_DEVICE=manual|auto 를 직접 주면 그 모드의 base 만 돈다(v8 과 같음, REG_LEVEL 무시).
 #
 # 각 케이스: .mlir 을 현재 컴파일러로 새로 컴파일 -> iree-run-module 실행 ->
 # 출력 첫 원소를 기대값과 비교 -> PASS/FAIL. 기존 vmfb 는 절대 재사용하지 않는다
@@ -18,6 +24,10 @@
 #   REG_ROOT     산출물 상위 폴더          (기본 /tmp)
 #   REG_OUT      산출물 폴더 전체 경로     (기본 $REG_ROOT/regression_YYYYMMDD_HHMM)
 #   REG_TIMEOUT  케이스별 컴파일/실행 제한 시간(초) (기본 600)
+#   REG_LEVEL    base | quick(기본) | full  (위)
+#   REG_FAULT    검출력 확인용(평소에는 비움). out_corrupt: REG_FAULT_CASE(기본 mlp_reduce_3dev)의 첫 출력
+#                (1,1) 원소 하나를 실행 뒤 일부러 바꾼다(base 는 stdout 텍스트, V0 는 출력 npy). ext 쪽 값은 ext/run_ext.sh 참고
+#   REG_PYTHON   판정용 python (기본 /opt/venv/bin/python3)
 #   REG_INPUT_DEVICE  both(기본): manual 과 auto 를 차례로 둘 다 돌린다. 결과는
 #                       $REG_OUT/manual/, $REG_OUT/auto/ 이고, 합친 요약은 $REG_OUT/summary.txt.
 #                     manual: 케이스의 --input_device 를 붙인다.
@@ -27,6 +37,7 @@
 # 산출물($REG_OUT): <key>.vmfb, <key>.compile.log, <key>.stream.mlir(지표용),
 #                   <key>.stream.log, <case>.stdout, <case>.stderr,
 #                   summary.txt. 저장소 안에는 아무것도 쓰지 않는다.
+#   v9: $REG_OUT/{manual,auto}/ = base, $REG_OUT/v0/ = V0(입력·CPU 기준 npy 포함), $REG_OUT/ext/ = V1~V6·F1~F3
 
 set -u -o pipefail
 
@@ -40,46 +51,80 @@ OUT=${REG_OUT:-$REG_ROOT/regression_$(date +%Y%m%d_%H%M)}
 TIMEOUT=${REG_TIMEOUT:-600}
 INPUT_MODE=${REG_INPUT_DEVICE:-both}
 FILTER=${1:-}
+LEVEL=${REG_LEVEL:-quick}
+V0=${REG_V0:-}
+PY=${REG_PYTHON:-/opt/venv/bin/python3}
+FAULT=${REG_FAULT:-}
+FAULT_CASE=${REG_FAULT_CASE:-mlp_reduce_3dev}
 
 # 기본(both): 이 스크립트를 모드별로 한 번씩 다시 부르고 요약을 합친다. 둘 중 하나라도 FAIL 이면 rc 1.
+# v9: quick/full 이면 이어서 V0(한 번, 수동 모드 인자)와 ext(V1~V6, full 은 F1~F3 까지)를 돈다.
 if [[ $INPUT_MODE == both ]]; then
+  case $LEVEL in base|quick|full) ;; *) echo "REG_LEVEL=$LEVEL 은 base|quick|full 중 하나여야 한다"; exit 2 ;; esac
   mkdir -p "$OUT" || exit 2
   rc_all=0
   for m in manual auto; do
     echo "===== input mode: $m ====="
     REG_INPUT_DEVICE=$m REG_OUT="$OUT/$m" bash "${BASH_SOURCE[0]}" "$@" || rc_all=1
   done
+  if [[ $LEVEL != base ]]; then
+    echo "===== V0: 난수 입력 + 출력 전체 (CPU 기준) ====="
+    REG_V0=1 REG_INPUT_DEVICE=manual REG_OUT="$OUT/v0" bash "${BASH_SOURCE[0]}" "$@" || rc_all=1
+    echo "===== ext: $LEVEL ====="
+    bash "$SCRIPT_DIR/ext/run_ext.sh" "$LEVEL" "$OUT/ext" "$@" || rc_all=1
+  fi
   {
-    echo "regression run (both input modes): $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo "out dir       : $OUT  (manual/, auto/)"
+    echo "regression run (both input modes, level $LEVEL): $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "out dir       : $OUT  (manual/, auto/$([[ $LEVEL != base ]] && echo ', v0/, ext/'))"
     for m in manual auto; do echo; echo "===== $m ====="; cat "$OUT/$m/summary.txt"; done
+    if [[ $LEVEL != base ]]; then
+      echo; echo "===== v0 ====="; cat "$OUT/v0/summary.txt"
+      echo; echo "===== ext ====="; cat "$OUT/ext/ext_summary.txt"
+    fi
     echo
-    echo "BOTH: manual $(grep -m1 '^PASS=' "$OUT/manual/summary.txt") / auto $(grep -m1 '^PASS=' "$OUT/auto/summary.txt")"
+    line="BOTH: manual $(grep -m1 '^PASS=' "$OUT/manual/summary.txt") / auto $(grep -m1 '^PASS=' "$OUT/auto/summary.txt")"
+    [[ $LEVEL != base ]] && line+=" / V0 $(grep -m1 '^PASS=' "$OUT/v0/summary.txt") / EXT $(grep -m1 '^EXT ' "$OUT/ext/ext_summary.txt" | sed 's/^EXT //')"
+    echo "$line"
   } >"$OUT/summary.txt"
   tail -1 "$OUT/summary.txt"
   exit $rc_all
 fi
-PEANO=/workspace/llvm-aie
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 mkdir -p "$OUT" || exit 2
 SUMMARY=$OUT/summary.txt
 
-# 컴파일 타깃 목록(쉼표 구분)에서 플래그를 만든다. CLAUDE.md 의 F3 와 같은 값.
-# vulkan 이 있으면 --iree-vulkan-target=gfx1150 을 반드시 붙인다
-# (빠지면 에러 없이 vp_android_baseline_2022 로 떨어진다).
-compile_flags() {
-  local targets=$1 f="" d
-  IFS=, read -ra devs <<<"$targets"
-  for d in "${devs[@]}"; do f+=" --iree-hal-target-device=$d"; done
-  for d in "${devs[@]}"; do
-    case $d in
-      local)   f+=" --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-cpu=host" ;;
-      amdxdna) f+=" --iree-amdaie-target-device=npu4 --iree-amd-aie-peano-install-dir=$PEANO --iree-amdaie-stack-size=2048" ;;
-      vulkan)  f+=" --iree-vulkan-target=gfx1150" ;;
-    esac
-  done
-  f+=" --iree-hal-external-resources-mappable=true"
-  echo "$f"
+# compile_flags 는 lib.sh 에 있다(v9 에서 옮김, 내용 같음).
+
+# v9 V0: 26케이스 공용 난수 입력(128x128 f32 3개)을 한 번 만든다. 입력 spec "128x128xf32=<값>" 의 i 번째를
+# $OUT/inputs/v0_in<i>.npy 로 바꿔 넣는다.
+if [[ -n $V0 ]]; then
+  "$PY" "$SCRIPT_DIR/ext/gen_inputs.py" v0 "$OUT/inputs" 3 || { echo "V0 입력 생성 실패"; exit 2; }
+fi
+declare -A REFDONE    # V0: 기준 모델 -> CPU 기준 실행 rc
+
+# V0 기준 모델: 손으로 쓴 affinity 모델(@__device_1/2 를 가리킴)은 CPU 하나로 컴파일할 수 없으므로
+# 같은 함수((a@b)@c)의 자동 배정판 chain2_auto.mlir 을 기준으로 쓴다.
+v0_ref_model() {
+  case $(basename "$1") in chain2_npufirst.mlir|chain2_order_*.mlir) echo "$MODEL_DIR/chain2_auto.mlir" ;; *) echo "$1" ;; esac
+}
+# 모델의 결과 개수(return 줄의 % 개수).
+n_results() { grep -m1 -oE 'return [^:]*' "$1" | tr -cd '%' | wc -c; }
+
+# REG_FAULT=out_corrupt: 첫 출력의 (1,1) 원소(평탄 인덱스 129)를 바꾼다. base 는 stdout 텍스트의 그 토큰, V0 는 npy.
+fault_corrupt() {
+  local name=$1
+  [[ $FAULT == out_corrupt && $name == "$FAULT_CASE" ]] || return 0
+  if [[ -n $V0 ]]; then
+    "$PY" -c "import numpy as np,sys; f=sys.argv[1]; x=np.load(f); x.flat[129]+=0.01*np.abs(x).max(); np.save(f,x)" "$OUT/$name.o0.npy"
+  else
+    "$PY" -c "
+import re,sys; f=sys.argv[1]; s=open(f).read(); m=re.search(r'^[0-9x]+[a-z]+[0-9]+=', s, re.M)
+nums=list(re.finditer(r'[-+]?[0-9][0-9.eE+-]*', s[m.end():])); t=nums[129]; j=m.end()+t.start(); k=m.end()+t.end()
+s=s[:j]+repr(float(t.group())+1.0)+s[k:]; open(f,'w').write(s)" "$OUT/$name.stdout"
+  fi
+  echo "[fault] $name: 출력 (1,1) 원소를 바꿈" >&2
 }
 
 # 출력(stdout)에서 첫 번째 결과 텐서의 첫 원소를 뽑는다.
@@ -141,6 +186,23 @@ run_case() {
     IFS=, read -ra idv <<<"$idevs"; for i in "${idv[@]}"; do args+=(--input_device="$i"); done
   fi
   [[ $lead != - ]] && args+=(--device_lead_allocator="$lead")
+  if [[ -n $V0 ]]; then
+    # V0: 상수 입력 대신 난수 입력 npy, 출력은 전부 npy 로 받는다. CPU 기준은 모델마다 한 번 만든다.
+    local k nres refm refkey
+    for ((k = 0; k < ${#inputs[@]}; ++k)); do inputs[$k]="@$OUT/inputs/v0_in$k.npy"; done
+    refm=$(v0_ref_model "$src"); refkey=ref_$(basename "$refm" .mlir); nres=$(n_results "$refm")
+    for ((k = 0; k < nres; ++k)); do args+=(--output="@$OUT/$name.o$k.npy"); done
+    if [[ -z ${REFDONE[$refkey]+x} ]]; then
+      local rargs=(--module="$OUT/$refkey.vmfb" --function="$func" --device=local-task)
+      for i in "${inputs[@]}"; do rargs+=(--input="$i"); done
+      for ((k = 0; k < nres; ++k)); do rargs+=(--output="@$OUT/$refkey.o$k.npy"); done
+      echo "[ref]     $refkey <- $(basename "$refm") (CPU)"
+      # shellcheck disable=SC2046
+      { timeout "$TIMEOUT" "$COMPILE" "$refm" $(compile_flags local) -o "$OUT/$refkey.vmfb" &&
+        timeout "$TIMEOUT" "$RUN" "${rargs[@]}"; } >"$OUT/$refkey.log" 2>&1
+      REFDONE[$refkey]=$?
+    fi
+  fi
   for i in "${inputs[@]}"; do args+=(--input="$i"); done
 
   local rrc=- actual=- nsel=- nxcopy=- placed=- status=FAIL
@@ -178,7 +240,18 @@ run_case() {
       local d; d=$(grep -m1 -oE "^\[BR\] input\[$k\] -> device [0-9]+" "$OUT/$name.stderr" | sed 's/.* //')
       placed+="${placed:+,}${d:-L}"
     done
-    if [[ $rrc -eq 0 ]] && matches "$actual" "$expect" && [[ $cands != *amdxdna* ]]; then status=PASS; fi
+    fault_corrupt "$name"
+    if [[ -n $V0 ]]; then
+      local outs=() refs=()
+      for ((k = 0; k < nres; ++k)); do outs+=("$OUT/$name.o$k.npy"); refs+=("$OUT/$refkey.o$k.npy"); done
+      local jr; jr=$("$PY" "$SCRIPT_DIR/ext/judge.py" allclose 1e-5 "$nres" "${outs[@]}" "${refs[@]}" 2>&1 | head -1)
+      echo "$jr" >"$OUT/$name.judge"
+      expect="cpu:$refkey"; actual=$(echo "$jr" | grep -oE 'rel [^(]*' | sed 's/rel //; s/ *$//'); actual=${actual:--}
+      if [[ $rrc -eq 0 && ${REFDONE[$refkey]} -eq 0 && $jr == OK* && $cands != *amdxdna* ]]; then status=PASS; fi
+    else
+      actual=$(first_elem "$OUT/$name.stdout"); actual=${actual:--}
+      if [[ $rrc -eq 0 ]] && matches "$actual" "$expect" && [[ $cands != *amdxdna* ]]; then status=PASS; fi
+    fi
   fi
   if [[ $status == PASS ]]; then NPASS=$((NPASS + 1)); else NFAIL=$((NFAIL + 1)); fi
   ROWS+=("$(printf '| %-26s | %-8s | %-10s | %-3s | %-3s | %-32s | %-8s | %-10s | %-9s | %-4s |' \
@@ -272,7 +345,7 @@ fi
   echo "iree-compile  : $(stat -c '%y' "$IREE_BUILD/lib/libIREECompiler.so" 2>/dev/null) (libIREECompiler.so)"
   echo "iree-run-module: $(stat -c '%y' "$RUN" 2>/dev/null)"
   echo "model dir     : $MODEL_DIR"
-  echo "input mode    : $INPUT_MODE (REG_INPUT_DEVICE)"
+  echo "input mode    : $INPUT_MODE (REG_INPUT_DEVICE)$([[ -n $V0 ]] && echo ', V0: 난수 입력 + 출력 전체 원소별 CPU 기준 비교(rel ≤ 1e-5)')$([[ -n $FAULT ]] && echo ", REG_FAULT=$FAULT($FAULT_CASE)")"
   echo
   echo "| case                       | expected | actual     | crc | rrc | alloc_select(후보->선택)         | cmd.copy | xdna_copy  | placed    | res  |"
   echo "|----------------------------|----------|------------|-----|-----|----------------------------------|----------|------------|-----------|------|"

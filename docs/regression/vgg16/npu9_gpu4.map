@@ -1,0 +1,15 @@
+# VGG16 f32 3장치 배정: NPU 9 / GPU 4 / CPU 46 (docs/2026-10-18/2_NPU10_unroll0_VGG16_3장치, 챕터 02c)
+# model : models/vgg16/vgg16-12.onnx  sha256 722c42f53ca03a54…
+# input : /work/vgg16/vgg.mlir (import_onnx, build/ 바인딩)  sha256 59fb6b6bc3d130f5…
+#         실행 입력 models/vgg16/input.npy  sha256 0971a6124658d8a4…
+# flags : 01_컴파일과_배정확인/flags_nodemote_unroll0.txt  sha256 31df70e06f30707a…
+#         = 10/02 t4 flags_nodemote.txt + --iree-amd-aie-additional-peano-opt-flags="-unroll-threshold=0"
+# 의도  : NPU10 맵(챕터 01)에서 d6(conv1_2)만 GPU로 옮김.
+#   d6는 NPU 제어 코드 루프 392회 > aie-rt MaxRepeatCount 256 → 드라이버 타임아웃(ert state 8) (챕터 02b 7절)
+#   NPU  conv1_1, conv2_1~conv4_3 matmul 9개 (제어 코드 최대 루프 ≤ 142)
+#   GPU  conv1_2 + conv5_1~conv5_3 matmul 4개 (M>1, MatmulPromoteVectorize. conv1_2는 10/02 t4에서 GPU 정확)
+#   CPU  FC 3개(d53, d55, d57: NPU ③, GPU M=1 2배) + 나머지 전부
+# 기대  : [amdaie placement-map] rules=3 dispatches=59 npu=9 gpu=4 cpu=46 unmatched=0
+d2,d10,d14,d18,d22,d26,d30,d34,d38=npu
+d6,d42,d46,d50=gpu
+*=cpu

@@ -1,0 +1,13 @@
+--iree-hal-target-device=npu=amdxdna
+--iree-hal-target-device=cpu=local
+--iree-hal-local-target-device-backends=llvm-cpu
+--iree-hal-default-device=npu
+--iree-amdaie-target-device=npu4
+--iree-amd-aie-peano-install-dir=/workspace/llvm-aie
+--iree-global-opt-use-im2col-for-convs
+--iree-amdaie-demote-contraction-inputs-to-bf16
+--iree-amdaie-enable-vectorization-passes=false
+--iree-preprocessing-pass-pipeline=builtin.module(iree-preprocessing-convert-conv-to-channels-last)
+--iree-dispatch-creation-no-fuse-into-contraction-conv-roots
+--iree-global-opt-detach-elementwise-through-reshape
+--iree-flow-enable-executable-deduplication=false
