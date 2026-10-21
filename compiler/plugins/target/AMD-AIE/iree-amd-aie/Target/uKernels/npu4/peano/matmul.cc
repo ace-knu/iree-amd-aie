@@ -210,6 +210,12 @@ void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
   const unsigned stepB_n = TransposeB ? size_B : colA * size_B;
   const unsigned stepB_k = TransposeB ? colB * size_B : size_B;
 
+  // The bf16 -> bfp16 conversions round with the core rounding mode, which is
+  // floor by default and biases every product. Round to nearest even instead,
+  // and restore the mode for the code that runs after this call.
+  const unsigned prevRnd = get_rnd();
+  set_rnd(rnd_conv_even);
+
   v64bfp16ebs8 A0;
   v64bfp16ebs8 A1;
   v64bfp16ebs8 B0;
@@ -292,6 +298,7 @@ void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
       pC1 += rowA;
     }
   }
+  set_rnd(prevRnd);
 }
 
 template <unsigned m, unsigned k, unsigned n, bool TransposeB>
