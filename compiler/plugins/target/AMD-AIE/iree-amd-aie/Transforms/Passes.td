@@ -95,11 +95,12 @@ def AMDAIEFoldBiasIntoContraction :
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBiasIntoContractionPass()";
   let options = [
-    Option<"foldConvBias", "fold-conv-bias", "bool", /*default=*/"true",
-      "Also apply the K+1 fold to conv2d + bias (not just matmul). Disable "
-      "to keep conv's bias as a separate dispatch input (relying on the "
-      "usual detach/no-fuse workaround flags for conv), while matmul bias "
-      "is still folded into the same dispatch.">,
+    Option<"foldConvBias", "fold-conv-bias", "bool", /*default=*/"false",
+      "Also apply the K+1 fold to conv2d + bias (not just matmul), by adding "
+      "a constant-one input channel. Off by default, matching "
+      "--iree-amdaie-fold-conv-bias-into-contraction: "
+      "AMDAIEPadContractionDispatches folds a conv's bias into one K column "
+      "of the post-im2col matmul instead.">,
     Option<"foldRhsTranspose", "fold-rhs-transpose", "bool", /*default=*/"true",
       "Fold an explicit linalg.transpose feeding the matmul RHS into the "
       "matmul's own indexing maps (keeping transpose_b form) before "

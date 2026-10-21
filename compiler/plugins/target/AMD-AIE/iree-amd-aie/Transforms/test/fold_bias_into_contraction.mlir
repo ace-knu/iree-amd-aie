@@ -1,9 +1,14 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction)' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{fold-conv-bias=true})' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction)' %s | FileCheck %s --check-prefix=DEFAULT
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{fold-rhs-transpose=false})' %s | FileCheck %s --check-prefix=NOTRANSPOSE
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-fold-bias-into-contraction{k-align=1})' %s | FileCheck %s --check-prefix=KALIGN1
 
 // Every case below declares an amd-aie device (`@npu`); the pass is a no-op
 // without one (see the last two cases).
+//
+// The conv fold is opt-in (`fold-conv-bias`, default false, like
+// --iree-amdaie-fold-conv-bias-into-contraction), so the main CHECK run turns
+// it on; the DEFAULT run checks that it is off unless asked for.
 
 // A conv2d (NCHW/FCHW: no channels-last conversion) whose accumulator is a
 // `linalg.broadcast` of a 1-D bias is folded into a single conv with one
@@ -11,6 +16,10 @@
 // (already-padded) input, and the filter gets a matching extra input-channel
 // plane that is zero except a `bias` tap at (kh=0, kw=0). No `linalg.broadcast`
 // survives.
+
+// DEFAULT-LABEL: @conv_bias_nchw
+// DEFAULT: linalg.broadcast
+// DEFAULT: linalg.conv_2d_nchw_fchw {{.*}} ins({{.*}} : tensor<1x3x18x18xf32>, tensor<8x3x3x3xf32>)
 
 // CHECK-LABEL: @conv_bias_nchw
 // CHECK-SAME:    %[[IN:[a-zA-Z0-9]+]]: tensor<1x3x18x18xf32>
@@ -118,6 +127,10 @@ func.func @conv_only(%input: tensor<1x3x18x18xf32>, %filter: tensor<8x3x3x3xf32>
 // runtime padding dispatch (see both passes' comments). Hence the zero-*filled*
 // bases below rather than bare `tensor.empty`: the tail past the bias row is
 // never written by an insert, so it has to be defined, not undefined.
+
+// The matmul fold does not depend on `fold-conv-bias`.
+// DEFAULT-LABEL: @matmul_bias
+// DEFAULT: linalg.matmul ins({{.*}} : tensor<64x256xf32>, tensor<256x128xf32>)
 
 // CHECK-LABEL: @matmul_bias
 // CHECK-SAME:    %[[LHS:[a-zA-Z0-9]+]]: tensor<64x128xf32>
