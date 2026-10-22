@@ -84,7 +84,8 @@ def format_report(dispatches, total, hwctx):
              for i, d in enumerate(dispatches)]
     lines.append("---")
     busy = 0
-    for target in sorted({d["target"] for d in dispatches}, key=["npu", "cpu"].index):
+    targets = {d["target"] for d in dispatches}
+    for target in [t for t in ("npu", "cpu") if t in targets] + sorted(targets - {"npu", "cpu"}):
         sel = [d for d in dispatches if d["target"] == target]
         ns = sum(d["ns"] for d in sel)
         busy += ns
