@@ -254,14 +254,27 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
 - **f32는 ukernel off에서도 bf16 off보다 큰 conv에서 약 6.7배 느리다.** AIE2P에는 f32 x f32 곱셈 명령이 없어서,
   f32 곱셈은 soft-float `__mulsf3` 호출이 된다. bf16 x bf16 → f32는 `vmul.f` 명령 하나다(MLP 코어 disassemble로 확인).
   덧셈은 둘 다 `vadd.f`다.
+- **f32 ukernel off는 S0(Peano v19)보다 약 2배 빠르다**(VGG NPU 연산 72.3s → 32.7s, conv3_2 7145ms → 3464ms).
+  같은 tile loop를 두 Peano로 컴파일해 비교했다.
+
+  | 구성 | 곱셈 | 덧셈 | MAC당 soft-float 호출 |
+  |---|---|---|---|
+  | S0: v19, bf16 입력(f32로 확장) | `__mulsf3` | `__addsf3` | 2 |
+  | v22, f32 입력 | `__mulsf3` | `vadd.f` | 1 |
+  | S1: v22, bf16 입력 | `vmul.f` | `vadd.f` | 0 |
+
+  - 덧셈이 `vadd.f`가 된 것은 Peano 버전 차이다. v22가 scalar f32 덧셈을 lane 1개짜리 vector 명령으로 lowering한다.
+  - 곱셈이 soft-float로 남는 것은 하드웨어 제약이다. AIE2P의 부동소수점 곱셈 명령은 bf16 x bf16 → f32뿐이다.
 - **f32 ukernel `all`은 off와 같다.** f32 matmul 템플릿이 없어서 matmul은 ukernel off 경로를 탄다.
   컴파일이 20s 늘어난 것은 f32 zero_fill이 ukernel을 쓰기 때문이다(dispatch마다 ukernel `.cc` 컴파일).
 - conv5와 FC는 비율이 작다. f32는 scalar pack(4)으로, bf16은 instruction 크기(8)로 패딩해서 계산량이 다르다
   (예: FC의 M=1을 f32는 16, bf16 off는 32로 패딩).
-- f32 VGG wall 35.1s 중 NPU 연산이 32.7s(93%)다. 이 시간을 줄이려면 f32 matmul ukernel이 필요하다.
-  AIE2P의 f32 곱셈(`mac_elem_16(v16float, ...)`)은 bf16 곱셈으로 흉내 낸 것이다.
-  f32 하나를 bf16 세 조각으로 나눠 기본(`accuracy_safe`) 9번, `fast` 6번, `low` 3번 곱한다.
-  scalar soft-float보다는 크게 빠를 것으로 보이지만, bf16 ukernel(명령당 MAC 512개)보다는 훨씬 느리다. 측정은 하지 않았다.
+- **f32는 기준값(reference) 경로로 유지하고, f32 matmul ukernel은 만들지 않는다.**
+  성능은 하드웨어가 지원하는 벡터/행렬 연산(bf16 → bfp16 행렬 곱셈 ukernel)으로 내고, f32와 비교한다.
+  - AIE2P에는 f32 곱셈 하드웨어가 없다. `mac_elem_16(v16float, ...)`도 f32를 bf16 세 조각으로 나눠
+    bf16 곱셈 9번(기본 `accuracy_safe`), 6번(`fast`), 3번(`low`)으로 흉내 낸 것이다.
+    행렬 곱셈은 bfp16(8개 원소가 exponent 공유)뿐이라 이 방식으로 f32 정밀도를 낼 수 없다.
+  - mlir-aie(`aie_kernels/aie2p/mm.cc`)와 aie_api에도 AIE2P용 f32 입력 matmul 커널이 없다. 직접 작성하면 정확도 검증과 유지보수 부담이 생긴다.
 
 ---
 
@@ -340,7 +353,7 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
 - **ukernel이 지원하는 타입 조합**: npu4 peano matmul은 i8 x i8 → i32와 bf16 x bf16 → f32뿐이고, transpose_b는 bf16만 지원한다.
   템플릿이 없는 타입은 ukernel off 경로로 간다(`hasUKernelTemplate`, `65ece963`).
   목표는 하드웨어가 지원하는 모든 타입 조합이다. 템플릿을 추가하면 `hasUKernelTemplate` 표에도 추가한다(`AMDAIEUtils.cpp`, `matmul.cc`의 TODO).
-  f32 matmul ukernel이 다음 후보다(위 "추가 작업: f32 e2e").
+  f32는 기준값 경로로 두고 f32 matmul ukernel은 만들지 않는다(위 "추가 작업: f32 e2e").
 - **npu4 밖의 장치**(npu1)는 `hasUKernelTemplate` 표를 적용하지 않고 이전 동작을 유지한다.
   npu1의 transpose_b matmul은 KernelDispatch가 ukernel용으로 tile하지만 matcher는 ukernel로 보내지 않는다(검증 불가, TODO).
 - **BD chain 분할 후 token 없는 push 수**: 분할된 앞 조각은 token 없이 push되어, channel별 대기 task 수가 queue depth로 제한되지 않는다.
