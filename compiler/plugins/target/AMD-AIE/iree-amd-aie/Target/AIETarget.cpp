@@ -26,6 +26,7 @@
 #include "iree/compiler/Dialect/HAL/Target/TargetRegistry.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree/compiler/Utils/FlatbufferUtils.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -369,6 +370,9 @@ struct Flatbuffer1dStringArrayConverter {
   // Maps each ordinal to its corresponding index in the `data` array.
   SmallVector<int32_t> indices;
 
+  // Content -> index in `data`, used by `addEntryDedup` only.
+  llvm::StringMap<int32_t> dedupIndices;
+
   Flatbuffer1dStringArrayConverter(uint64_t ordinalCount) {
     indices.resize(ordinalCount);
   }
@@ -382,6 +386,18 @@ struct Flatbuffer1dStringArrayConverter {
       indices[ordinal] = data.size();
       data.push_back(entry.str());
     }
+  }
+
+  // Like `addEntry`, but an entry that is byte-identical to an earlier one
+  // shares that entry's index instead of adding another copy to `data`.
+  void addEntryDedup(uint64_t ordinal, StringRef entry) {
+    if (entry.empty()) {
+      indices[ordinal] = -1;
+      return;
+    }
+    auto [it, inserted] = dedupIndices.try_emplace(entry, data.size());
+    if (inserted) data.push_back(entry.str());
+    indices[ordinal] = it->second;
   }
 
   flatbuffers_string_vec_ref_t getFlatbufferVecRef(FlatbufferBuilder &builder) {
@@ -692,8 +708,20 @@ LogicalResult AIETargetBackend::serializeExecutable(
     // Get the artifact (XCLBIN or PDI) only if control packet reconfiguration
     // is disabled or this is the first entry point. Otherwise, leave it as an
     // empty string.
+    //
+    // Exception for the amdxdna HAL: a control-packet reconfiguration rewrites
+    // cores, DMAs and locks but not the stream switches (with the default
+    // broadcast core config, AMDAIEConvertDeviceToControlPackets skips the
+    // switch configuration), so an entry point's routing comes only from its
+    // base PDI, and entry points of one executable can have different base
+    // PDIs. Keep every entry point's base PDI and let byte-identical PDIs
+    // share one index; the runtime then shares one hw context per distinct
+    // base PDI. The XRT HAL keeps the first-entry-only rule.
+    const bool dedupCtrlPktArtifacts =
+        options.enableCtrlPkt &&
+        options.deviceHal == AMDAIEOptions::DeviceHAL::AMDXDNA;
     std::string artifactString;
-    if (!options.enableCtrlPkt || i == 0) {
+    if (!options.enableCtrlPkt || i == 0 || dedupCtrlPktArtifacts) {
       // Load the artifact from file.
       std::unique_ptr<llvm::MemoryBuffer> artifactInput =
           openInputFile(artifactPath, &errorMessage);
@@ -704,7 +732,10 @@ LogicalResult AIETargetBackend::serializeExecutable(
       artifactString = artifactInput->getBuffer();
     }
     // Add the artifact to the converter.
-    artifactConvertor.addEntry(ordinal, artifactString);
+    if (dedupCtrlPktArtifacts)
+      artifactConvertor.addEntryDedup(ordinal, artifactString);
+    else
+      artifactConvertor.addEntry(ordinal, artifactString);
   }
 
   // Serialize the executable to flatbuffer format

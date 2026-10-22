@@ -27,6 +27,12 @@ struct iree_hal_amdxdna_kernel_params {
   // control code, applied by the ERT_CMD_CHAIN path.
   std::vector<std::vector<uint32_t>> patch_runlist;
   std::string kernel_name;
+  // CU name of the hw context used by control-packet dispatches of this entry
+  // point: the name of the first entry point of the executable that uses the
+  // same PDI index. Entry points sharing a PDI (the same base routing) thus
+  // resolve to one cached context and one CU. Empty when the entry point has
+  // no PDI.
+  std::string context_cu_name;
   uint32_t n_kernel_runs{1};
   uint32_t n_reconfigure_runs{1};
   uint32_t n_pdi_loads{1};

@@ -480,6 +480,10 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
   executable->host_allocator = host_allocator;
   executable->entry_point_count = entry_point_count;
   executable->entry_points.resize(entry_point_count);
+  // Per PDI index, the name of the first entry point using it; see
+  // `iree_hal_amdxdna_kernel_params::context_cu_name`.
+  std::vector<std::string> pdi_context_cu_names(
+      iree_amd_aie_hal_amdxdna_PdiDef_vec_len(pdis_vec));
   for (iree_host_size_t entry_ordinal = 0; entry_ordinal < entry_point_count;
        entry_ordinal++) {
     iree_hal_amdxdna_kernel_params* params =
@@ -501,6 +505,9 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
       std::vector<uint8_t> pdiVector(pdi_fb,
                                      pdi_fb + flatbuffers_string_len(pdi_fb));
       params->pdi = pdiVector;
+      std::string& context_cu_name = pdi_context_cu_names[pdi_index];
+      if (context_cu_name.empty()) context_cu_name = params->kernel_name;
+      params->context_cu_name = context_cu_name;
     }
 
     // Get the asm instructions runlist for the current entry point, and store

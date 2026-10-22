@@ -1009,12 +1009,20 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
         z0, iree_hal_amdxdna_native_context_open_cu(context.get(), kernel_name,
                                                     &cu_idx));
   } else if (!kernel_params.pdi.empty()) {
+    // Control-packet entry points that share a base PDI (the same stream
+    // switch routing) share one hw context: the cache key is the PDI bytes and
+    // the CU name of the first entry point using that PDI. Entry points with a
+    // different base PDI get their own context, so each runs on the routing it
+    // was compiled for.
+    iree_string_view_t context_cu_name = iree_make_string_view(
+        kernel_params.context_cu_name.data(),
+        kernel_params.context_cu_name.size());
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_device_get_or_create_context(
-                command_buffer->device, pdi_span, kernel_name, &context));
+                command_buffer->device, pdi_span, context_cu_name, &context));
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_amdxdna_native_context_open_cu(context.get(), kernel_name,
-                                                    &cu_idx));
+        z0, iree_hal_amdxdna_native_context_open_cu(
+                context.get(), context_cu_name, &cu_idx));
     {
       std::lock_guard<std::mutex> lock(executable->context_mutex);
       executable->context = context;

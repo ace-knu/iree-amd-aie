@@ -144,6 +144,12 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | R18 | `docs/regression/models/vec/*.mlir`(4), `models/chain3_ngc.mlir` | 새 파일 | V1~V3 matmul 모델, V6 NPU→GPU→CPU 직결 모델 | 같음 | 같음 | 같음 |
 | R19 | `docs/regression/vgg16/*`(5) | 새 파일 | F1~F3 레시피 사본·placement map·기준 sha(`expected_sha256.txt`, 바꿀 때 근거 + 사용자 승인) | 같음 | 같음 | 같음 |
 | R20 | `docs/regression/README.md` | 앞부분 다시 씀, 버전 이력 v9 | 1-4 형식(위치·입출력·단계·판정·시험·검출력·갱신 규칙) | 같음 | 같음 | — |
+| R21 | `compiler/…/Target/AIETarget.cpp` | +29 / +373,3 / +391,12 / +711,12 / +724 / +735,4 | `llvm/ADT/StringMap.h`, `Flatbuffer1dStringArrayConverter::addEntryDedup`(바이트 같으면 같은 번호), 컨트롤 패킷 + amdxdna HAL이면 모든 entry의 base PDI를 넣고 같은 PDI는 번호 공유(전: 첫 entry만). XRT HAL·컨트롤 패킷 끔은 그대로 | 10/22 세션6(B1) | `docs/2026-10-22/6_B1_컨트롤패킷_PDI묶음/`(원인: `docs/2026-10-22/5_hwctx_수명_설계조사/`) | S13 |
+| R22 | `runtime/…/amdxdna/executable_internal.h` | +30,6 | `kernel_params.context_cu_name`(같은 PDI를 쓰는 첫 entry 이름) | 같음 | 같음 | S13 |
+| R23 | `runtime/…/amdxdna/executable.cc` | +483,4 / +508,3 | 적재 때 PDI 번호별 대표 CU 이름 계산 | 같음 | 같음 | S13 |
+| R24 | `runtime/…/amdxdna/direct_command_buffer.cc` | +1012,8 / +1022 / +1024,2 | 컨트롤 패킷 dispatch가 (PDI, 대표 이름)으로 묶음 컨텍스트를 찾고 CU를 연다(전: entry 이름) | 같음 | 같음 | S13 |
+| R25 | `runtime/…/amdxdna/device.cc` | +69,7 / +82 / +85 / +1107,2 / +1113,39 / +1158,4 | 캐시 항목에 마지막 사용 순번, 생성 실패(NOT_FOUND·RESOURCE_EXHAUSTED·UNAVAILABLE) 때 쓰이지 않는 캐시 컨텍스트 LRU 축출 후 재시도, `[T] ctx EVICT` 로그, 실패 정보 덧붙임 | 같음 | 같음 | S13 |
+| R26 | `docs/specs/S13_컨트롤패킷_배선묶음_컨텍스트.md`, `docs/specs/README.md`, 이 파일 | 새 파일·행 추가 | 명세·장부 | 같음 | — | — |
 
 ## 3. 전임자 변경 — 덩어리별 (HEAD → 9/28 기준선)
 
@@ -362,4 +368,5 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | 2026-10-22 | 10/21 세션 1 챕터 04 | **통합 브랜치** 2-4절 R01~R10: 코어 반올림 모드 설정(S11). AIE2P 기본 conv_even, AIE2 기본 넣지 않음. 회귀 26×2·VGG16 2·3장치 출력 그대로, vmfb는 바뀜(NPU 코어 명령 1개). 작업 폴더(`3devices-f32`)에는 없다 |
 | 2026-10-22 | 10/22 세션 1 챕터 05 | **통합 브랜치** 2-4절 R11~R13: AIE2P bfp16 MAC 흉내 V3.1(`tools/bfp16_emulator/`)과 명세 S12. 코드 변경 없음(시험 도구). VGG16 실제 dispatch 4개(conv1_1·conv4_2·conv5_2·fc6) 포함 41경우 비트 일치 |
 | 2026-10-22 | 10/22 세션 2 챕터 02 | **통합 브랜치** 2-4절 R14~R20: 회귀 v9(3단계, V0, V1~V6, F1~F3), 흉내 import 보호. 컴파일러·런타임 변경 없음. quick 219 s·full 529 s 모두 PASS |
+| 2026-10-22 | 10/22 세션 6 | **통합 브랜치** 2-4절 R21~R26: 컨트롤 패킷 경로의 배선(base PDI) 묶음별 PDI·컨텍스트(S13)와 컨텍스트 생성 실패 때 LRU 축출. 컨트롤 패킷 끔은 그대로(VGG16 vmfb `10abd446…`·출력 `6ccb1a0a…` 동일, 회귀 quick 전부 PASS). 켬: 배선 3종 모델이 고치기 전 틀림(corr 0.229) → 고친 뒤 기준과 비트 동일 |
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |

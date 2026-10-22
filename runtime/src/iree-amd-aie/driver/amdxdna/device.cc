@@ -66,15 +66,23 @@ struct iree_hal_amdxdna_context_cache_key_hash_t {
   }
 };
 
+struct iree_hal_amdxdna_cached_context_t {
+  std::shared_ptr<iree_hal_amdxdna_native_context_t> context;
+  // Value of the cache's use counter at the last lookup of this entry; the
+  // smallest value is the least recently used entry.
+  uint64_t last_use = 0;
+};
+
 struct iree_hal_amdxdna_device_context_cache_t {
   // Keyed by the bootstrap PDI and the CU/export name used to register the
   // native context. Linux KMQ contexts currently register one CU name, so
   // sharing across identical PDIs is valid only when that bootstrap name also
   // matches.
   std::unordered_map<iree_hal_amdxdna_context_cache_key_t,
-                     std::shared_ptr<iree_hal_amdxdna_native_context_t>,
+                     iree_hal_amdxdna_cached_context_t,
                      iree_hal_amdxdna_context_cache_key_hash_t>
       contexts;
+  uint64_t use_counter = 0;
   std::mutex mutex;
 };
 
@@ -1096,23 +1104,61 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
             static_cast<int>(kernel_name.size), kernel_name.data,
             iree_time_now() / 1e6);
     fflush(stderr);
-    *out_context = it->second;
+    it->second.last_use = ++device->pdi_context_cache->use_counter;
+    *out_context = it->second.context;
     return iree_ok_status();
   }
   int64_t t0 = iree_time_now();
   iree_hal_amdxdna_native_context_t* raw_context = nullptr;
-  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_device_create_context(
-      device->native_device,
-      iree_make_const_byte_span(key.pdi.data(), key.pdi.size()),
-      iree_make_string_view(key.kernel_name.data(), key.kernel_name.size()),
-      &raw_context));
+  auto create_context = [&]() {
+    return iree_hal_amdxdna_native_device_create_context(
+        device->native_device,
+        iree_make_const_byte_span(key.pdi.data(), key.pdi.size()),
+        iree_make_string_view(key.kernel_name.data(), key.kernel_name.size()),
+        &raw_context);
+  };
+  iree_status_t status = create_context();
+  // The driver caps hw contexts per device across all processes and rejects a
+  // new one when the cap is reached (ENOENT/ENOSPC/EBUSY). While that happens,
+  // evict the least recently used cached context that no dispatch is holding
+  // (only the cache owns it) and retry.
+  while (!iree_status_is_ok(status) &&
+         (iree_status_is_not_found(status) ||
+          iree_status_is_resource_exhausted(status) ||
+          iree_status_is_unavailable(status))) {
+    auto& contexts = device->pdi_context_cache->contexts;
+    auto victim = contexts.end();
+    for (auto entry = contexts.begin(); entry != contexts.end(); ++entry) {
+      if (entry->second.context.use_count() != 1) continue;
+      if (victim == contexts.end() ||
+          entry->second.last_use < victim->second.last_use) {
+        victim = entry;
+      }
+    }
+    if (victim == contexts.end()) {
+      return iree_status_annotate_f(
+          status,
+          "amdxdna: no idle cached hw context to evict (%zu cached)",
+          contexts.size());
+    }
+    fprintf(stderr, "[T] ctx EVICT '%s' (cached %zu)\n",
+            victim->first.kernel_name.c_str(), contexts.size());
+    fflush(stderr);
+    contexts.erase(victim);
+    iree_status_ignore(status);
+    status = create_context();
+  }
+  IREE_RETURN_IF_ERROR(status);
   fprintf(stderr, "[T] ctx MISS '%.*s' create=%.3fms\n",
           static_cast<int>(kernel_name.size), kernel_name.data,
           (iree_time_now() - t0) / 1e6);
   fflush(stderr);
   std::shared_ptr<iree_hal_amdxdna_native_context_t> ctx(
       raw_context, iree_hal_amdxdna_native_context_destroy);
-  device->pdi_context_cache->contexts.emplace(std::move(key), ctx);
+  iree_hal_amdxdna_cached_context_t entry;
+  entry.context = ctx;
+  entry.last_use = ++device->pdi_context_cache->use_counter;
+  device->pdi_context_cache->contexts.emplace(std::move(key), std::move(entry));
   *out_context = ctx;
   return iree_ok_status();
 }
