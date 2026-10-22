@@ -97,6 +97,66 @@ void checkForChainsWithDuplicateBdId(
   }
 }
 
+/// Utility function to recreate a chained DMA op with new `next_bd` and
+/// `start_bd` operands.
+AMDAIE::NpuHalfDmaCpyNdOp setChainOperands(IRRewriter &rewriter,
+                                           AMDAIE::NpuHalfDmaCpyNdOp dmaOp,
+                                           Value nextBdId, Value startBdId) {
+  rewriter.setInsertionPoint(dmaOp);
+  auto newDmaOp = rewriter.create<AMDAIE::NpuHalfDmaCpyNdOp>(
+      dmaOp.getLoc(), dmaOp.getResultTypes(), dmaOp.getConnection(),
+      dmaOp.getInput(), dmaOp.getMixedOffsets(), dmaOp.getMixedSizes(),
+      dmaOp.getMixedStrides(), dmaOp.getBdId(), dmaOp.getChannel(), nextBdId,
+      startBdId);
+  rewriter.replaceOp(dmaOp, newDmaOp.getResults());
+  return newDmaOp;
+}
+
+/// A chain is pushed to the queue only at its last DMA op, so a chain that
+/// spans a DMA wait holds back its earlier BDs until after the wait. If the
+/// waited transfer needs their data (e.g. a core needs both its operands to
+/// drain the other one), the wait never completes. Split every chain at each
+/// DMA wait it spans: the last DMA op before the wait ends a chain and the
+/// first one after it starts a new one. DMA ops on the same channel run in
+/// order, so a wait on the chain's last DMA op still covers all of its BDs.
+void splitDmaBdChainsAtWaits(IRRewriter &rewriter,
+                             AMDAIE::ControlCodeOp controlCodeOp) {
+  controlCodeOp->walk([&](Block *block) {
+    // The last DMA op seen so far of each chain that is still open, keyed by
+    // connection.
+    DenseMap<Value, AMDAIE::NpuHalfDmaCpyNdOp> openChains;
+    // The `start_bd` that the remaining DMA ops of a split chain must use.
+    DenseMap<Value, Value> splitStartBdIds;
+    // Connections whose next DMA op starts the remainder of a split chain.
+    DenseSet<Value> splitChains;
+    for (Operation &op : llvm::make_early_inc_range(*block)) {
+      if (isa<AMDAIE::NpuDmaWaitOp>(op)) {
+        for (auto &[connection, dmaOp] : openChains) {
+          setChainOperands(rewriter, dmaOp, /*nextBdId=*/nullptr,
+                           dmaOp.getStartBd());
+          splitChains.insert(connection);
+        }
+        openChains.clear();
+        continue;
+      }
+      auto dmaOp = dyn_cast<AMDAIE::NpuHalfDmaCpyNdOp>(op);
+      if (!dmaOp || !dmaOp.getStartBd()) continue;
+      Value connection = dmaOp.getConnection();
+      if (splitChains.erase(connection))
+        splitStartBdIds[connection] = dmaOp.getBdId();
+      if (Value startBdId = splitStartBdIds.lookup(connection)) {
+        dmaOp = setChainOperands(rewriter, dmaOp, dmaOp.getNextBd(), startBdId);
+      }
+      if (dmaOp.getNextBd()) {
+        openChains[connection] = dmaOp;
+      } else {
+        openChains.erase(connection);
+        splitStartBdIds.erase(connection);
+      }
+    }
+  });
+}
+
 /// Traverse the control code in reverse order to create DMA BD chains. Reverse
 /// traversal simplifies handling duplicate BD IDs, preventing the need to
 /// revisit and modify earlier operations after processing later ones.
@@ -246,6 +306,7 @@ LogicalResult insertDmaBdChain(const AMDAIE::AMDAIEDeviceModel &deviceModel,
   }
 
   if (res.wasInterrupted()) return failure();
+  splitDmaBdChainsAtWaits(rewriter, controlCodeOp);
   return success();
 }
 
