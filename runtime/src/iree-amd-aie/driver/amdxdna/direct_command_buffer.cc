@@ -972,6 +972,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
       kernel_params.pdi.data(), kernel_params.pdi.size());
   iree_string_view_t kernel_name = iree_make_string_view(
       kernel_params.kernel_name.data(), kernel_params.kernel_name.size());
+  // Names the dispatch in tracing backends that cannot append zone text.
+  IREE_TRACE_MESSAGE_DYNAMIC(INFO, kernel_name.data, kernel_name.size);
   std::shared_ptr<iree_hal_amdxdna_native_context_t> context;
   iree_hal_amdxdna_native_cu_index_t cu_idx;
   if (num_reconfigurations == 0) {
