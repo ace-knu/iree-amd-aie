@@ -36,6 +36,7 @@
 
 - VGG 실행 시간은 S0 대비 **32배**(74.5s → 2.29s) 줄었다. NPU 연산만 보면 **583배**(72.3s → 0.124s)다.
 - S3에서는 실행 시간의 79%(1.80s / 2.29s)가 연산이 아니라 dispatch 고정 비용이다. 다음 개선의 가장 큰 대상이다.
+  이 비용의 대부분은 NPU power mode(default)의 영향이다. performance mode에서는 VGG 실행이 0.44s가 된다(아래 "NPU power mode의 영향").
 - 벡터화를 켜도 S3 결과는 같다. 앞으로 NPU 벡터 연산은 ukernel을 우선 추가하고, 적절하지 않을 때만 aievec을 확장한다.
 
 ---
@@ -342,6 +343,23 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
 | NPU 연산 (23 dispatch) | 0.12s | 5% | ukernel 연산 |
 | CPU 작업, BO 준비, module load 등 | 0.37s | 16% | im2col, maxpool, bias+ReLU 등은 CPU에서 실행된다 |
 
+### NPU power mode의 영향
+
+같은 S3 VGG(bf16, ukernel all)를 NPU power mode만 바꿔 5회씩 실행했다. power mode는 host에서
+`sudo xrt-smi configure --pmode <mode>`로 바꾼다(performance = amdxdna driver의 `high`).
+
+| | default | performance |
+|---|---|---|
+| VGG 실행 (wall, 중앙값) | 2.256s | **0.439s** (5.1배) |
+| hwctx 생성 / 해제 (23 dispatch 합) | 0.827s / 0.933s | 0.002s / 0.003s |
+| NPU 연산 (23 dispatch 합) | 0.125s | 0.101s |
+| 정확도 (corr) | 0.99997 | 0.99997 |
+
+- dispatch 고정 비용(hwctx 생성/해제, dispatch마다 약 36~40ms씩)은 대부분 default mode의 power management 때문이다.
+  performance mode에서는 거의 사라지고, NPU 연산도 약 20% 빨라진다.
+- power mode 설정에는 root 권한(CAP_SYS_ADMIN)이 필요하다. 컨테이너 안에서 iree의 `--amdxdna_power_mode`로 바꾸면 errno 13으로 실패한다.
+- 위 표들의 시간은 모두 default mode에서 측정했다. 측정값을 비교할 때는 power mode를 함께 기록한다.
+
 ---
 
 ## 알려진 한계와 남은 작업
@@ -363,4 +381,6 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
 - **벡터화 on에서는 ukernel matcher가 받지 않는 bf16 matmul이 컴파일에 실패한다**(aievec bf16 `vector.contract` 미지원).
   해당: vector instruction 수가 홀수인 tile(odd-block), transpose_a, npu1의 transpose_b. 현재 VGG와 MLP는 해당 없음(전부 ukernel).
   위 "앞으로의 벡터화 방향"에 따라 ukernel 추가를 우선하고, scalar fallback은 backlog다.
+- **dispatch 고정 비용**은 default power mode에서 VGG 실행의 약 80%다. performance mode로 대부분 없어지지만 root 권한이 필요하다.
+  default mode에서 줄이려면 runtime에서 dispatch마다 hwctx를 만들고 지우지 않고 재사용해야 한다(backlog, 위 "NPU power mode의 영향").
 - VGG의 elementwise 연산은 모두 CPU에서 실행된다. NPU로 옮기려면(dev_GEMV 통합 후 pool 등) 해당 ukernel이 필요하다.
