@@ -1,7 +1,7 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col num-rows=2 num-cols=2})' %s | FileCheck %s --check-prefix=CHECK-2x2
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col num-rows=4 num-cols=2})' %s | FileCheck %s --check-prefix=CHECK-4x2
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col})' %s | FileCheck %s --check-prefix=CHECK-4x4
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col use-tile-pipeline=pack-peel-4-level-tiling})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col num-rows=2 num-cols=2 enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=CHECK-2x2
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col num-rows=4 num-cols=2 enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=CHECK-4x2
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=CHECK-4x4
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col use-tile-pipeline=pack-peel-4-level-tiling enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
 
 // CHECK-2x2{LITERAL}: #config = #iree_codegen.lowering_config<tile_sizes = [[64, 64, 0], [0, 0, 1], [1, 1, 0]]>
 // CHECK-2x2{LITERAL}: #amdaie.packing_config<packing_config = [{packedSizes = [32, 32, 128], transposePackIndices = [0, 1, 2], unpackEmpty = [false, false, true], innerPerm = [[0, 1], [1, 0], [0, 1]], outerPerm = [[0, 1], [1, 0], [1, 0]]}, {packedSizes = [0, 0, 0, 4, 4, 8], transposePackIndices = [0, 1, 2], unpackEmpty = [false, false, true], innerPerm = [[0, 1], [1, 0], [0, 1]], outerPerm = [[0, 1, 3, 2], [0, 1, 3, 2], [0, 1, 3, 2]]}]>

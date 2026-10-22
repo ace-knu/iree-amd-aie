@@ -96,14 +96,14 @@ static IREE::HAL::ExecutableTargetAttr getDispatchTarget(
 /// Computes the M/N/K pad multiples for `target` and the matmul element types,
 /// entirely from the device info tables (no hardcoded geometry): M/N from the
 /// core-array shape (num_rows/num_cols) times the vector instruction size, K
-/// from the shared pack-peel reduction tile. With ukernels enabled M/N are
-/// doubled, because the matmul ukernels process 2x2 vector instructions per
-/// step and need an even count per core (KernelDispatch picks the per-core
-/// tile to match). Returns nullopt if `target` is not a recognized amd-aie
-/// target.
+/// from the shared pack-peel reduction tile. If the matmul is lowered to a
+/// ukernel M/N are doubled, because the matmul ukernels process 2x2 vector
+/// instructions per step and need an even count per core (KernelDispatch picks
+/// the per-core tile to match). Returns nullopt if `target` is not a recognized
+/// amd-aie target.
 static std::optional<PaddingMultiples> getPaddingMultiples(
     IREE::HAL::ExecutableTargetAttr target, Type lhsElemType, Type rhsElemType,
-    Type accElemType) {
+    Type accElemType, bool transposeB) {
   std::optional<AMDAIEDevice> device = getConfigAMDAIEDevice(target);
   std::optional<int64_t> numRows = getConfigNumRows(target);
   std::optional<int64_t> numCols = getConfigNumColumns(target);
@@ -127,7 +127,11 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   //   * with ukernels enabled KernelDispatch picks a factor of K instead, so
   //     padding K at all is unnecessary work. `ukernels` *is* on the target
   //     attr, so that half could be handled without any new plumbing.
-  int64_t perCore = hasUkernel(target.getConfiguration()) ? 2 : 1;
+  bool useUKernel =
+      hasUkernel(target.getConfiguration(), "matmul") &&
+      hasUKernelTemplate(*device, "matmul",
+                         {lhsElemType, rhsElemType, accElemType}, transposeB);
+  int64_t perCore = useUKernel ? 2 : 1;
   return PaddingMultiples{/*m=*/*numRows * perCore * (*instr)[0],
                           /*n=*/*numCols * perCore * (*instr)[1],
                           /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
@@ -570,8 +574,8 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
             .getElementType();
 
     std::optional<PaddingMultiples> mult = getPaddingMultiples(
-        target, lhsType.getElementType(), rhsType.getElementType(),
-        outElemType);
+        target, lhsType.getElementType(), rhsType.getElementType(), outElemType,
+        /*transposeB=*/rhsNPos < rhsKPos);
     if (!mult) continue;
 
     int64_t mPad = roundUpToMultiple(m, mult->m);
@@ -718,7 +722,7 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
         target,
         cast<RankedTensorType>(dispatch.getArguments()[lhsArgNo].getType())
             .getElementType(),
-        rhsType.getElementType(), elemType);
+        rhsType.getElementType(), elemType, /*transposeB=*/true);
     if (!mult) continue;
     int64_t C = chooseChunkN(N, mult->n, kNChunkMax);
     int64_t nChunks = N / C;

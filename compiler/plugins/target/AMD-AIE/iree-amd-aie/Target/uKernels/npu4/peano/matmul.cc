@@ -196,8 +196,8 @@ v64bfp16ebs8 load_B_v64bf16_as_bfp16(const bfloat16 *__restrict p) {
 
 // TODO: The goal is every element type combination the hardware supports, each
 // with and without a transposed B. Only this template supports a transposed B
-// for now. When a template is added or gains it, extend the check in
-// AMDAIELowerToUKernels.cpp (matchMatmulDAGForUKernel) to match.
+// for now. When a template is added or gains it, add it to the table in
+// `hasUKernelTemplate` (Transforms/Utils/AMDAIEUtils.cpp).
 template <unsigned rowA, unsigned colA, unsigned colB, unsigned L0_M,
           unsigned L0_K, unsigned L0_N, bool TransposeB>
 void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,

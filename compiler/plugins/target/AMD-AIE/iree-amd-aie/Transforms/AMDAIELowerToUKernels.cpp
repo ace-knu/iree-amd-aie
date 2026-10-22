@@ -104,15 +104,6 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
   if (!linalgOp) {
     return rewriter.notifyMatchFailure(op, "is not a linalg operation");
   }
-  // A transposed B is read as [n][k] blocks. Each element type combination has
-  // its own ukernel template, and each template supports a transposed B on its
-  // own, so this is limited to what the ukernel sources implement: only the
-  // bf16 x bf16 -> f32 template of npu4 for now. Any other combination stays on
-  // the non-ukernel path instead of failing the ukernel compilation.
-  // TODO: The goal is every element type combination the hardware supports,
-  // with and without a transposed B. When a template is added or gains
-  // transposed B support in uKernels/<npu>/peano/matmul.cc, extend the check
-  // below to match.
   bool transposeB = isMatmulTransposeB(linalgOp);
   if (!isMatmul(linalgOp) && !transposeB) {
     return rewriter.notifyMatchFailure(op, "is not a matmul-like operation");
@@ -140,14 +131,18 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
     return rewriter.notifyMatchFailure(
         op, "tile needs an even number of vector instructions in M and N");
   }
-  if (transposeB) {
-    std::optional<AMDAIEDevice> device =
-        getConfigAMDAIEDevice(IREE::HAL::ExecutableTargetAttr::lookup(op));
-    if (!device || !isAie2P(*device) || !lhsElemType.isBF16() ||
-        !rhsElemType.isBF16() || !outElemType.isF32()) {
-      return rewriter.notifyMatchFailure(
-          op, "transposed B is only supported for bf16 x bf16 -> f32 on npu4");
-    }
+  // A transposed B is read as [n][k] blocks, which each template supports on
+  // its own. Only the npu4 templates do so far.
+  // TODO: Other devices tile a transposed B matmul for the ukernel
+  // (`KernelDispatch`) although it is not lowered to one here.
+  std::optional<AMDAIEDevice> device =
+      getConfigAMDAIEDevice(IREE::HAL::ExecutableTargetAttr::lookup(op));
+  if (!device || (transposeB && !isAie2P(*device)) ||
+      !hasUKernelTemplate(*device, ukernelName,
+                          {lhsElemType, rhsElemType, outElemType},
+                          transposeB)) {
+    return rewriter.notifyMatchFailure(
+        op, "no ukernel template for the element types");
   }
   std::string inputOutputElemTypeAndSize =
       typeToString(lhsElemType) + "_" + typeToString(rhsElemType) + "_" +
@@ -190,6 +185,12 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
   Value output = fillOp.getDpsInitOperand(0)->get();
   auto outType = llvm::cast<ShapedType>(output.getType());
   Type outElemType = outType.getElementType();
+  std::optional<AMDAIEDevice> device =
+      getConfigAMDAIEDevice(IREE::HAL::ExecutableTargetAttr::lookup(op));
+  if (!device || !hasUKernelTemplate(*device, ukernelName, {outElemType})) {
+    return rewriter.notifyMatchFailure(
+        op, "no ukernel template for the element type");
+  }
 
   int M, N, r, t;
   if (outType.getRank() == 2) {
@@ -257,6 +258,24 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchTruncIDAGForUKernel(
   if (!linalgOp) {
     return rewriter.notifyMatchFailure(op, "is not a linalg operation");
   }
+  if (linalgOp.getNumDpsInputs() != 1 || linalgOp.getNumDpsInits() != 1) {
+    return rewriter.notifyMatchFailure(op, "is not a single input/output op");
+  }
+  Value input = linalgOp.getDpsInputOperand(0)->get();
+  Value output = linalgOp.getDpsInitOperand(0)->get();
+  auto inType = llvm::cast<ShapedType>(input.getType());
+  auto outType = llvm::cast<ShapedType>(output.getType());
+  Type inElemType = inType.getElementType();
+  Type outElemType = outType.getElementType();
+  // Checked before `checkIsShiftTruncIAndReturnShift`, which may create IR.
+  std::optional<AMDAIEDevice> device =
+      getConfigAMDAIEDevice(IREE::HAL::ExecutableTargetAttr::lookup(op));
+  if (!device ||
+      !hasUKernelTemplate(*device, ukernelName, {inElemType, outElemType})) {
+    return rewriter.notifyMatchFailure(
+        op, "no ukernel template for the element types");
+  }
+
   std::optional<Value> maybeShift =
       checkIsShiftTruncIAndReturnShift(rewriter, linalgOp);
   if (!maybeShift.has_value()) {
@@ -264,13 +283,6 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchTruncIDAGForUKernel(
                                        "is not a shift followed by a trunci");
   }
   Value shiftVal = maybeShift.value();
-
-  Value input = linalgOp.getDpsInputOperand(0)->get();
-  Value output = linalgOp.getDpsInitOperand(0)->get();
-  auto inType = llvm::cast<ShapedType>(input.getType());
-  auto outType = llvm::cast<ShapedType>(output.getType());
-  Type inElemType = inType.getElementType();
-  Type outElemType = outType.getElementType();
 
   // Tiling for M x N as well as the corresponding inner tiling intrinsics r x
   // t.

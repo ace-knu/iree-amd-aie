@@ -1,6 +1,7 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4})' %s | FileCheck %s
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 use-tile-pipeline=pack-peel-4-level-tiling})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 enable-ukernels=matmul})' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 use-tile-pipeline=pack-peel-4-level-tiling enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=UKERNEL
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 enable-ukernels=zero_fill})' %s | FileCheck %s --check-prefix=ZERO-FILL
 
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
 // CHECK-SAME:                [128, 128, 0], [0, 0, 1], [1, 1, 0]
@@ -52,6 +53,13 @@ module {
 
 // UKERNEL{LITERAL}: #config = #iree_codegen.lowering_config<tile_sizes = [[64, 256, 0], [0, 0, 1], [1, 1, 0]]>
 // UKERNEL:          #packingConfig = #amdaie.packing_config<packing_config = [{packedSizes = [16, 32, 128]
+
+// With only the zero fill ukernel enabled the matmul is not lowered to a
+// ukernel, so it keeps the tiling without ukernels.
+
+// ZERO-FILL{LITERAL}: #config = #iree_codegen.lowering_config<tile_sizes = [[224, 256, 0], [0, 0, 1], [1, 1, 0]]>
+// ZERO-FILL:          #packingConfig = #amdaie.packing_config<packing_config = [{packedSizes = [56, 32, 32]
+// ZERO-FILL-SAME:     {packedSizes = [0, 0, 0, 8, 8, 8]
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   <storage_buffer>,
   <storage_buffer>,
@@ -69,6 +77,36 @@ module {
     %5 = tensor.empty() : tensor<3136x256xf32>
     %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
     %7 = linalg.matmul ins(%3, %4 : tensor<3136x1152xbf16>, tensor<1152x256xbf16>) outs(%6 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [3136, 256], strides = [1, 1] : tensor<3136x256xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<3136x256xf32>>
+    return
+  }
+}
+
+// -----
+
+// There is no f32 matmul ukernel, so with the matmul ukernel enabled the f32
+// matmul keeps the tiling without ukernels and the scalar pack size 4x4x8.
+
+// UKERNEL{LITERAL}: #config = #iree_codegen.lowering_config<tile_sizes = [[224, 256, 0], [0, 0, 1], [1, 1, 0]]>
+// UKERNEL:          #packingConfig = #amdaie.packing_config<packing_config = [{packedSizes = [56, 32, 32]
+// UKERNEL-SAME:     {packedSizes = [0, 0, 0, 4, 4, 8]
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @matmul_3136x256x1152_f32() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3136x1152xf32>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1152x256xf32>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<3136x256xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [3136, 1152], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3136x1152xf32>> -> tensor<3136x1152xf32>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [1152, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1152x256xf32>> -> tensor<1152x256xf32>
+    %5 = tensor.empty() : tensor<3136x256xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
+    %7 = linalg.matmul ins(%3, %4 : tensor<3136x1152xf32>, tensor<1152x256xf32>) outs(%6 : tensor<3136x256xf32>) -> tensor<3136x256xf32>
     iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [3136, 256], strides = [1, 1] : tensor<3136x256xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<3136x256xf32>>
     return
   }

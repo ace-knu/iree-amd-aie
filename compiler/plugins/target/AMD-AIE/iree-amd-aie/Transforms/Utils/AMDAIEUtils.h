@@ -57,6 +57,20 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1);
 /// (which pads M/N/K up to multiples of it).
 std::array<uint32_t, 3> getScalarMatmulPackSize();
 
+/// Returns true if the ukernel sources of `device` have a template for the
+/// ukernel `ukernelName` with the element types `elemTypes` (operands, then
+/// result), and for a transposed B if `transposeB`. An op without a template is
+/// left to the non-ukernel path, so this decides whether an op is lowered to a
+/// ukernel (`AMDAIELowerToUKernels`) and whether it is tiled and padded for one
+/// (`KernelDispatch`, the padding pass). Only the element types are checked
+/// here: the shape conditions of a ukernel are checked when lowering to it.
+/// TODO: The goal is every element type combination the hardware supports.
+/// The table covers the npu4 peano sources (uKernels/npu4/peano). Other devices
+/// and ukernels without an entry keep the previous behavior: a template is
+/// assumed. When a template is added, add it here.
+bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
+                        ArrayRef<Type> elemTypes, bool transposeB = false);
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);
 

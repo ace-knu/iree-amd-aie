@@ -1,5 +1,5 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy)' %s | FileCheck %s
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{use-tile-pipeline=pack-peel-4-level-tiling})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{enable-ukernels=matmul})' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{use-tile-pipeline=pack-peel-4-level-tiling enable-ukernels=matmul})' %s | FileCheck %s --check-prefix=PACK-PEEL-4-LEVEL
 
 // Test generic version of matmul.
 

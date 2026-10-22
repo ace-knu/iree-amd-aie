@@ -96,6 +96,39 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
 
 std::array<uint32_t, 3> getScalarMatmulPackSize() { return {4, 4, 8}; }
 
+bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
+                        ArrayRef<Type> elemTypes, bool transposeB) {
+  struct UKernelTemplate {
+    StringRef ukernelName;
+    SmallVector<StringRef, 3> elemTypes;
+    bool transposeB;
+  };
+  // The templates in uKernels/npu4/peano.
+  static const UKernelTemplate kNpu4Templates[] = {
+      {"matmul", {"bf16", "bf16", "f32"}, /*transposeB=*/true},
+      {"matmul", {"i8", "i8", "i32"}, /*transposeB=*/false},
+      {"zero_fill", {"f32"}, /*transposeB=*/false},
+      {"zero_fill", {"i32"}, /*transposeB=*/false},
+      {"trunci", {"i32", "i8"}, /*transposeB=*/false},
+  };
+  auto isUKernel = [&](const UKernelTemplate &t) {
+    return t.ukernelName == ukernelName;
+  };
+  if (!isAie2P(device) || llvm::none_of(kNpu4Templates, isUKernel)) return true;
+  auto typeToString = [](Type type) {
+    std::string typeStr;
+    llvm::raw_string_ostream rso(typeStr);
+    type.print(rso);
+    return typeStr;
+  };
+  return llvm::any_of(kNpu4Templates, [&](const UKernelTemplate &t) {
+    return isUKernel(t) && (t.transposeB || !transposeB) &&
+           llvm::equal(t.elemTypes, elemTypes, [&](StringRef s, Type type) {
+             return s == typeToString(type);
+           });
+  });
+}
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr) {
   std::optional<int64_t> res = getConstantIntValue(ofr);

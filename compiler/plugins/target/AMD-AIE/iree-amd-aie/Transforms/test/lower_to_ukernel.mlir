@@ -401,6 +401,48 @@ module {
 
 // -----
 
+// The npu4 ukernels have no f32 matmul or i16 zero fill template, so these are
+// not lowered.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
+module {
+  func.func @generic_matmul_f32f32f32_no_template(
+      %arg0: tensor<1x1x4x4x4x8xf32>, %arg1: tensor<1x1x4x4x8x4xf32>,
+      %arg2: tensor<1x1x4x4x4x4xf32>) -> tensor<1x1x4x4x4x4xf32> attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+    %0 = linalg.generic {
+        indexing_maps = [
+            affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d0, d2, d5, d3, d6, d8)>,
+            affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d2, d1, d4, d5, d8, d7)>,
+            affine_map<(d0, d1, d2, d3, d4, d5, d6, d7, d8) -> (d0, d1, d4, d3, d6, d7)>
+        ],
+        iterator_types = [
+          "parallel", "parallel", "reduction",
+          "parallel", "parallel", "reduction",
+          "parallel", "parallel", "reduction"
+        ]
+      } ins(%arg0, %arg1 : tensor<1x1x4x4x4x8xf32>, tensor<1x1x4x4x8x4xf32>)
+        outs(%arg2 : tensor<1x1x4x4x4x4xf32>) {
+        ^bb0(%in: f32, %in_0: f32, %out: f32):
+          %1 = arith.mulf %in, %in_0 : f32
+          %2 = arith.addf %out, %1 : f32
+          linalg.yield %2 : f32
+      } -> tensor<1x1x4x4x4x4xf32>
+    return %0 : tensor<1x1x4x4x4x4xf32>
+  }
+  func.func @zero_fill_i16_no_template(%arg0: tensor<1x1x4x4x4x4xi16>) -> tensor<1x1x4x4x4x4xi16> attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+    %c0 = arith.constant 0 : i16
+    %0 = linalg.fill ins(%c0 : i16) outs(%arg0 : tensor<1x1x4x4x4x4xi16>) -> tensor<1x1x4x4x4x4xi16>
+    return %0 : tensor<1x1x4x4x4x4xi16>
+  }
+}
+// CHECK-LABEL: func @generic_matmul_f32f32f32_no_template(
+//       CHECK:   linalg.generic
+//   CHECK-NOT:   iree_codegen.ukernel.generic
+// CHECK-LABEL: func @zero_fill_i16_no_template(
+//       CHECK:   linalg.fill
+//   CHECK-NOT:   iree_codegen.ukernel.generic
+
+// -----
+
 func.func @shift_trunci(%arg0 : tensor<16x16x4x4xi32>) -> tensor<16x16x4x4xi8> attributes {
   hal.executable.target = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
 } {
@@ -441,15 +483,11 @@ func.func @trunci(%arg0 : tensor<16x16x4x4xi16>) -> tensor<16x16x4x4xi8> attribu
     } -> tensor<16x16x4x4xi8>
   return %1 : tensor<16x16x4x4xi8>
 }
+// The npu4 trunci ukernel has no i16 -> i8 template, so this is not lowered.
+// Expect it to be lowered again once such a template is added.
 // CHECK-LABEL:  func @trunci
-// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: tensor<16x16x4x4xi16>)
-// CHECK:        %[[C0:.+]] = arith.constant 0 : i16
-// CHECK-NOT:    linalg.generic
-// CHECK:        %[[MICRO_KERNEL:.+]] = iree_codegen.ukernel.generic "trunci_i16_i8_64x64"
-// CHECK-SAME:       ins(%[[ARG0]], %[[C0]] : tensor<16x16x4x4xi16>, i16
-// CHECK-SAME:       fn_def_attrs {link_with = "trunci.o", ukernel_instance = [
-// CHECK-SAME:       -> tensor<16x16x4x4xi8>
-// CHECK:        return %[[MICRO_KERNEL]]
+// CHECK:        linalg.generic
+// CHECK-NOT:    iree_codegen.ukernel.generic
 
 // -----
 

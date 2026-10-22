@@ -12,6 +12,7 @@
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -240,6 +241,21 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // Also we should make sure the first level inner pack size is divisible by
   // the second level of inner pack size (vector instruction size).
 
+  // The ukernel tiling below only applies if this matmul is lowered to a
+  // ukernel: the matmul ukernel is enabled and has a template for its element
+  // types.
+  MLIRContext *context = linalgOp.getContext();
+  DictionaryAttr ukernelConfig = DictionaryAttr::get(
+      context,
+      {NamedAttribute(StringAttr::get(context, "ukernels"),
+                      StringAttr::get(context, enableAMDAIEUkernels))});
+  bool useUKernel =
+      hasUkernel(ukernelConfig, "matmul") &&
+      hasUKernelTemplate(deviceModel.device, "matmul",
+                         {lhsType.getElementType(), rhsType.getElementType(),
+                          initType.getElementType()},
+                         isMatmulTransposeB(linalgOp));
+
   // Get the level 1 pack size, i.e., vector instruction size.
   auto maybePackedSize = getPackedSize(linalgOp, M, N, K, deviceModel);
   if (failed(maybePackedSize)) return failure();
@@ -300,7 +316,7 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // multiples of that instead of the L1 size; this stays within the L1 bound
   // because the L1 size is at least 16. Otherwise the ukernel is not used for
   // the resulting odd tile (see AMDAIELowerToUKernels).
-  if (enableAMDAIEUkernels != "none") {
+  if (useUKernel) {
     uint32_t mMultiple = numRows * 2 * m1Pack;
     uint32_t nMultiple = numCols * 2 * n1Pack;
     if (M % mMultiple == 0) M0 = findLargestFactor(M, maxL0SizeM, mMultiple);
@@ -327,7 +343,7 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // size with ukernel path, while keeping smaller size for vectorization path.
   // TODO: fix vectorization path to use larger k tile size.
   uint32_t k0Pack =
-      enableAMDAIEUkernels == "none"
+      !useUKernel
           ? std::min(static_cast<int>(getPackPeelReductionTile(kPackScaleL1)),
                      static_cast<int>(K))
           : maxL0SizeK;
