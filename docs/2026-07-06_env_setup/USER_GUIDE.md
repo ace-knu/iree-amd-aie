@@ -77,8 +77,29 @@ bash build_tools/download_peano.sh          # Peano(llvm-aie) v22 → ./llvm-aie
 ctest --test-dir build -R amd-aie --output-on-failure
 # 기대: 100% tests passed, 0 failed out of 221
 ```
+참고: configure/build는 `build/` 외에 `build-trace/`(console tracing을 켠 런타임, `iree-run-module`만)도
+함께 만든다. 2-4의 `--verbose`(dispatch별 시간)가 이것을 쓴다.
 
-### 2-4. 모델 → NPU 실행 (컨테이너 내부)
+### 2-4. 모델 → NPU 실행
+
+**ONNX 모델은 실행 스크립트를 쓴다.** 컴파일 옵션이 `scripts/onnx/options.py`에 모여 있어 모두 같은
+옵션으로 실행하고, 결과는 CPU(llvm-cpu) 기준값과 비교해 정확도까지 출력한다. 상세는
+[`scripts/onnx/README.md`](../../scripts/onnx/README.md).
+```bash
+# (호스트, repo 루트) 컨테이너를 띄워 컴파일 + 실행 + 정확도 확인. ONNX 파일은 repo 안에 있어야 한다
+./scripts/docker/run-onnx.sh e2e models/mlp_2layer/mlp_2layer.onnx
+# 출력: mlp_2layer: compile X s | run Y s (median of 3) | corr ..., maxabs ...
+
+# 옵션 예: bf16 변환 + dispatch별 시간(NPU/CPU 할당, 각 실행 시간)
+./scripts/docker/run-onnx.sh e2e models/vgg16/vgg16-12.onnx --numeric bf16 --verbose
+
+# 이미 컴파일한 결과(build/onnx/<model>-<options>/)만 다시 실행
+./scripts/docker/run-onnx.sh run build/onnx/mlp_2layer-ukernel_all-vectorize_off-numeric_f32
+```
+컨테이너 안에서는 `python3 scripts/onnx/{compile,run,e2e}.py`를 같은 인자로 실행한다(아래의
+`source`/`export` 후).
+
+**그 밖의 모델(PyTorch 등)은 직접 import → compile → run 한다** (컨테이너 내부):
 ```bash
 # 모델 import 준비: venv 활성화(python=torch/onnx 포함) + iree.compiler 경로
 source /opt/venv/bin/activate
@@ -117,32 +138,12 @@ build/tools/iree-run-module --device=amdxdna --module=model.vmfb \
 <summary><b>번들 예시 모델로 셋업 확인</b> — <code>models/mlp_2layer</code></summary>
 
 > 2-layer MLP: `MatMul(x,w1) → Relu → MatMul(_,w2)` (bias 없음, 가중치는 상수, f32 128×128).
+> `mlp_2layer.onnx`는 repo에 있다(생성 스크립트: `models/mlp_2layer/export_mlp_2layer.py`).
 >
 > ```bash
-> cd /workspace/models/mlp_2layer
-> python export_mlp_2layer.py                    # mlp_2layer.onnx 생성 (가중치 상수)
-> python -m iree.compiler.tools.import_onnx mlp_2layer.onnx -o mlp_2layer.mlir
-> /workspace/build/tools/iree-compile mlp_2layer.mlir \
->   --iree-hal-target-device=npu=amdxdna --iree-hal-target-device=cpu=local \
->   --iree-hal-local-target-device-backends=llvm-cpu --iree-hal-default-device=npu \
->   --iree-amdaie-target-device=npu4 --iree-amd-aie-peano-install-dir=/workspace/llvm-aie \
->   --iree-amdaie-demote-contraction-inputs-to-bf16 --iree-amdaie-enable-vectorization-passes=false \
->   -o mlp_2layer.vmfb
-> # 함수 mlp_2layer, 입력 1개(x=128x128xf32)
-> /workspace/build/tools/iree-run-module --device=amdxdna --device=local-task \
->   --module=mlp_2layer.vmfb --function=mlp_2layer --input="128x128xf32=1" --output=@out.npy
-> ```
->
-> 생성 스크립트: `models/mlp_2layer/export_mlp_2layer.py`. 정확도까지 확인하려면 같은 모델을 CPU로
-> 컴파일해 golden을 만들고 비교한다:
->
-> ```bash
-> /workspace/build/tools/iree-compile mlp_2layer.mlir \
->   --iree-hal-target-backends=llvm-cpu -o mlp_cpu.vmfb
-> /workspace/build/tools/iree-run-module --device=local-task --module=mlp_cpu.vmfb \
->   --function=mlp_2layer --input="128x128xf32=1" --output=@gold.npy
-> python3 -c "import numpy as np; g=np.load('gold.npy'); o=np.load('out.npy'); \
->   print('corr %.6f' % np.corrcoef(g.ravel(), o.ravel())[0,1])"
+> # (호스트, repo 루트)
+> ./scripts/docker/run-onnx.sh e2e models/mlp_2layer/mlp_2layer.onnx
+> # 기대: corr 1.00000 (기본 --numeric f32). --numeric bf16이면 corr 0.9999x
 > ```
 >
 > 컴파일 각 단계의 MLIR을 덤프해 변환 과정을 추적하려면 `./scripts/docker/run-debug.sh`
@@ -158,7 +159,7 @@ build/tools/iree-run-module --device=amdxdna --module=model.vmfb \
 수정 후에는 **컨테이너 안에서 다시 빌드·실행**한다 (ninja 증분 빌드라 바뀐 부분만 재컴파일 → 빠름):
 ```bash
 # (컨테이너 내부) 소스 수정 후
-./scripts/build/build.sh                                # 증분 재빌드
+./scripts/build/build.sh                                # 증분 재빌드 (build/ + build-trace/)
 ctest --test-dir build -R amd-aie --output-on-failure   # (선택) 테스트
 # 필요하면 2-4의 모델 → NPU 실행을 다시 수행
 ```
