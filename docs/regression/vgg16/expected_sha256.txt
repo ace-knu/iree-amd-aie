@@ -4,3 +4,4 @@
 vgg_2dev_novec   d5f1ebb9c7bdfa96b47423157425bb928e539bfd0fb6ba486cb98bf95fc5d5ff  팀 bf16 2장치 레시피(flags_b.txt), 9/29 팀 원본 빌드와 같음. CLAUDE.md 0절
 vgg_2dev_vec     6ccb1a0aa2e5b131b586cfada7f591c5e9fc25efa73df0d20954d517147e1366  flags_b_vec.txt(벡터화 켬, 반올림 기본 conv_even), 10/22 세션 1 챕터 01. CLAUDE.md 0절
 vgg_3dev_npu9    e4dcc1a0c28b7d145abce2f000d7c59568f6a0b5b101a6e2dce2ae01d075beaa  우회 레시피(-unroll-threshold=0 + placement-map npu9_gpu4.map) 기준, 10/18. CLAUDE.md 0절
+ctrlpkt_vgg16    6ccb1a0aa2e5b131b586cfada7f591c5e9fc25efa73df0d20954d517147e1366  flags_b_vec_ctrlpkt.txt(벡터화 + 컨트롤 패킷, packet flow auto). vgg_2dev_vec과 같은 출력. 10/22 세션 6(S13), 사용자 승인

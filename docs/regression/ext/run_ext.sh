@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# v9 회귀 새 시험 실행기 (run_regression.sh 가 quick/full 단계에서 부른다. 단독 실행도 된다).
+# v9~v10 회귀 새 시험 실행기 (run_regression.sh 가 quick/full 단계에서 부른다. 단독 실행도 된다).
 #   bash ext/run_ext.sh <quick|full> <out_dir> [케이스 이름 정규식]
 # 시험 (판정은 ext/judge.py, 입력은 ext/gen_inputs.py 로 실행 때 생성. 자세한 표는 ../README.md)
 #   V1 vec_*   bf16 벡터화 matmul × rand·relu      → 흉내 V3.1(conv_even) 원소 100% 비트 일치
@@ -8,7 +8,9 @@
 #   V4 mlp_*   mlp_reduce 난수 입력(3장치·CPU+GPU)  → 출력 전체 float64 기준 rel ≤ 1e-5
 #   V5 sem_*   NPU→GPU, GPU→NPU, CPU→NPU × 시드 3 × 2회 → 정확, 같은 시드 비트 동일, 로그 순서
 #   V6 edge_*  fanout3 3경우 + NPU→GPU→CPU 직결     → 출력 전부 float64 기준
+#   V7 ctrlpkt_* 컨트롤 패킷(배선 묶음, S13): 배선 3종 pa·1종 chain4 → 컨트롤 패킷 끔 출력과 비트 동일 + ctx MISS 수
 #   F1~F3 vgg_* (full) VGG16 2장치 끔/켬, f32 3장치 → 출력 sha256 (vgg16/expected_sha256.txt)
+#   F4 ctrlpkt_vgg16 (full) VGG16 2장치 벡터화 + 컨트롤 패킷 → 출력 sha256 + ctx MISS 6
 # 환경 변수
 #   REG_FAULT   검출력 확인용(평소 비움): v1_floor(V1 컴파일에 floor 옵션), v1_v1model(V1 판정을 옛 누산 모델로),
 #               v4_ref(V4 기준을 다른 시드 입력으로 계산)
@@ -98,6 +100,30 @@ if want i8_3136x64x576; then
   row i8_3136x64x576 int "$j" "$crc" "$rrc" "$res"
 fi
 
+# ---------------- V7 컨트롤 패킷 배선 묶음 (S13) ----------------
+# VGG 벡터화 레시피(vgg16/flags_b_vec.txt, dedup 끔 포함)로 끔/켬 두 번 컴파일. 켬 출력 = 끔 출력(비트) + [T] ctx MISS = 배선 종류 수.
+ctrlpkt_case() {  # name model func 기대_ctx_MISS
+  local name=$1 m=$2 func=$3 nctx=$4 fl=() ia=() k crc rrc=- j=- res=FAIL miss
+  want "$name" || return 0
+  mapfile -t fl < "$REG_DIR/vgg16/flags_b_vec.txt"
+  "$PY" "$EXT_DIR/gen_inputs.py" sig "$IN/$name" "$MODELS/ctrlpkt/$m.mlir" || { row "$name" ctrlpkt "입력 생성 실패" 98 - FAIL; return; }
+  for k in $(ls "$IN/$name"/in*.npy | sort -V); do ia+=(--input=@"$k"); done
+  compile "${m}_off" "$MODELS/ctrlpkt/$m.mlir" "${fl[@]}"; crc=$?
+  compile "${m}_ctrlpkt" "$MODELS/ctrlpkt/$m.mlir" "${fl[@]}" --iree-amdaie-enable-control-packet=true --iree-amdaie-packet-flow-strategy=auto || crc=$?
+  if [[ $crc -eq 0 ]]; then
+    run "${name}_off" "$OUT/${m}_off.vmfb" "$func" --device=amdxdna --device=local-task "${ia[@]}" --output=@"$OUT/${name}_off.npy"; rrc=$?
+    [[ $rrc -eq 0 ]] && { run "$name" "$OUT/${m}_ctrlpkt.vmfb" "$func" --device=amdxdna --device=local-task "${ia[@]}" --output=@"$OUT/$name.npy"; rrc=$?; }
+    if [[ $rrc -eq 0 ]]; then
+      j=$(judge same "$OUT/${name}_off.npy" "$OUT/$name.npy"); miss=$(grep -c 'ctx MISS' "$OUT/$name.stderr")
+      [[ $j == OK* && $miss -eq $nctx ]] && res=PASS
+      j="$j ; ctx MISS $miss (기대 $nctx)"
+    fi
+  fi
+  row "$name" ctrlpkt "$j" "$crc" "$rrc" "$res"
+}
+ctrlpkt_case ctrlpkt_pa_3routes pa     pa     3
+ctrlpkt_case ctrlpkt_chain4     chain4 chain4 1
+
 # ---------------- V4~V6 128x128 3장치·2장치 (난수 입력, float64 기준) ----------------
 devargs() { local o="" d; IFS=, read -ra x <<<"$1"; for d in "${x[@]}"; do o+=" --device=$d"; done; echo "$o"; }
 idargs() { local o="" d; [[ $1 == - ]] && return; IFS=, read -ra x <<<"$1"; for d in "${x[@]}"; do o+=" --input_device=$d"; done; echo "$o"; }
@@ -161,11 +187,11 @@ sem_case sem_n2g_chain2auto_avl   chain2_auto.mlir chain2     chain2     $T3 $R3
 sem_case sem_g2n_chain2auto_vla   chain2_auto.mlir chain2     chain2     vulkan,local,amdxdna vulkan,local-task,amdxdna 0,0,2 g2n
 sem_case sem_c2n_mlpreduce_vla    mlp_reduce.mlir  mlp_reduce mlp_reduce vulkan,local,amdxdna vulkan,local-task,amdxdna 0,0,2 -
 
-# ---------------- F1~F3 VGG16 (full) ----------------
+# ---------------- F1~F4 VGG16 (full) ----------------
 if [[ $LEVEL == full ]]; then
   VM=${REG_VGG_MLIR:-/work/vgg16/vgg.mlir}; VI=${REG_VGG_INPUT:-/workspace/models/vgg16/input.npy}; V=$REG_DIR/vgg16
-  vgg_case() {  # name flags_file map(-|파일) 실행장치
-    local name=$1 ff=$2 map=$3 rd=$4 exp crc=- rrc=- j=- res=FAIL fl=()
+  vgg_case() {  # name flags_file map(-|파일) 실행장치 [기대_ctx_MISS]
+    local name=$1 ff=$2 map=$3 rd=$4 nctx=${5:--} exp crc=- rrc=- j=- res=FAIL fl=() miss
     want "$name" || return 0
     exp=$(awk -v n="$name" '$1==n{print $2}' "$V/expected_sha256.txt")
     if [[ ! -f $VM || ! -f $VI ]]; then row "$name" sha "SKIP: VGG 입력 없음 ($VM, $VI)" - - SKIP; return; fi
@@ -176,6 +202,9 @@ if [[ $LEVEL == full ]]; then
       # shellcheck disable=SC2046
       run "$name" "$OUT/$name.vmfb" mxnet_converted_model $(devargs "$rd") --input=@"$VI" --output=@"$OUT/$name.npy"; rrc=$?
       [[ $rrc -eq 0 ]] && { j=$(judge sha "$OUT/$name.npy" "$exp"); [[ $j == OK* ]] && res=PASS; }
+      if [[ $rrc -eq 0 && $nctx != - ]]; then
+        miss=$(grep -c 'ctx MISS' "$OUT/$name.stderr"); [[ $miss -eq $nctx ]] || res=FAIL; j="$j ; ctx MISS $miss (기대 $nctx)"
+      fi
       j="$j | vmfb $(sha256sum "$OUT/$name.vmfb" | cut -c1-16)…(지표)"
     fi
     [[ ${REG_KEEP_VGG_VMFB:-0} == 1 ]] || rm -f "$OUT/$name.vmfb"
@@ -184,6 +213,7 @@ if [[ $LEVEL == full ]]; then
   vgg_case vgg_2dev_novec    flags_b.txt                - amdxdna,local-task
   vgg_case vgg_2dev_vec      flags_b_vec.txt            - amdxdna,local-task
   vgg_case vgg_3dev_npu9     flags_nodemote_unroll0.txt npu9_gpu4.map amdxdna,vulkan,local-task
+  vgg_case ctrlpkt_vgg16     flags_b_vec_ctrlpkt.txt    - amdxdna,local-task 6
 fi
 
 {
