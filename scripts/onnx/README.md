@@ -46,7 +46,10 @@ and, for large models such as VGG, the host settings in
 | `vector` | user options `--ukernel {none,all}`, `--vectorize {off,on}` |
 | `numeric` | user option `--numeric {f32,bf16}`: what f32 contraction inputs become |
 
-Defaults: `--ukernel all --vectorize off --numeric f32`. Fixed groups are always
+Defaults: `--ukernel all --vectorize off --numeric f32`. With `--numeric f32`,
+`--ukernel none` compiles faster (VGG 65 s instead of 83 s) and runs the same:
+f32 matmuls have no ukernel, only their zero fill does, which costs a ukernel
+compile per NPU dispatch without a run-time gain. Fixed groups are always
 passed. A flag that only works around a current gap is marked `# workaround:`;
 remove it once the gap is fixed. To add, remove or change an option, edit
 `options.py` only: each user option becomes a `--<name>` argument by itself.

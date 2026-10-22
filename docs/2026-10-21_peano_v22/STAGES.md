@@ -227,6 +227,9 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
 | bf16, ukernel `all` | corr 0.99997, top-1 일치 | 99.6s | 2.28s | 0.125s | 0.999913 | 8.5s / 0.31s |
 
 - 정확도는 VGG가 ONNX f32 reference 대비 logit corr, MLP가 llvm-cpu 대비 corr이다. f32는 MLP max abs 차이 1.4e-6이다.
+- f32 ukernel `all`의 컴파일이 20s 더 긴 것은 zero_fill ukernel 때문이다. f32 matmul은 템플릿이 없어 ukernel을 쓰지 않지만
+  누적값 초기화(fill)는 f32 템플릿이 있어 ukernel로 가고, `zero_fill.cc`를 NPU dispatch마다(VGG 23번) Peano로 컴파일한다.
+  실행 시간은 같으므로 f32에서는 `--ukernel none`을 권장한다(`scripts/onnx/README.md`).
 - bf16 ukernel `all`의 VGG dispatch 23개는 이 작업 전(`2119b20f`)과 core IR, NPU 명령열, pdi가 byte 단위로 같다.
 - i8 x i8 → i16 matmul(256x256x256)은 ukernel off와 `all` 모두 numpy와 정확히 일치한다(이전에는 `all`에서 컴파일 실패).
 - ctest 221/221.
@@ -290,6 +293,8 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
   - NPU dispatch는 program 순서대로 실행되므로 k번째 명령을 k번째 NPU dispatch에 대응시켰다.
   - NPU 명령 사이의 빈 시간은 CPU 작업(im2col, maxpool, bias+ReLU, transpose 등)이다.
 - 단계마다 3회 측정해 중앙값을 썼다. strace overhead는 wall 기준 약 1%다.
+- 이후 같은 분해(dispatch별 NPU/CPU 시간, hwctx 생성/해제)는 `scripts/onnx/run.py --verbose`로 얻을 수 있다.
+  console tracing을 켠 runtime(`build-trace/`)의 로그를 해석한다(`scripts/onnx/README.md`).
 
 ### 시간 구성
 
