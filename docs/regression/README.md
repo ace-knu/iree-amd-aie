@@ -29,7 +29,7 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡�
 |---|---|---|---|
 | `base` | 26케이스 × 수동·자동 (v8과 같음, 이전 결과와 비교용) | 104 s | 16 MB |
 | **`quick`(기본)** | base + **V0**(26케이스, 난수 입력·출력 전체) + **V1~V7**(ext 20행) | **245 s**(v10, v9는 219 s) | 100 MB |
-| `full` | quick + **F1~F4**(VGG16 4개) | **529 s**(v9 F1~F3 기준, v10 전체는 미측정) | 100 MB(VGG vmfb 1.16 GB는 판정 뒤 지움) |
+| `full` | quick + **F1~F4**(VGG16 4개) | **605 s**(v10, v9는 529 s) | 102 MB(VGG vmfb 약 1.4 GB는 판정 뒤 지움) |
 
 ```bash
 # 컨테이너 안(/workspace = 저장소, /work = ~/iree-work, 잠금 디렉토리·--ulimit memlock=-1·장치 마운트)
@@ -161,4 +161,4 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 | v8 | 2026-09-29, `docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현` | 26 | `REG_INPUT_DEVICE=auto` 모드, `placed` 지표 열, npu2out 편입, 2장치 4케이스의 수동 `--input_device`를 lead 인덱스로 명시(자동 배치가 기본이 되어서) |
 | v8 (기본 모드) | 2026-09-29, 같은 챕터 | 26 | 기본 실행을 수동+자동 둘 다로 변경(`REG_INPUT_DEVICE=both`), 한쪽만은 `manual`/`auto` |
 | v9 | 2026-10-22, `docs/2026-10-22/2_회귀_벡터화_편입/02_구현` | 26×2 + V0 26 + ext 18(+F 3) | 3단계 `REG_LEVEL` = base / quick(기본) / full. **V0**(26케이스 난수 입력·출력 전체·CPU 기준), **V1~V6**(bf16 벡터화 V3.1 비트 일치, 반올림 floor 옵션, int8, mlp_reduce 강화, 세마포어 대표, 미시험 경계 버퍼 + NPU→GPU→CPU 직결 `chain3_ngc.mlir`), **F1~F3**(VGG16 출력 sha). `compile_flags`를 `lib.sh`로 옮김(내용 같음). base 26×2 결과 행은 v8과 같음(10/22 확인). 흉내는 `tools/bfp16_emulator` import(같은 날 `__main__` 보호 추가) |
-| v10 | 2026-10-22, `docs/2026-10-22/6_B1_컨트롤패킷_PDI묶음/05_회귀추가` | 26×2 + V0 26 + ext 20(+F 4) | **V7**(컨트롤 패킷 배선 묶음, 명세 S13): `ctrlpkt_pa_3routes`(배선 3종, 고치기 전 빌드에서 corr 0.229로 틀리던 모델), `ctrlpkt_chain4`(배선 1종) — 끔과 비트 동일 + `[T] ctx MISS` 수. **F4** `ctrlpkt_vgg16`(F2 레시피 + 컨트롤 패킷, 출력 sha `6ccb1a0a…` = F2와 같음, ctx MISS 6. 기준 sha 추가는 사용자 승인). 새 파일 `models/ctrlpkt/{pa,chain4}.mlir`, `vgg16/flags_b_vec_ctrlpkt.txt`, `gen_inputs.py` `sig` 모드. quick 245 s 전부 PASS(manual·auto·V0 26, EXT 20). F4는 단독 실행으로 PASS 확인(full 전체는 안 돌림) |
+| v10 | 2026-10-22, `docs/2026-10-22/6_B1_컨트롤패킷_PDI묶음/05_회귀추가` | 26×2 + V0 26 + ext 20(+F 4) | **V7**(컨트롤 패킷 배선 묶음, 명세 S13): `ctrlpkt_pa_3routes`(배선 3종, 고치기 전 빌드에서 corr 0.229로 틀리던 모델), `ctrlpkt_chain4`(배선 1종) — 끔과 비트 동일 + `[T] ctx MISS` 수. **F4** `ctrlpkt_vgg16`(F2 레시피 + 컨트롤 패킷, 출력 sha `6ccb1a0a…` = F2와 같음, ctx MISS 6. 기준 sha 추가는 사용자 승인). 새 파일 `models/ctrlpkt/{pa,chain4}.mlir`, `vgg16/flags_b_vec_ctrlpkt.txt`, `gen_inputs.py` `sig` 모드. quick 245 s 전부 PASS(manual·auto·V0 26, EXT 20). full 605 s 전부 PASS(EXT 24, F1~F4 sha 기준과 같음) |
