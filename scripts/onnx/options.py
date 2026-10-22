@@ -22,6 +22,7 @@ OPTIONS = {
             "--iree-hal-target-device=npu=amdxdna",
             "--iree-hal-target-device=cpu=local",
             "--iree-hal-local-target-device-backends=llvm-cpu",
+            "--iree-llvmcpu-target-cpu=host",
             "--iree-hal-default-device=npu",
         ],
         "run": [
