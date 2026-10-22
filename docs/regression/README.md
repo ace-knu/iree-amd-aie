@@ -1,6 +1,6 @@
 # 3-device 회귀 테스트 (docs/regression)
 
-CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡터화(bf16·int8, 반올림 설정 S11, 흉내 V3.1 S12)의 회귀 테스트다. 이 폴더는 날짜와 상관없는 고정 위치이고, 스크립트와 모델은 여기서만 관리한다(v6부터). v1~v6의 이전 사본은 `docs/2026-09-28/02_회귀테스트_기준선_재현/`에 있고, 더 이상 갱신하지 않는다. **현재 v11**(2026-10-22, 3단계 + V0 + V1~V7 + F1~F4, V1에 M=4096 join 레이스 모양).
+CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡터화(bf16·int8, 반올림 설정 S11, 흉내 V3.1 S12)의 회귀 테스트다. 이 폴더는 날짜와 상관없는 고정 위치이고, 스크립트와 모델은 여기서만 관리한다(v6부터). v1~v6의 이전 사본은 `docs/2026-09-28/02_회귀테스트_기준선_재현/`에 있고, 더 이상 갱신하지 않는다. **현재 v12**(2026-10-22, 3단계 + V0 + V1~V7 + F1~F4, V1에 M=4096 join 레이스 모양, v12는 summary에 NPU 전원 모드 줄).
 
 ## 1. 흐름상 위치·무엇을 하는가 (1-4 형식)
 - **위치**: 컴파일러·런타임 밖의 시험이다. 현재 빌드(`$IREE_BUILD`, 기본 `/workspace/build-gpu`)의 `iree-compile`·`iree-run-module`로 모델을 **매번 새로 컴파일**하고(vmfb 재사용 안 함), 실제 NPU·GPU·CPU에서 실행해 출력을 판정한다. 컨테이너(`iree-aie-gpu:dev`, `/workspace` = 저장소 루트) 안에서 NPU 잠금으로 감싸 돈다.
@@ -55,6 +55,7 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 | `REG_KEEP_VGG_VMFB=1` | VGG vmfb를 지우지 않음 |
 | `REG_FAULT` | **검출력 확인용**(평소 비움, 6절) |
 
+- **NPU 전원 모드(v12~)**: `summary.txt` 머리에 `npu power_mode: start=<모드> end=<모드>` 한 줄이 들어가고, 시작과 끝이 다르면 `  WARN pm changed`가 붙는다(실행 끝 콘솔에도 마지막 `BOTH:` 줄 바로 앞에 찍힘). 전원 모드는 장치 전체 설정이라 root만 바꿀 수 있고 NPU 시간을 바꾼다(기본 모드에서는 hwctx 생성·해제마다 DPM을 바꿈). **회귀 시간을 비교할 때는 이 줄이 같은지 먼저 본다.** 읽기 전용 `scripts/npu/getpm.py`(`GET_POWER_MODE`)를 쓰고, 못 읽으면 `unknown`이다. 판정·rc와 무관하다.
 - 입력 배치 모드(v8~): base는 수동(`--input_device` 붙임)과 자동(빼고 reflection 배치) 두 모드를 모두 돈다. V0·ext는 **한 번만** 돌고, 기존 케이스와 같은 `--input_device`를 붙인다.
 
 ## 4. 판정 (PASS 조건)
@@ -169,3 +170,4 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 | v9 | 2026-10-22, `docs/2026-10-22/2_회귀_벡터화_편입/02_구현` | 26×2 + V0 26 + ext 18(+F 3) | 3단계 `REG_LEVEL` = base / quick(기본) / full. **V0**(26케이스 난수 입력·출력 전체·CPU 기준), **V1~V6**(bf16 벡터화 V3.1 비트 일치, 반올림 floor 옵션, int8, mlp_reduce 강화, 세마포어 대표, 미시험 경계 버퍼 + NPU→GPU→CPU 직결 `chain3_ngc.mlir`), **F1~F3**(VGG16 출력 sha). `compile_flags`를 `lib.sh`로 옮김(내용 같음). base 26×2 결과 행은 v8과 같음(10/22 확인). 흉내는 `tools/bfp16_emulator` import(같은 날 `__main__` 보호 추가) |
 | v10 | 2026-10-22, `docs/2026-10-22/6_B1_컨트롤패킷_PDI묶음/05_회귀추가` | 26×2 + V0 26 + ext 20(+F 4) | **V7**(컨트롤 패킷 배선 묶음, 명세 S13): `ctrlpkt_pa_3routes`(배선 3종, 고치기 전 빌드에서 corr 0.229로 틀리던 모델), `ctrlpkt_chain4`(배선 1종) — 끔과 비트 동일 + `[T] ctx MISS` 수. **F4** `ctrlpkt_vgg16`(F2 레시피 + 컨트롤 패킷, 출력 sha `6ccb1a0a…` = F2와 같음, ctx MISS 6. 기준 sha 추가는 사용자 승인). 새 파일 `models/ctrlpkt/{pa,chain4}.mlir`, `vgg16/flags_b_vec_ctrlpkt.txt`, `gen_inputs.py` `sig` 모드. quick 245 s 전부 PASS(manual·auto·V0 26, EXT 20). full 605 s 전부 PASS(EXT 24, F1~F4 sha 기준과 같음) |
 | v11 | 2026-10-22, `docs/2026-10-22/8_회귀V1_M4096_레이스` | 26×2 + V0 26 + ext 22(+F 4) | **V1에 `vec_bf16_4096x64x32_{rand,relu}`**(규민 memtile join lock 레이스 재현 모양, d2846c0d): V3.1 원소 100% 비트 일치 + 새 판정 `judge.py race`(64행 조각, 2웨이브 뒤 기대값과 같은 조각을 레이스 흔적으로 셈). 새 모델 `models/vec/mm_f32_4096x64x32.mlir`. 레이스 판정 검출력은 팀 원본 빌드 `build/`(lock 수정 전)의 int8 4096으로 확인(5/5 NG, 통합 빌드 5/5 OK). bf16 경우 자체의 검출력은 미확인(수정 전 빌드에 AIE2P bf16 벡터화 없음). quick 249 s 전부 PASS(EXT 22) |
+| v12 | 2026-10-22, `docs/2026-10-22/12_NPU_power_mode_기록_turbo재측정` | 같음 | 케이스·판정 변화 없음. `summary.txt`에 **NPU 전원 모드 줄**(`npu power_mode: start=… end=…`, 다르면 `WARN pm changed`)을 넣었다. 10/22 저녁에 장치 모드가 default → turbo로 바뀐 것을 발견했고(누가 바꿨는지 미확인), 모드에 따라 NPU 시간이 달라져서다. 새 파일 `scripts/npu/getpm.py`(읽기 전용) |

@@ -157,6 +157,8 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | R31 | `docs/regression/ext/judge.py` | 모드 `race` 추가 | 출력을 64행 조각으로 나눠 기대값(V3.1 흉내 또는 정수 정답)과 비트 비교, 2웨이브 뒤 기대값과 같은 조각을 레이스 흔적으로 셈(규민 `matmul.sh` 판정과 같은 방식) | 10/22 세션8 | `docs/2026-10-22/8_회귀V1_M4096_레이스/` | `docs/regression/README.md` |
 | R32 | `docs/regression/ext/run_ext.sh`, `docs/regression/models/vec/mm_f32_4096x64x32.mlir` | V1 모양 목록·`RACE_SHAPES`, 새 파일 | 회귀 v11: V1에 4096x64x32 rand·relu(V3.1 100% + race) | 같음 | 같음 | 같음 |
 | R33 | `docs/regression/README.md`, 이 파일 | v11 | 판정·시험 표, 검출력 메모, 버전 이력 | 같음 | 같음 | 같음 |
+| R34 | `scripts/npu/getpm.py` | 새 파일 | NPU 전원 모드 읽기 전용 도구(`GET_INFO`/`GET_POWER_MODE`, 세션 4 T6 도구를 옮기고 인자·시각·실패 처리 추가) | 10/22 세션 12 | `docs/2026-10-22/12_NPU_power_mode_기록_turbo재측정/02_모드기록_구현/` | `docs/regression/README.md` 3절 |
+| R35 | `docs/regression/run_regression.sh`, `docs/regression/README.md`, 이 파일 | 머리 주석·`npu_pm`/`pm_line`·summary 한 줄 / v12 | 회귀 v12: summary에 `npu power_mode: start=… end=…`(다르면 `WARN pm changed`). 판정·rc 무관 | 같음 | 같음 | 같음 |
 
 ## 3. 전임자 변경 — 덩어리별 (HEAD → 9/28 기준선)
 
@@ -378,4 +380,5 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | 2026-10-22 | 10/22 세션 6 | **통합 브랜치** 2-4절 R21~R26: 컨트롤 패킷 경로의 배선(base PDI) 묶음별 PDI·컨텍스트(S13)와 컨텍스트 생성 실패 때 LRU 축출. 컨트롤 패킷 끔은 그대로(VGG16 vmfb `10abd446…`·출력 `6ccb1a0a…` 동일, 회귀 quick 전부 PASS). 켬: 배선 3종 모델이 고치기 전 틀림(corr 0.229) → 고친 뒤 기준과 비트 동일 |
 | 2026-10-22 | 10/22 세션 6 챕터 05 | **통합 브랜치** 2-4절 R27~R29: 회귀 v10(V7 컨트롤 패킷 `ctrlpkt_pa_3routes`·`ctrlpkt_chain4`, F4 `ctrlpkt_vgg16`). 컴파일러·런타임 변경 없음. quick 245 s 전부 PASS(EXT 20), F4 단독 PASS |
 | 2026-10-22 | 10/22 세션 7·8 | **통합 브랜치** 2-4절 R30: 규민 브랜치 재 merge `c521e6d2`(문서·스크립트 4개, 반올림 cherry-pick은 코드 변경 없음). R31~R33: 회귀 v11(V1 4096x64x32 + `race` 판정). 컴파일러·런타임 변경 없음. quick 249 s 전부 PASS(EXT 22) |
+| 2026-10-22 | 10/22 세션 12 | **통합 브랜치** 2-4절 R34~R35: NPU 전원 모드 기록(`scripts/npu/getpm.py`, 회귀 v12 summary 줄). 컴파일러·런타임 변경 없음. 잠금 래퍼 `scripts/lock/with-npu-lock.sh`의 같은 기록은 브랜치 밖 파일(빌드 사본만)이라 장부 행 없음 |
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |

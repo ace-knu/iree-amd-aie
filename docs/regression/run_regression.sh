@@ -38,6 +38,7 @@
 #                   <key>.stream.log, <case>.stdout, <case>.stderr,
 #                   summary.txt. 저장소 안에는 아무것도 쓰지 않는다.
 #   v9: $REG_OUT/{manual,auto}/ = base, $REG_OUT/v0/ = V0(입력·CPU 기준 npy 포함), $REG_OUT/ext/ = V1~V6·F1~F3
+#   v12: summary.txt 머리에 "npu power_mode: start=<모드> end=<모드>" 한 줄(다르면 "  WARN pm changed"). 판정·rc 와 무관.
 
 set -u -o pipefail
 
@@ -57,12 +58,19 @@ PY=${REG_PYTHON:-/opt/venv/bin/python3}
 FAULT=${REG_FAULT:-}
 FAULT_CASE=${REG_FAULT_CASE:-mlp_reduce_3dev}
 
+# v12: NPU 전원 모드(장치 전체 설정, root 만 바꿀 수 있고 측정 시간에 영향)를 시작·끝에 읽어 summary 에 남긴다.
+# 읽기 전용(scripts/npu/getpm.py, GET_POWER_MODE). 못 읽으면 unknown. 판정·rc 에는 쓰지 않는다.
+PM_TOOL=$SCRIPT_DIR/../../scripts/npu/getpm.py
+npu_pm() { local m; m=$("$PY" -I "$PM_TOOL" --name 2>/dev/null); echo "${m:-unknown}"; }
+pm_line() { local l="npu power_mode: start=$1 end=$2"; [[ $1 != "$2" ]] && l+="  WARN pm changed"; echo "$l"; }
+
 # 기본(both): 이 스크립트를 모드별로 한 번씩 다시 부르고 요약을 합친다. 둘 중 하나라도 FAIL 이면 rc 1.
 # v9: quick/full 이면 이어서 V0(한 번, 수동 모드 인자)와 ext(V1~V6, full 은 F1~F3 까지)를 돈다.
 if [[ $INPUT_MODE == both ]]; then
   case $LEVEL in base|quick|full) ;; *) echo "REG_LEVEL=$LEVEL 은 base|quick|full 중 하나여야 한다"; exit 2 ;; esac
   mkdir -p "$OUT" || exit 2
   rc_all=0
+  PM_START=$(npu_pm); echo "npu power_mode (start): $PM_START"
   for m in manual auto; do
     echo "===== input mode: $m ====="
     REG_INPUT_DEVICE=$m REG_OUT="$OUT/$m" bash "${BASH_SOURCE[0]}" "$@" || rc_all=1
@@ -73,9 +81,11 @@ if [[ $INPUT_MODE == both ]]; then
     echo "===== ext: $LEVEL ====="
     bash "$SCRIPT_DIR/ext/run_ext.sh" "$LEVEL" "$OUT/ext" "$@" || rc_all=1
   fi
+  PM_LINE=$(pm_line "$PM_START" "$(npu_pm)")
   {
     echo "regression run (both input modes, level $LEVEL): $(date '+%Y-%m-%d %H:%M:%S %Z')"
     echo "out dir       : $OUT  (manual/, auto/$([[ $LEVEL != base ]] && echo ', v0/, ext/'))"
+    echo "$PM_LINE"
     for m in manual auto; do echo; echo "===== $m ====="; cat "$OUT/$m/summary.txt"; done
     if [[ $LEVEL != base ]]; then
       echo; echo "===== v0 ====="; cat "$OUT/v0/summary.txt"
@@ -86,6 +96,7 @@ if [[ $INPUT_MODE == both ]]; then
     [[ $LEVEL != base ]] && line+=" / V0 $(grep -m1 '^PASS=' "$OUT/v0/summary.txt") / EXT $(grep -m1 '^EXT ' "$OUT/ext/ext_summary.txt" | sed 's/^EXT //')"
     echo "$line"
   } >"$OUT/summary.txt"
+  echo "$PM_LINE"
   tail -1 "$OUT/summary.txt"
   exit $rc_all
 fi
@@ -94,6 +105,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 mkdir -p "$OUT" || exit 2
 SUMMARY=$OUT/summary.txt
+PM_START=$(npu_pm)
 
 # compile_flags 는 lib.sh 에 있다(v9 에서 옮김, 내용 같음).
 
@@ -342,6 +354,7 @@ fi
 {
   echo "regression run: $(date '+%Y-%m-%d %H:%M:%S %Z')"
   echo "out dir       : $OUT"
+  pm_line "$PM_START" "$(npu_pm)"
   echo "iree-compile  : $(stat -c '%y' "$IREE_BUILD/lib/libIREECompiler.so" 2>/dev/null) (libIREECompiler.so)"
   echo "iree-run-module: $(stat -c '%y' "$RUN" 2>/dev/null)"
   echo "model dir     : $MODEL_DIR"
