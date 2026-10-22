@@ -94,6 +94,8 @@ int64_t getPackPeelReductionTile(int64_t kPackScaleL1) {
   return kPackScaleL1 * 32;
 }
 
+std::array<uint32_t, 3> getScalarMatmulPackSize() { return {4, 4, 8}; }
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr) {
   std::optional<int64_t> res = getConstantIntValue(ofr);

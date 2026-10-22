@@ -7,6 +7,8 @@
 #ifndef IREE_AMD_AIE_TRANSFORMS_AMDAIEUTILS_H_
 #define IREE_AMD_AIE_TRANSFORMS_AMDAIEUTILS_H_
 
+#include <array>
+
 #include "iree-amd-aie/aie_runtime/AMDAIEEnums.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -48,6 +50,12 @@ std::optional<int64_t> getConfigNumRows(
 /// `kPackScaleL1` selects the pipeline variant (1 = default 2-level tiling,
 /// 2 = 4-level tiling).
 int64_t getPackPeelReductionTile(int64_t kPackScaleL1);
+
+/// Returns the M/N/K pack size for a matmul whose element types have no AIE
+/// vector instruction (e.g. f32). Shared by `KernelDispatch` (which packs by
+/// it, or by the largest factor of each dim below it) and the padding pass
+/// (which pads M/N/K up to multiples of it).
+std::array<uint32_t, 3> getScalarMatmulPackSize();
 
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);

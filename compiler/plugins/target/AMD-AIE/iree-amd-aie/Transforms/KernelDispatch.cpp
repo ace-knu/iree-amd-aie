@@ -59,10 +59,11 @@ FailureOr<std::array<uint32_t, 3>> getPackedSize(
   // not divisible by the instruction size, then use the largest factor of M, N,
   // K that is divisible. Any packing is valid when there is not vectorization.
   if (failed(maybeInstructionSize)) {
+    std::array<uint32_t, 3> scalarSize = getScalarMatmulPackSize();
     std::array<uint32_t, 3> packedSize;
-    packedSize[0] = findLargestFactor(M, 4);
-    packedSize[1] = findLargestFactor(N, 4);
-    packedSize[2] = findLargestFactor(K, 8);
+    packedSize[0] = findLargestFactor(M, scalarSize[0]);
+    packedSize[1] = findLargestFactor(N, scalarSize[1]);
+    packedSize[2] = findLargestFactor(K, scalarSize[2]);
     return packedSize;
   }
 
@@ -694,6 +695,9 @@ static LogicalResult setRootConfigForConvDecomposePipeline(
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   FailureOr<std::array<uint32_t, 3>> maybeInstructionSize =
       getMatmulInstructionSize(linalgOp, deviceModel);
+  // TODO: This scalar fallback duplicates `getScalarMatmulPackSize()`. Use the
+  // shared helper (and keep it in sync with the padding pass) once conv is
+  // lowered directly by this backend instead of through im2col + matmul.
   int64_t OW = 4;
   int64_t OC = 4;
   int64_t IC = 8;

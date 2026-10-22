@@ -112,7 +112,9 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   FailureOr<std::array<uint32_t, 3>> instr =
       deviceModel.getAIEMatmulInstructionSize(lhsElemType, rhsElemType,
                                               accElemType);
-  if (failed(instr)) return std::nullopt;
+  // Element types without a vector instruction (e.g. f32) are packed by the
+  // scalar pack size instead, so pad to that.
+  if (failed(instr)) instr = getScalarMatmulPackSize();
   // M and N come from the device tables. K does not: the reduction tile is
   // pinned to the default scalar pack-peel pipeline's 2-level tiling
   // (kPackScaleL1 = 1), because the tile pipeline is a global option and is not
