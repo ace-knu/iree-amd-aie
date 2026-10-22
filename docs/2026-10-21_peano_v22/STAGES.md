@@ -37,6 +37,7 @@
 - VGG 실행 시간은 S0 대비 **32배**(74.5s → 2.29s) 줄었다. NPU 연산만 보면 **583배**(72.3s → 0.124s)다.
 - S3에서는 실행 시간의 79%(1.80s / 2.29s)가 연산이 아니라 dispatch 고정 비용이다. 다음 개선의 가장 큰 대상이다.
   이 비용의 대부분은 NPU power mode(default)의 영향이다. performance mode에서는 VGG 실행이 0.44s가 된다(아래 "NPU power mode의 영향").
+- 같은 VGG를 CPU only(f32, `znver5`)로 실행하면 0.34s다(함수 호출 0.096s). NPU 최적화의 목표 수치다(아래 "CPU only 기준선").
 - 벡터화를 켜도 S3 결과는 같다. 앞으로 NPU 벡터 연산은 ukernel을 우선 추가하고, 적절하지 않을 때만 aievec을 확장한다.
 
 ---
@@ -364,6 +365,27 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
   performance mode에서는 거의 사라지고, NPU 연산도 약 20% 빨라진다.
 - power mode 설정에는 root 권한(CAP_SYS_ADMIN)이 필요하다. 컨테이너 안에서 iree의 `--amdxdna_power_mode`로 바꾸면 errno 13으로 실패한다.
 - 위 표들의 시간은 모두 default mode에서 측정했다. 측정값을 비교할 때는 power mode를 함께 기록한다.
+
+### CPU only 기준선 (NPU 최적화 목표)
+
+같은 VGG를 CPU에서만 f32로 실행한 시간이다. accuracy 기준값 모듈(`reference_device`)을 그대로 쓴다.
+이 머신의 CPU는 Ryzen AI 9 HX 370이다(Zen 5, 24 thread, AVX-512).
+두 모듈 모두 CPU 코드는 `--iree-llvmcpu-target-cpu=host`(= `znver5`)로 컴파일했다.
+이전에는 NPU+CPU 모듈의 CPU 부분만 generic CPU(SSE2)였다. 그때 cpu dispatch 합은 0.067s, 실행 시간은 2.32s였다.
+
+| | CPU only, f32 | NPU+CPU, bf16 ukernel all (default mode) |
+|---|---|---|
+| 컴파일 | 5.0~5.4s | 100.9s |
+| 실행 (wall, module load 포함, 중앙값) | **0.34s** | 2.26s |
+| 함수 호출 (`--verbose` total) | **0.096s** | 2.097s |
+| dispatch 연산 | cpu 59개 0.085s | npu 23개 0.196s + cpu 69개 0.051s |
+| host | 0.011s | 1.849s (hwctx 생성/해제 1.766s) |
+| 정확도 (corr) | 기준값 | 0.99997, top-1 일치 |
+
+- 현재 NPU+CPU는 CPU only보다 모든 항목에서 느리다. performance mode(0.439s)에서도 CPU only 0.34s보다 느리다.
+- NPU 연산(0.196s, `--verbose`로 잰 dispatch별 submit + wait 합)만 따져도 CPU only의 전체 dispatch 시간(0.085s)보다 길다.
+- **NPU 최적화의 목표는 이 CPU only 수치다.** 실행 0.34s, 함수 호출 0.096s를 기준으로 비교한다.
+  hwctx 재사용(dispatch 고정 비용)이 첫 번째 대상이고, 그다음이 NPU 연산과 CPU-NPU 사이 dispatch다.
 
 ---
 
