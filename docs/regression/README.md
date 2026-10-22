@@ -1,6 +1,6 @@
 # 3-device 회귀 테스트 (docs/regression)
 
-CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡터화(bf16·int8, 반올림 설정 S11, 흉내 V3.1 S12)의 회귀 테스트다. 이 폴더는 날짜와 상관없는 고정 위치이고, 스크립트와 모델은 여기서만 관리한다(v6부터). v1~v6의 이전 사본은 `docs/2026-09-28/02_회귀테스트_기준선_재현/`에 있고, 더 이상 갱신하지 않는다. **현재 v10**(2026-10-22, 3단계 + V0 + V1~V7 + F1~F4).
+CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡터화(bf16·int8, 반올림 설정 S11, 흉내 V3.1 S12)의 회귀 테스트다. 이 폴더는 날짜와 상관없는 고정 위치이고, 스크립트와 모델은 여기서만 관리한다(v6부터). v1~v6의 이전 사본은 `docs/2026-09-28/02_회귀테스트_기준선_재현/`에 있고, 더 이상 갱신하지 않는다. **현재 v11**(2026-10-22, 3단계 + V0 + V1~V7 + F1~F4, V1에 M=4096 join 레이스 모양).
 
 ## 1. 흐름상 위치·무엇을 하는가 (1-4 형식)
 - **위치**: 컴파일러·런타임 밖의 시험이다. 현재 빌드(`$IREE_BUILD`, 기본 `/workspace/build-gpu`)의 `iree-compile`·`iree-run-module`로 모델을 **매번 새로 컴파일**하고(vmfb 재사용 안 함), 실제 NPU·GPU·CPU에서 실행해 출력을 판정한다. 컨테이너(`iree-aie-gpu:dev`, `/workspace` = 저장소 루트) 안에서 NPU 잠금으로 감싸 돈다.
@@ -18,7 +18,7 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡�
 | `ext/judge.py` | 판정기(bfp·bfp_neg·int·ref·allclose·same·order·sha). 흉내 V3.1은 `tools/bfp16_emulator/bfp_strict_v3.py`를 **import**(복사 안 함) |
 | `ext/stamp_run.py` | 명령 실행 중 stderr 줄마다 시각을 붙임(V5 순서 검사) |
 | `models/*.mlir` | base·V0·V4~V6 모델 14개(v8 13개 + `chain3_ngc.mlir`) |
-| `models/vec/*.mlir` | V1·V2 f32 matmul 3모양(demote로 bf16), V3 int8 matmul |
+| `models/vec/*.mlir` | V1·V2 f32 matmul 4모양(demote로 bf16, v11에 `mm_f32_4096x64x32.mlir`), V3 int8 matmul |
 | `models/ctrlpkt/*.mlir` | V7 컨트롤 패킷 모델: `pa.mlir`(matmul 3개, 배선 base PDI 3종), `chain4.mlir`(matmul 4개, 배선 1종) |
 | `vgg16/` | F1~F4 레시피 사본(`flags_b.txt`, `flags_b_vec.txt`, `flags_b_vec_ctrlpkt.txt`, `flags_nodemote_unroll0.txt`, `npu9_gpu4.map`)과 **기준 sha** `expected_sha256.txt` |
 | `models/src/export_mlp_2layer_const.py` | `mlp_2layer_const*.mlir`을 만든 ONNX export 스크립트(출처 보존용) |
@@ -28,8 +28,8 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업과 NPU 벡�
 | 단계 | 내용 | 시간(2026-10-22 실측) | 산출물 |
 |---|---|---|---|
 | `base` | 26케이스 × 수동·자동 (v8과 같음, 이전 결과와 비교용) | 104 s | 16 MB |
-| **`quick`(기본)** | base + **V0**(26케이스, 난수 입력·출력 전체) + **V1~V7**(ext 20행) | **245 s**(v10, v9는 219 s) | 100 MB |
-| `full` | quick + **F1~F4**(VGG16 4개) | **605 s**(v10, v9는 529 s) | 102 MB(VGG vmfb 약 1.4 GB는 판정 뒤 지움) |
+| **`quick`(기본)** | base + **V0**(26케이스, 난수 입력·출력 전체) + **V1~V7**(ext 22행) | **249 s**(v11, v10 245 s, v9 219 s) | 100 MB |
+| `full` | quick + **F1~F4**(VGG16 4개) | **605 s**(v10, v11은 미측정 — quick 증가분 약 4 s만큼 늘 것으로 추정) | 102 MB(VGG vmfb 약 1.4 GB는 판정 뒤 지움) |
 
 ```bash
 # 컨테이너 안(/workspace = 저장소, /work = ~/iree-work, 잠금 디렉토리·--ulimit memlock=-1·장치 마운트)
@@ -62,7 +62,7 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 |---|---|
 | base | 실행 rc 0 **그리고** 첫 출력 텐서의 첫 원소가 기대값과 상대 1e-3 이내 **그리고** `alloc_select` 후보에 amdxdna가 없음(v8과 같음) |
 | V0 | 실행 rc 0, CPU 기준 실행 rc 0, **출력 전부**가 원소별 rel = max\|out − ref\|/max\|ref\| ≤ 1e-5(NaN 없음), `alloc_select` 후보에 amdxdna가 없음 |
-| V1 | 흉내 V3.1(`half_even` = 기본 crRnd conv_even)과 **원소 100% 비트 일치** |
+| V1 | 흉내 V3.1(`half_even` = 기본 crRnd conv_even)과 **원소 100% 비트 일치**. v11: 4096x64x32는 **그리고** `judge.py race`(출력 64행 조각마다 V3.1과 비트 비교, 다른 조각 0개. 다른 조각이 2웨이브(512행) 뒤 기대값과 같으면 join 레이스 흔적으로 따로 셈) |
 | V2 | floor V3.1과 100% 비트 일치 **그리고** conv_even V3.1과 비트 일치 50% 미만(옵션이 실제로 먹는지) |
 | V3 | 정수 정답 `a@b`(int64)와 원소 전부 같음(10/21 기준 sha256은 참고로 찍음) |
 | V4·V6 | 출력 전부가 float64 기준 식과 rel ≤ 1e-5, NaN 없음, `alloc_select` 후보에 amdxdna가 없음 |
@@ -84,10 +84,10 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 - 2026-10-22 실측: 26/26, rel 최대 3.85e-07.
 - **왜 넣었나**: base는 첫 원소 하나만, 상수 입력으로 비교한다. 예를 들어 mlp_reduce는 softmax가 균등이라 기대값이 1이어서 행렬 곱이 틀려도 통과할 수 있다(CLAUDE.md 1-3 "10/22 발견").
 
-### 5-2. ext — 새 시험 (v9, V7·F4는 v10)
+### 5-2. ext — 새 시험 (v9, V7·F4는 v10, V1 4096은 v11)
 | # | 케이스 | 모델·장치 | 입력 | 판정 | 무엇을 지키나 |
 |---|---|---|---|---|---|
-| V1 | `vec_bf16_{256x64x32,3072x256x1152,768x512x2304}_{rand,relu}` (6) | `models/vec/mm_f32_*`, NPU+CPU, demote, 벡터화 켬, 반올림 기본 | 10/21 생성기 시드 3(rand: N·0.5/N·0.2, relu: 희소·넓은 범위) | V3.1 비트 100% | 규민 bf16 벡터화 하강(bfp16), 반올림 기본 conv_even(S11), 흉내 V3.1(S12) |
+| V1 | `vec_bf16_{256x64x32,3072x256x1152,768x512x2304,4096x64x32}_{rand,relu}` (8) | `models/vec/mm_f32_*`, NPU+CPU, demote, 벡터화 켬, 반올림 기본 | 10/21 생성기 시드 3(rand: N·0.5/N·0.2, relu: 희소·넓은 범위) | V3.1 비트 100%(4096은 + 레이스 행 패턴) | 규민 bf16 벡터화 하강(bfp16), 반올림 기본 conv_even(S11), 흉내 V3.1(S12). **4096x64x32(v11)는 규민 memtile join lock 레이스(d2846c0d) 재현 모양**(L2 웨이브 16개) |
 | V2 | `rnd_floor_3072x256x1152_relu` | 위 + `--iree-amdaie-core-rounding-mode=floor` | relu | floor V3.1 100%, conv_even과 < 50% | 반올림 옵션이 실제로 코어에 들어감 |
 | V3 | `i8_3136x64x576` | `models/vec/mm_i8_*`, NPU+CPU | `default_rng(7)` int8 | 정수 정답 | int8 벡터화, crRnd가 int8 결과를 바꾸지 않음 |
 | V4 | `mlp_reduce_3dev_rand`, `mlp_cg_topo_lead{0,1}_rand` | `mlp_reduce.mlir`, a,v,l / l,v | r128 시드 0 | float64 `softmax(a@b)@c` rel ≤ 1e-5 | mlp_reduce 강화(base는 상수 입력 첫 원소만) |
@@ -107,10 +107,16 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 ## 6. 검출력 확인 (`REG_FAULT`, 평소 비움)
 | 값 | 하는 일 | 2026-10-22 결과 |
 |---|---|---|
-| `v1_floor` | V1 컴파일에 floor 옵션을 넣고 판정은 그대로(conv_even) | V1 **6/6 FAIL**(비트 일치 0~0.12%) |
+| `v1_floor` | V1 컴파일에 floor 옵션을 넣고 판정은 그대로(conv_even). 오른쪽 결과는 v9 6경우 기준 | V1 **6/6 FAIL**(비트 일치 0~0.12%) |
 | `v1_v1model` | V1 판정을 옛 누산 모델(블록 합 f32 RNE)로 | relu **3/3 FAIL**(86.5~99.99%), rand 3/3 PASS. 판정이 V3.1 규칙에 민감함, rand만으로는 못 가림 |
 | `v4_ref` | V4 기준을 다른 시드 입력으로 계산 | V4 **3/3 FAIL**(rel 1.34) |
 | `out_corrupt` | `REG_FAULT_CASE`(기본 mlp_reduce_3dev)의 첫 출력 (1,1) 원소를 실행 뒤 바꿈(base는 stdout 텍스트, V0는 npy) | **base 수동·자동 PASS(못 잡음), V0 FAIL**(rel 1.00e-02) |
+
+- **join 레이스 판정 검출력(v11, `REG_FAULT` 아님)**: 수정 전 동작을 켜는 플래그가 없다. 그래서 소스를 되돌리지 않고 **팀 원본 빌드 `build/`(2026-08-13, 규민 lock 수정 전, 읽기 전용)**로 확인했다.
+  - 같은 int8 4096x32x64 모델(규민 `matmul.sh i8 4096`과 같은 플래그, NPU 단독)을 `judge.py race … int`로 판정했다.
+  - 수정 전 빌드: **5/5 NG**(64행 조각 15~41개 다름, 그중 14~28개가 2웨이브 뒤 정답과 같음). 통합 빌드: 5/5 OK.
+  - **bf16 V1 4096 경우 자체의 검출력은 직접 확인하지 못했다**(수정 전 빌드에는 AIE2P bf16 벡터화가 없음). 같은 join 구조라 잡을 것으로 추정한다.
+  - 근거: `docs/2026-10-22/8_회귀V1_M4096_레이스/02_검출력/`
 
 ## 케이스 목록 (v8, 26케이스 — base와 V0)
 약어: 순서 a=amdxdna, v=vulkan, l=local(실행 시 local-task). 입력은 전부 `128x128xf32`. `--input_device`와 lead(`--device_lead_allocator`)는 스크립트에 적힌 값이다.
@@ -162,3 +168,4 @@ REG_LEVEL=quick REG_OUT=/work/regression/<이름> ./scripts/lock/with-npu-lock.s
 | v8 (기본 모드) | 2026-09-29, 같은 챕터 | 26 | 기본 실행을 수동+자동 둘 다로 변경(`REG_INPUT_DEVICE=both`), 한쪽만은 `manual`/`auto` |
 | v9 | 2026-10-22, `docs/2026-10-22/2_회귀_벡터화_편입/02_구현` | 26×2 + V0 26 + ext 18(+F 3) | 3단계 `REG_LEVEL` = base / quick(기본) / full. **V0**(26케이스 난수 입력·출력 전체·CPU 기준), **V1~V6**(bf16 벡터화 V3.1 비트 일치, 반올림 floor 옵션, int8, mlp_reduce 강화, 세마포어 대표, 미시험 경계 버퍼 + NPU→GPU→CPU 직결 `chain3_ngc.mlir`), **F1~F3**(VGG16 출력 sha). `compile_flags`를 `lib.sh`로 옮김(내용 같음). base 26×2 결과 행은 v8과 같음(10/22 확인). 흉내는 `tools/bfp16_emulator` import(같은 날 `__main__` 보호 추가) |
 | v10 | 2026-10-22, `docs/2026-10-22/6_B1_컨트롤패킷_PDI묶음/05_회귀추가` | 26×2 + V0 26 + ext 20(+F 4) | **V7**(컨트롤 패킷 배선 묶음, 명세 S13): `ctrlpkt_pa_3routes`(배선 3종, 고치기 전 빌드에서 corr 0.229로 틀리던 모델), `ctrlpkt_chain4`(배선 1종) — 끔과 비트 동일 + `[T] ctx MISS` 수. **F4** `ctrlpkt_vgg16`(F2 레시피 + 컨트롤 패킷, 출력 sha `6ccb1a0a…` = F2와 같음, ctx MISS 6. 기준 sha 추가는 사용자 승인). 새 파일 `models/ctrlpkt/{pa,chain4}.mlir`, `vgg16/flags_b_vec_ctrlpkt.txt`, `gen_inputs.py` `sig` 모드. quick 245 s 전부 PASS(manual·auto·V0 26, EXT 20). full 605 s 전부 PASS(EXT 24, F1~F4 sha 기준과 같음) |
+| v11 | 2026-10-22, `docs/2026-10-22/8_회귀V1_M4096_레이스` | 26×2 + V0 26 + ext 22(+F 4) | **V1에 `vec_bf16_4096x64x32_{rand,relu}`**(규민 memtile join lock 레이스 재현 모양, d2846c0d): V3.1 원소 100% 비트 일치 + 새 판정 `judge.py race`(64행 조각, 2웨이브 뒤 기대값과 같은 조각을 레이스 흔적으로 셈). 새 모델 `models/vec/mm_f32_4096x64x32.mlir`. 레이스 판정 검출력은 팀 원본 빌드 `build/`(lock 수정 전)의 int8 4096으로 확인(5/5 NG, 통합 빌드 5/5 OK). bf16 경우 자체의 검출력은 미확인(수정 전 빌드에 AIE2P bf16 벡터화 없음). quick 249 s 전부 PASS(EXT 22) |

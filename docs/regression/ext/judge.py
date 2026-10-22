@@ -3,6 +3,10 @@
   judge.py bfp      <out.npy> <in_dir> <floor|half_even> [old]   V1·V2: V3.1 흉내(tools/bfp16_emulator)와 원소 100% 비트 일치.
                                                                  old = 옛 누산 모델(블록 합을 f32 RNE로)로 판정(검출력 확인용)
   judge.py bfp_neg  <out.npy> <in_dir> <floor|half_even> <max%>  V2: 다른 반올림 흉내와의 비트 일치율이 max% 미만이어야 통과
+  judge.py race     <out.npy> <in_dir> <floor|half_even|int> [wave=256] [slice=64]
+                                                                 V1 M=4096(v11): memtile join 레이스 행 패턴(규민 scripts/repro/aie2p_bf16/matmul.sh와 같은 방식).
+                                                                 출력을 slice행 조각으로 나눠 기대값(V3.1 흉내, int면 정수 정답)과 비트 비교. 다른 조각 0이면 통과.
+                                                                 다른 조각이 2웨이브(2·wave행) 뒤 기대값과 같으면 레이스 흔적으로 따로 센다
   judge.py int      <out.npy> <in_dir>                           V3: 정수 정답 a@b(int64)와 원소 전부 같음
   judge.py ref      <식> <in_dir> <rel> <out1.npy> [out2.npy]    V4~V6: float64 기준 식과 출력 전체 비교. 식: chain2, mlp_reduce, fanout3, fanout3_cpu, chain3
                     (환경 변수 REG_JUDGE_REFDIR가 있으면 기준을 그 폴더 입력으로 계산 — 검출력 확인용)
@@ -70,6 +74,22 @@ def main():
             done(n == 0, f"bfp({rnd},{'V3.1' if model != 'old' else '옛 누산'}) 비트일치 {p:.4f}% ({n}개 다름{', 처음 ' + str(w) if n else ''}) | 참고 옛 누산 {p1:.4f}%")
         mx = float(A[3]); p, n, _ = bitpct(g, bfp_expect(m, a, b, rnd, "v31"))
         done(p < mx, f"bfp_neg({rnd}) 비트일치 {p:.4f}% (기준 < {mx}%)")
+    if mode == "race":
+        g = np.load(A[0]); a = np.load(f"{A[1]}/a.npy"); b = np.load(f"{A[1]}/b.npy"); rnd = A[2]
+        wave = int(A[3]) if len(A) > 3 else 256; sl = int(A[4]) if len(A) > 4 else 64
+        if rnd == "int":
+            e = a.astype(np.int64) @ b.astype(np.int64); gb, eb = g.astype(np.int64), e
+        else:
+            e = bfp_expect(emu(), a, b, rnd, "v31"); gb, eb = g.astype(np.float32).view(np.uint32), e.astype(np.float32).view(np.uint32)
+        if gb.shape != eb.shape: done(False, f"race 모양 다름 {g.shape} vs {e.shape}")
+        nsl = gb.shape[0] // sl; bad = stale = 0; first = []
+        for s in range(nsl):
+            r0 = s * sl
+            if np.array_equal(gb[r0:r0 + sl], eb[r0:r0 + sl]): continue
+            bad += 1; first.append(r0) if len(first) < 3 else None
+            l0 = r0 + 2 * wave
+            if l0 + sl <= eb.shape[0] and np.array_equal(gb[r0:r0 + sl], eb[l0:l0 + sl]): stale += 1
+        done(bad == 0, f"race {sl}행 조각 다름 {bad}/{nsl} (2웨이브 뒤 기대값과 같음 {stale}){', 처음 행 ' + str(first) if bad else ''}")
     if mode == "int":
         g = np.load(A[0]).astype(np.int64); a = np.load(f"{A[1]}/a.npy").astype(np.int64); b = np.load(f"{A[1]}/b.npy").astype(np.int64)
         ok = g.shape == (a.shape[0], b.shape[1]) and bool((g == a @ b).all())

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# v9~v10 회귀 새 시험 실행기 (run_regression.sh 가 quick/full 단계에서 부른다. 단독 실행도 된다).
+# v9~v11 회귀 새 시험 실행기 (run_regression.sh 가 quick/full 단계에서 부른다. 단독 실행도 된다).
 #   bash ext/run_ext.sh <quick|full> <out_dir> [케이스 이름 정규식]
 # 시험 (판정은 ext/judge.py, 입력은 ext/gen_inputs.py 로 실행 때 생성. 자세한 표는 ../README.md)
-#   V1 vec_*   bf16 벡터화 matmul × rand·relu      → 흉내 V3.1(conv_even) 원소 100% 비트 일치
+#   V1 vec_*   bf16 벡터화 matmul × rand·relu      → 흉내 V3.1(conv_even) 원소 100% 비트 일치 (v11: 4096x64x32는 join 레이스 행 패턴도)
 #   V2 rnd_*   --iree-amdaie-core-rounding-mode=floor → floor V3.1 100% + conv_even V3.1과 50% 미만
 #   V3 i8_*    int8 벡터화 matmul                  → 정수 정답과 같음
 #   V4 mlp_*   mlp_reduce 난수 입력(3장치·CPU+GPU)  → 출력 전체 float64 기준 rel ≤ 1e-5
@@ -81,12 +81,17 @@ bf16_case() {  # name shape kind rnd(판정) extra_flag(-|플래그)
         [[ $j == OK* && $jn == OK* ]] && res=PASS; j="$j ; $jn"
       else
         j=$(judge bfp "$OUT/$name.npy" "$IN/bf16_${S}_$kind" "$rnd" "$V1_MODEL"); [[ $j == OK* ]] && res=PASS
+        if [[ " ${RACE_SHAPES[*]} " == *" $S "* ]]; then   # v11: 여러 웨이브 모양은 join 레이스 행 패턴도 본다
+          local jr; jr=$(judge race "$OUT/$name.npy" "$IN/bf16_${S}_$kind" "$rnd"); [[ $jr == OK* ]] || res=FAIL; j="$j ; $jr"
+        fi
       fi
     fi
   fi
   row "$name" "bfp" "$j" "$crc" "$rrc" "$res"
 }
-for S in 256x64x32 3072x256x1152 768x512x2304; do for kind in rand relu; do bf16_case "vec_bf16_${S}_$kind" "$S" "$kind" half_even -; done; done
+# v11: 4096x64x32 = 규민 memtile join 레이스 재현 모양(d2846c0d, scripts/repro/aie2p_bf16/matmul.sh bf16 4096, L2 웨이브 16개)
+RACE_SHAPES=(4096x64x32)
+for S in 256x64x32 3072x256x1152 768x512x2304 4096x64x32; do for kind in rand relu; do bf16_case "vec_bf16_${S}_$kind" "$S" "$kind" half_even -; done; done
 bf16_case rnd_floor_3072x256x1152_relu 3072x256x1152 relu floor --iree-amdaie-core-rounding-mode=floor
 
 # ---------------- V3 int8 ----------------
