@@ -15,6 +15,7 @@
 - 브랜치 마무리로 ukernel 기본 컴파일러를 peano로 바꿨다(`9177dcf6`). 이 커밋에서 chess 플래그 없이 최종 검증했다:
   ctest 221/221, CI 41/41, ukernel off MLP 0.999995 / VGG 0.99999,
   ukernel `all` MLP 0.999913(컴파일 8.4s / 실행 0.32s), VGG 0.99997(컴파일 98.6s / 실행 2.39s, top-1 일치).
+- 추가 작업으로 bf16 변환 옵션 없이 f32 그대로 e2e를 실행하도록 고쳤다(아래 "추가 작업: f32 e2e").
 
 ## 요약
 
@@ -191,6 +192,79 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
 
 ---
 
+## 추가 작업: f32 e2e (bf16 변환 없이)
+
+`--iree-amdaie-demote-contraction-inputs-to-bf16`을 주면 지금까지처럼 matmul 입력을 bf16으로 낮추고, 빼면 f32 그대로 NPU에서 실행한다.
+옵션을 줬을 때의 동작은 바뀌지 않는다(아래 "결과"의 bf16 행, dispatch binary 비교). 벡터화는 두 경우 모두 off다.
+
+### 변경사항
+
+| 문제 | 커밋 | 원인과 해결 |
+|---|---|---|
+| VGG f32 컴파일 실패 | `b492865a` | 패딩 pass가 vector instruction이 없는 타입(f32 등)을 건너뛰어, conv5(M=196)와 FC(M=1)가 tile로 나누어떨어지지 않았다. KernelDispatch가 실제로 쓰는 scalar pack 크기(4x4x8)로 패딩한다. 두 곳이 같은 값을 쓰도록 `getScalarMatmulPackSize()`로 묶었다. |
+| M 방향 반복이 256을 넘는 matmul의 hang | `18cafea6`, `2119b20f` | 아래 "BD chain hang" 참고. 타입과 무관하다(bf16 81920x64x576에서도 재현). f32는 tile이 작아 conv1_2(50176x64x576)에서 반복이 392가 되어 드러났다. |
+| f32 + ukernel `all` 컴파일 실패 | `65ece963` | ukernel matcher가 타입을 검사하지 않아, 템플릿이 없는 타입(f32, i8 x i8 → i16 등)도 ukernel로 보내 ukernel 컴파일이 실패했다. npu4 peano 템플릿 표 `hasUKernelTemplate`을 두고, matcher(matmul, zero_fill, trunci), KernelDispatch, 패딩이 이 표로 ukernel 사용 여부를 판단한다. 템플릿이 없으면 ukernel off와 같은 경로로 간다. npu4 밖의 장치는 동작이 그대로다. |
+
+- **BD chain hang**: M 반복이 256(shim repeat count)을 넘으면 RHS를 반복마다 DMA로 보낸다.
+  - `AMDAIEInsertDmaBdChain`은 같은 connection의 DMA를 BD chain으로 묶고, chain의 마지막 DMA에서만 queue에 push한다.
+    chain이 다른 connection의 wait를 사이에 두면, wait 대상(LHS)이 끝나려면 코어가 RHS를 받아야 하는데 그 RHS는 wait 뒤에야 push되어 deadlock이 된다.
+    chain을 그것이 넘는 wait마다 끊는다(`2119b20f`).
+  - 같은 shape에서 `AMDAIEFoldDmaWaits`가 wait를 접을 때 token을 가진 DMA의 BD 하나만 재사용 검사를 했다.
+    chain의 다른 BD를 그 chain이 끝나기 전에 다시 programming하는 경우가 IR에 308개 있었다(chain 분할 없이도 존재, hang에 가려져 있었음).
+    chain의 모든 BD와, 접힌 wait와 남는 wait 사이에서 다시 programming되는 BD까지 검사한다(`18cafea6`).
+  - chain 분할로 chain이 짧아지지만, bf16 VGG의 NPU 연산 시간은 그대로다(ukernel off 6.65s, `all` 0.124s → 0.125s).
+
+### 결과
+
+`65ece963`에서 측정했다. VGG 실행은 3회 중앙값(bf16 ukernel `all`은 strace 2회)이다.
+
+| 구성 | VGG 정확도 | VGG 컴파일 | VGG 실행 (wall) | └ NPU 연산 | MLP 정확도 | MLP 컴파일 / 실행 |
+|---|---|---|---|---|---|---|
+| f32, ukernel off | corr 1.00000, top-1 일치 | 64.1s | 35.1s | 32.73s | 1.000000 | 3.7s / 0.21s |
+| f32, ukernel `all` | corr 1.00000, top-1 일치 | 84.5s | 35.1s | 32.74s | 1.000000 | 5.9s / 0.33s |
+| bf16, ukernel off | corr 0.99999, top-1 일치 | 64.9s | 8.8s | 6.65s | 0.999995 | 4.2s / 0.19s |
+| bf16, ukernel `all` | corr 0.99997, top-1 일치 | 99.6s | 2.28s | 0.125s | 0.999913 | 8.5s / 0.31s |
+
+- 정확도는 VGG가 ONNX f32 reference 대비 logit corr, MLP가 llvm-cpu 대비 corr이다. f32는 MLP max abs 차이 1.4e-6이다.
+- bf16 ukernel `all`의 VGG dispatch 23개는 이 작업 전(`2119b20f`)과 core IR, NPU 명령열, pdi가 byte 단위로 같다.
+- i8 x i8 → i16 matmul(256x256x256)은 ukernel off와 `all` 모두 numpy와 정확히 일치한다(이전에는 `all`에서 컴파일 실패).
+- ctest 221/221.
+
+### dispatch별 NPU 연산 시간
+
+| dispatch | 층 | M x N x K | f32 off (ms) | f32 `all` (ms) | bf16 off (ms) | bf16 `all` (ms) | f32 / bf16 off | f32 / bf16 `all` |
+|---|---|---|---|---|---|---|---|---|
+| d2 | conv1_1 | 50176x64x27 | 229.0 | 229.0 | 56.0 | 6.65 | 4.1x | 34x |
+| d6 | conv1_2 | 50176x64x576 | 3630.3 | 3630.6 | 543.0 | 7.69 | 6.7x | 472x |
+| d10 | conv2_1 | 12544x128x576 | 1921.9 | 1922.2 | 277.7 | 4.22 | 6.9x | 456x |
+| d14 | conv2_2 | 12544x128x1152 | 3490.5 | 3490.8 | 518.6 | 6.01 | 6.7x | 581x |
+| d18 | conv3_1 | 3136x256x1152 | 1834.5 | 1834.7 | 263.4 | 4.17 | 7.0x | 440x |
+| d22 | conv3_2 | 3136x256x2304 | 3463.9 | 3465.0 | 508.5 | 6.11 | 6.8x | 567x |
+| d26 | conv3_3 | 3136x256x2304 | 3484.6 | 3484.1 | 508.9 | 6.11 | 6.8x | 571x |
+| d30 | conv4_1 | 784x512x2304 | 1661.3 | 1661.9 | 261.2 | 6.13 | 6.4x | 271x |
+| d34 | conv4_2 | 784x512x4608 | 3373.4 | 3374.0 | 512.7 | 9.49 | 6.6x | 356x |
+| d38 | conv4_3 | 784x512x4608 | 3282.1 | 3282.5 | 512.4 | 10.94 | 6.4x | 300x |
+| d42 | conv5_1 | 196x512x4608 | 908.2 | 908.4 | 272.0 | 4.49 | 3.3x | 202x |
+| d46 | conv5_2 | 196x512x4608 | 933.9 | 934.4 | 272.4 | 4.24 | 3.4x | 220x |
+| d50 | conv5_3 | 196x512x4608 | 923.1 | 922.4 | 272.6 | 3.97 | 3.4x | 233x |
+| d54 x8 | fc1 (N-split 8개, 각각) | 1x512x25088 | 374~375 | 374~375 | 210~211 | 4.14~4.70 | 1.8x | 80~90x |
+| d56 | fc2 | 1x4096x4096 | 477.7 | 478.2 | 146.1 | 5.17 | 3.3x | 92x |
+| d58 | fc3 | 1x1000x4096 | 119.8 | 120.1 | 39.4 | 3.88 | 3.0x | 31x |
+
+- **f32는 ukernel off에서도 bf16 off보다 큰 conv에서 약 6.7배 느리다.** AIE2P에는 f32 x f32 곱셈 명령이 없어서,
+  f32 곱셈은 soft-float `__mulsf3` 호출이 된다. bf16 x bf16 → f32는 `vmul.f` 명령 하나다(MLP 코어 disassemble로 확인).
+  덧셈은 둘 다 `vadd.f`다.
+- **f32 ukernel `all`은 off와 같다.** f32 matmul 템플릿이 없어서 matmul은 ukernel off 경로를 탄다.
+  컴파일이 20s 늘어난 것은 f32 zero_fill이 ukernel을 쓰기 때문이다(dispatch마다 ukernel `.cc` 컴파일).
+- conv5와 FC는 비율이 작다. f32는 scalar pack(4)으로, bf16은 instruction 크기(8)로 패딩해서 계산량이 다르다
+  (예: FC의 M=1을 f32는 16, bf16 off는 32로 패딩).
+- f32 VGG wall 35.1s 중 NPU 연산이 32.7s(93%)다. 이 시간을 줄이려면 f32 matmul ukernel이 필요하다.
+  AIE2P의 f32 곱셈(`mac_elem_16(v16float, ...)`)은 bf16 곱셈으로 흉내 낸 것이다.
+  f32 하나를 bf16 세 조각으로 나눠 기본(`accuracy_safe`) 9번, `fast` 6번, `low` 3번 곱한다.
+  scalar soft-float보다는 크게 빠를 것으로 보이지만, bf16 ukernel(명령당 MAC 512개)보다는 훨씬 느리다. 측정은 하지 않았다.
+
+---
+
 ## dispatch별 시간 분석 (VGG-16)
 
 ### 측정 방법
@@ -263,9 +337,14 @@ aievec 경로를 새로 만드는 것보다 ukernel이 간단하고 효과적이
   `useChessForUKernel` 기본값을 `true` → `false`로 바꿔 `--iree-amd-aie-enable-chess-for-ukernel` 없이 peano로 ukernel을 컴파일한다.
   chess ukernel 경로(`--iree-amd-aie-enable-chess-for-ukernel=true`)는 그대로 있지만 `UK_INSTANCES`와 transpose_b를 받지 않고,
   이 브랜치에서 검증하지 않았다(Vitis가 없는 환경). CI(`run.py`)는 플래그를 명시하므로 영향이 없다.
-- **ukernel이 지원하는 타입 조합**: npu4 peano는 i8 x i8 → i32와 bf16 x bf16 → f32뿐이고, transpose_b는 bf16만 지원한다.
-  목표는 하드웨어가 지원하는 모든 타입 조합이다(`AMDAIELowerToUKernels.cpp`, `matmul.cc`의 TODO).
-  일반 matmul matcher는 타입을 검사하지 않아서, 지원하지 않는 타입에 ukernel을 켜면 ukernel 컴파일이 실패한다(기존 동작).
+- **ukernel이 지원하는 타입 조합**: npu4 peano matmul은 i8 x i8 → i32와 bf16 x bf16 → f32뿐이고, transpose_b는 bf16만 지원한다.
+  템플릿이 없는 타입은 ukernel off 경로로 간다(`hasUKernelTemplate`, `65ece963`).
+  목표는 하드웨어가 지원하는 모든 타입 조합이다. 템플릿을 추가하면 `hasUKernelTemplate` 표에도 추가한다(`AMDAIEUtils.cpp`, `matmul.cc`의 TODO).
+  f32 matmul ukernel이 다음 후보다(위 "추가 작업: f32 e2e").
+- **npu4 밖의 장치**(npu1)는 `hasUKernelTemplate` 표를 적용하지 않고 이전 동작을 유지한다.
+  npu1의 transpose_b matmul은 KernelDispatch가 ukernel용으로 tile하지만 matcher는 ukernel로 보내지 않는다(검증 불가, TODO).
+- **BD chain 분할 후 token 없는 push 수**: 분할된 앞 조각은 token 없이 push되어, channel별 대기 task 수가 queue depth로 제한되지 않는다.
+  측정한 최댓값은 3이다(81920x64x576, f32 50176x64x576). 원래 코드에도 있던 한계라서(ukernel 4096x512x512에서 이미 4) backlog다.
 - **4-level 배치의 memtile join**은 공유 lock pair를 유지해서 race가 잠재해 있다(producer chunk별 BD로 나누는 방안은 backlog).
 - ukernel off에서 FC 64x4096x25088을 단독으로 실행하면 DMA cliff(ert state 6)가 난다. VGG는 N-split으로 피한다.
 - **벡터화 on에서는 ukernel matcher가 받지 않는 bf16 matmul이 컴파일에 실패한다**(aievec bf16 `vector.contract` 미지원).
