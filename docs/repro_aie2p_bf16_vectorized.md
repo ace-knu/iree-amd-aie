@@ -1,7 +1,8 @@
 # 재현 방법: AIE2P (npu4) bf16 matmul 벡터화
 
 브랜치 `aie2p-bf16-vectorized`의 변경(커밋 1 `9b4f831a` 벡터화, 커밋 2 `d2846c0d` memtile
-join lock 수정)을 NPU에서 직접 확인하는 절차입니다. 각 커밋이 무엇을 바꿨는지는
+join lock 수정, 커밋 3 `822f0fed` cherry-pick 코어 반올림 설정)을 NPU에서 직접 확인하는
+절차입니다. 각 커밋이 무엇을 바꿨는지는
 [패치 노트](patch_aie2p_bf16_vectorized.md)를 보세요. 재현 스크립트는
 [scripts/repro/aie2p_bf16/](../scripts/repro/aie2p_bf16/)에 있습니다.
 
@@ -64,17 +65,22 @@ BENCH=1 bash scripts/repro/aie2p_bf16/vgg16.sh full off 1
 
 # (참고) matmul도 같은 방식으로 성능 측정 가능
 BENCH=1 bash scripts/repro/aie2p_bf16/matmul.sh bf16 4096 1
+
+# R8. 반올림 옵션 비교 (커밋 3): 같은 입력을 기본(conv_even)과 floor로
+bash scripts/repro/aie2p_bf16/matmul.sh bf16 256 1
+bash scripts/repro/aie2p_bf16/matmul.sh bf16 256 1 --iree-amdaie-core-rounding-mode=floor
 ```
 
-| # | 커밋 1까지 (`9b4f831a`) | 커밋 2까지 (`d2846c0d`, 브랜치 최신) |
-|---|---|---|
-| R1 | `RESULT: PASS`, corr 약 0.9999 | 같음 |
-| R2 | `RESULT: FAIL`, 실행마다 손상 블록 14~40개, 대부분 `equal to wave+2 result` | `RESULT: PASS`, 모든 실행에서 손상 0 |
-| R3 | `RESULT: FAIL` | `RESULT: PASS`, 모든 실행에서 손상 0 |
-| R4 | corr 약 0.857 | corr 0.99995, `runs bit-identical: True` |
-| R5 | corr 약 0.770, top-1 오답 | corr 0.97917, `top-1 gold=892 got=892 match=True`, `runs bit-identical: True` |
-| R6 | corr 1.00000, top-1 정답 | 같음 |
-| R7 | — | ON `real_time_mean` 약 3,300–3,700 ms, OFF 약 68,800 ms |
+| # | 커밋 1까지 (`9b4f831a`) | 커밋 2까지 (`d2846c0d`) | 커밋 3까지 (`822f0fed` cherry-pick, 브랜치 최신) |
+|---|---|---|---|
+| R1 | `RESULT: PASS`, corr 약 0.9999 | 같음 | `RESULT: PASS`, corr 0.99996 |
+| R2 | `RESULT: FAIL`, 실행마다 손상 블록 14~40개, 대부분 `equal to wave+2 result` | `RESULT: PASS`, 모든 실행에서 손상 0 | 같음 (`max\|err\| 0`) |
+| R3 | `RESULT: FAIL` | `RESULT: PASS`, 모든 실행에서 손상 0 | 같음, corr 0.99995 |
+| R4 | corr 약 0.857 | corr 0.99995, `runs bit-identical: True` | corr 0.99997, `runs bit-identical: True` |
+| R5 | corr 약 0.770, top-1 오답 | corr 0.97917, `top-1 gold=892 got=892 match=True`, `runs bit-identical: True` | **corr 0.99997**, top-1 일치, `runs bit-identical: True` |
+| R6 | corr 1.00000, top-1 정답 | 같음 | 이 문서에서는 측정 안 함 (최지훈 님 확인: 벡터화 OFF 출력 그대로) |
+| R7 | — | ON `real_time_mean` 약 3,300–3,700 ms, OFF 약 68,800 ms | ON 약 2,100–3,100 ms (측정 묶음마다 다름) |
+| R8 | — | — | 기본 corr 0.99996, `floor` corr 0.99990 |
 
 출력 읽는 법:
 
@@ -117,8 +123,12 @@ git checkout aie2p-bf16-vectorized
 
 ## 확인 이력
 
-- 2026-10-22, 커밋 2 이후 빌드로 컨테이너 안에서 빌드 명령과 R1~R5, R7(`layer1`)을 실행해 "커밋 2까지" 칸과 같은 판정(PASS,
-  top-1 정답)을 확인했습니다. 단, 이때 빌드에는 이 문서에 없는 미커밋 수정이 들어 있어서 bf16
-  corr 값은 표보다 조금 높게 나왔습니다(R4·R5 0.99997).
+- 2026-10-22, 커밋 3(`822f0fed` cherry-pick) 빌드로 R1~R5, R7(`full on`), R8을 실행해 "커밋 3까지"
+  칸의 값을 얻었습니다. R7은 같은 빌드에서 3,105 ms(cv 13.6%)와 2,096 ms(cv 1.7%)가 따로
+  나왔습니다.
+- 2026-10-22, 커밋 2 이후 빌드(당시 커밋하지 않은 별도 반올림 수정 포함)로 빌드 명령과
+  R1~R5, R7(`layer1`)을 실행해 스크립트가 동작하고 "커밋 2까지" 칸과 같은 판정(PASS, top-1
+  정답)이 나오는 것을 확인했습니다. "커밋 2까지" 칸의 corr 값(R4 0.99995, R5 0.97917)은 이
+  스크립트 이전의 측정값입니다.
 - "커밋 1까지" 칸은 이 스크립트가 아니라 이전 판 재현 스크립트로 측정한 값입니다([패치 노트](patch_aie2p_bf16_vectorized.md) 커밋 2 절의
   검증 표). "(선택) 커밋 1 상태로" 절차는 아직 실행해 보지 않았습니다.

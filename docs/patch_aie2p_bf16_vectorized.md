@@ -13,9 +13,12 @@ bf16 matmul을 벡터화하는 작업의 커밋별 기록입니다. 커밋마다
 |---|---|---|---|---|---|
 | 1 | `9b4f831a` | 2026-10-20 | AIE2P bf16 matmul을 bfp16 MAC으로 벡터화 | 0.770, top-1 오답 | — |
 | 2 | `d2846c0d` | 2026-10-21 | memtile join의 lock 레이스 수정 (bf16과 무관한 기존 버그) | 0.97917, top-1 정답 | 약 3.3–3.7 s |
+| 3 | `822f0fed` cherry-pick (작성: 최지훈) | 2026-10-22 | 코어 반올림 모드를 floor → conv_even으로 설정 | **0.99997**, top-1·top-5 정답 | 약 2.1–3.1 s (변화 없음) |
 
-비교 기준: 벡터화 OFF(스칼라 경로)는 corr 1.00000, 약 68.8 s입니다. 커밋 2까지
-적용하면 top-1을 맞히면서 **약 19배 빠릅니다.**
+비교 기준: 벡터화 OFF(스칼라 경로)는 corr 1.00000, 약 68.8 s입니다. 커밋 3까지
+적용하면 **스칼라 경로와 거의 같은 정확도로 약 20배 빠릅니다.**
+
+커밋 `f55542b4`는 이 문서와 재현 스크립트를 추가한 문서 커밋이라 표에서 뺐습니다.
 
 측정 조건(모든 커밋 공통):
 
@@ -602,8 +605,122 @@ lit: AMD-AIE 호스트 테스트 전부 통과.
 
 ### 이 커밋 시점의 알려진 문제
 
-VGG16 corr가 0.979로, 벡터화 OFF(1.00000)보다 낮습니다. top-1은 맞지만 이 브랜치에서는
-아직 해결하지 않았습니다.
+VGG16 corr가 0.979로, 벡터화 OFF(1.00000)보다 낮습니다. 원인은 bfp16 변환의 반올림
+방향이었고, 커밋 3에서 고쳤습니다.
+
+---
+
+## 커밋 3 — `822f0fed` cherry-pick: 코어 반올림 모드 설정 (crRnd = conv_even)
+
+작성: 최지훈 (통합 브랜치 `3devices-f32-aie2p-bf16`의 `822f0fed`). 소스 8개와 lit 테스트만
+가져왔고, 원 커밋의 `docs/` 변경(`docs/CHANGES.md`, `docs/specs/`)은 이 브랜치에 넣지
+않았습니다.
+
+### 요약
+
+VGG16 corr 0.979의 원인은 **bfp16 변환의 반올림 방향**이었습니다. f32→bfp16 변환 명령
+(`v64accfloat.to.v64bfp16ebs8`)은 코어 제어 레지스터 `crRnd`가 정한 방식으로 반올림하는데,
+아무도 이 레지스터를 설정하지 않아 리셋값 **floor(항상 내림)**로 돌고 있었습니다. floor는
+모든 가수를 같은 방향으로 깎기 때문에, K 방향으로 수천 개를 더하는 동안 오차가 상쇄되지 않고
+쌓입니다. 이 커밋은 모든 코어 함수의 맨 앞에서 `crRnd`를 **conv_even(짝수 쪽 최근접 반올림)**으로
+설정합니다. 정확도가 corr 0.97917 → 0.99997로 올라가고 속도는 그대로입니다.
+
+### 원인 확인 (이 브랜치에서 독립적으로 한 것)
+
+최지훈 님과 별개로 같은 결론에 도달했습니다.
+
+- **하드웨어 변환 방식**: 하드웨어 bf16 matmul 출력(256×32×64, 32×32×32)에 bfp16 변환 후보를
+  대입해 보니, "K 방향 8개 블록이 최대 지수 `E`를 공유하고, 각 원소는 `floor(x / 2^(E-6))`인
+  부호 있는 8비트 가수" 모델이 **모든 출력 원소와 비트 단위로 일치**했습니다.
+- **VGG16 시뮬레이션**: 이 모델을 PyTorch VGG16에 넣어 계산하면 corr 0.97917로 하드웨어와
+  같았고(출력 차이 최대 2.4e-7), floor를 짝수 쪽 반올림으로만 바꾸면 0.99996이었습니다.
+  레이어별로는 floor가 conv0 0.99998 → conv12 0.984 → 마지막 FC 0.979로 계속 떨어졌습니다.
+- 그래서 0.979는 이 반올림 하나로 전부 설명되고, 커밋 1의 전치, 커밋 2의 lock 수정, 타일링에는
+  문제가 없다는 것도 함께 확인됐습니다.
+
+> 다른 보완안(bfp16을 hi/lo로 나눠 MAC 3번, 원소별 bf16 MAC)은 연산량이 3~8배 늘어 쓰지
+> 않았습니다. 이 브랜치에서도 matmul마다 반올림을 설정하는 안(새 XLLVM op)을 따로 구현해
+> 같은 결과를 얻었지만, 코어 시작에 한 번 설정하고 옵션도 있는 이 커밋으로 통일했습니다.
+
+### 변경 파일
+
+| 파일 | 변경 |
+|---|---|
+| `aie/AMDAIECoreToStandard.cpp` | 코어 함수 첫 명령으로 `call @llvm.<arch>.set.ctrl.reg(crRnd, mode)` 삽입. `rounding-mode` 옵션 해석 |
+| `aie/Passes.td` | `amdaie-standard-lowering` 패스에 `rounding-mode` 옵션 추가 (기본 `auto`) |
+| `iree-amd-aie/Target/AIETarget.{h,cpp}` | 컴파일 플래그 `--iree-amdaie-core-rounding-mode` 추가 |
+| `iree-amd-aie/Target/XCLBinGen.{h,cpp}` | 위 플래그를 패스 옵션까지 전달 |
+| `aie_runtime/iree_aie_runtime.{h,cc}` | `AMDAIEDeviceModel::getRoundingModeCtrlReg()`: `crRnd` 레지스터 번호 (AIE2 6, AIE2P 1) |
+| `aie/test/core_rounding_mode.mlir` | lit 테스트: auto / none / floor / chess / 잘못된 이름 |
+
+### 상세
+
+**`AMDAIECoreToStandard.cpp`** (170–183행) — 코어 함수 맨 앞에 반올림 설정 삽입
+
+```cpp
+170    // Set the rounding mode before anything else runs on the core, so that every
+171    // SRS / float-to-bf16 / float-to-bfp16 conversion in the core (including
+172    // those in linked ukernels) sees it.
+173    if (roundingMode.has_value()) {
+174      rewriter.setInsertionPointToStart(&coreFunc.getBody().front());
+175      Location loc = coreOp.getLoc();
+176      IntegerType i32 = rewriter.getI32Type();
+177      SmallVector<Value, 2> args{
+178          rewriter.create<arith::ConstantOp>(
+179              loc, i32, rewriter.getI32IntegerAttr(roundingMode->ctrlReg)),
+180          rewriter.create<arith::ConstantOp>(
+181              loc, i32, rewriter.getI32IntegerAttr(roundingMode->value))};
+182      rewriter.create<func::CallOp>(loc, roundingMode->setCtrlReg, args);
+183    }
+```
+
+옵션 해석(276행~): `auto`면 AIE2P에서 conv_even(12), AIE2에서는 아무것도 하지 않습니다.
+`none`이면 설정하지 않고, `floor`·`conv_even` 같은 모드 이름을 주면 그 값을 씁니다. chess
+경로에서는 적용하지 않고(이름을 직접 주면 경고), 모르는 이름이면 에러를 냅니다. 모드 번호는
+Peano `aie2p_defines.h`의 `rnd_*` 값과 같습니다(129행 `getRoundingModeValue`).
+
+> **변경 전 → 후**
+> - **기존**: 코어 시작 코드에서 `crRnd`를 건드리지 않아, 모든 반올림 변환이 리셋값 floor로
+>   동작했습니다.
+> - **추가**: 코어마다 첫 명령으로 `set.ctrl.reg(1, 12)` 한 번(AIE2P 기본). 생성된 코어
+>   코드에서는 `mov crrnd, #12` 명령 하나입니다.
+> - **결과**: 벡터화 하강과 ukernel 모두 bfp16 변환이 짝수 쪽 최근접 반올림을 합니다. 같은
+>   코어의 다른 반올림 변환(SRS, f32→bf16)도 같은 모드를 따릅니다. AIE2(npu1)는 기본값에서
+>   달라지는 것이 없습니다.
+
+**사용법**: 기본값(`auto`)이면 따로 할 일이 없습니다. 비교하려면 컴파일 플래그로 바꿉니다.
+
+```bash
+--iree-amdaie-core-rounding-mode=floor   # 이전 동작 (corr 0.979)
+--iree-amdaie-core-rounding-mode=none    # 레지스터를 건드리지 않음
+```
+
+### 검증
+
+- lit: AMD-AIE 테스트 222개 전부 통과(새 `core_rounding_mode.mlir` 포함). 새 테스트 파일은
+  CMake 재구성(`cmake build`)을 해야 테스트 목록에 잡힙니다.
+- 하드웨어 (npu4, [재현 문서](repro_aie2p_bf16_vectorized.md)의 스크립트):
+
+| 확인 | 결과 |
+|---|---|
+| bf16 256×32×64, 기본 / `floor` | corr 0.99996 / 0.99990 (옵션이 실제로 동작) |
+| int8 4096×32×64 | 오차 0, PASS (int8은 영향 없음) |
+| bf16 4096×32×64 (join 레이스) | PASS, 손상 0 |
+| VGG16 첫 conv 레이어 | corr 0.99997 |
+| **VGG16 전체** | **corr 0.99997**, top-1 정답(892), top-5가 순서까지 torch와 같음, 3회 실행 비트 단위 동일 |
+| VGG16 전체 성능 (`real_time_mean`) | 측정 묶음에 따라 2,096 ms(cv 1.7%) ~ 3,105 ms(cv 13.6%) |
+
+성능은 커밋 2와 같은 범위입니다. 같은 빌드에서도 측정할 때마다 2.1 s와 3.1 s처럼 크게 달라서,
+이 커밋이 속도를 바꿨다고 볼 근거는 없습니다.
+
+최지훈 님 쪽 검증(원 커밋 메시지 기준): bf16 벡터화 matmul이 conv_even bfp16 흉내와 난수 입력
+4개 모양에서 비트 단위로 일치, int8 출력 그대로, 회귀 26×2와 VGG16(벡터화 OFF) 출력 그대로.
+
+### 이 커밋 시점의 알려진 문제
+
+- 나중에 AIE2P에 SRS나 bf16 출력 하강이 생기면 그 연산도 conv_even을 따릅니다. int8 양자화처럼
+  연산마다 반올림이 정해져 있어야 하는 경우에는 그 하강이 직접 저장·설정·복원해야 합니다.
+- chess 경로에는 적용되지 않습니다.
 
 ---
 
@@ -611,7 +728,9 @@ VGG16 corr가 0.979로, 벡터화 OFF(1.00000)보다 낮습니다. top-1은 맞�
 
 - **분배(distribute) 쪽 레이스**: memtile 버퍼 1개 → 코어 N개로 나눠 주는 쪽도 같은
   공유 lock 구조라 비슷한 레이스가 있을 수 있습니다. 확인하지 않았습니다.
-- **벡터화 ON 실행 시간의 큰 흔들림(cv 10~18%)**: 원인을 확인하지 않았습니다.
+- **벡터화 ON 실행 시간의 큰 흔들림(cv 2~18%, 같은 빌드에서 2.1~3.7 s)**: 원인을
+  확인하지 않았습니다. 최지훈 님이 런타임이 NPU dispatch마다 하드웨어 컨텍스트를 만들고
+  지우는 비용(dispatch당 약 94 ms)을 찾았고, 이것과 관련 있을 수 있습니다(추정).
 - **AIE2P transpose 지원 범위**: 새로 처리하는 1024비트 전치는 `vector<8x8xbf16>`
   하나입니다. AIE2P 512비트 전치는 AIE2 mode 번호를 그대로 쓰는데, int8 lit 테스트
   외에는 따로 확인하지 않았습니다.
@@ -643,10 +762,18 @@ bfp16으로 바꾸고 → 곱하고 → 결과를 꺼내는" 과정을 컴파일
 빨라지면서 드러났습니다. 코어마다 자기 구역 전용 숫자를 따로 두게 고쳤습니다.
 → 상관계수 0.979, 정답 맞힘.
 
-**3. 결론**
+**3. 남은 오차: 반올림 방향 (커밋 3)**
 
-벡터화하지 않은 경로(69초, 상관계수 1.00000)보다 약 19배 빠른 약 3.5초에 VGG16을
-돌리고, 정답(top-1)도 맞힙니다. 상관계수는 0.979로 아직 1.0보다 낮습니다.
+bfp16으로 바꿀 때 NPU는 기본 설정으로 **항상 내림**을 했습니다. 하나하나는 작은 오차지만
+늘 같은 방향이라 수천 개를 더하는 동안 쌓였습니다. 컴퓨터로 이 "항상 내림"을 흉내 내니 NPU
+결과와 사실상 똑같이 나와서 원인이 이것 하나라는 게 확인됐습니다. 코어가 시작할 때 반올림
+설정을 "가까운 쪽으로"로 바꾸는 명령 하나를 넣었습니다(최지훈 님 커밋).
+→ 상관계수 0.99997, top-5까지 정답과 같고 속도는 그대로입니다.
+
+**4. 결론**
+
+벡터화하지 않은 경로(69초, 상관계수 1.00000)와 거의 같은 정확도로, 약 20배 빠른
+2~3초에 VGG16을 돌립니다.
 
 ## 부록: 정정 이력
 
@@ -657,3 +784,5 @@ bfp16으로 바꾸고 → 곱하고 → 결과를 꺼내는" 과정을 컴파일
   커밋 2의 공유 lock 레이스입니다.
 - "lock 수정 후 2,202 ms(약 31배)" → 다음 날 같은 바이너리가 3,408 ms로 재현되지
   않아 철회했습니다. 벡터화 ON 측정은 흔들림이 커서 여러 묶음으로 확인해야 합니다.
+- "corr 0.979는 bfp16 양자화 오차가 쌓인 것으로 보임(미확인)" → 양자화 자체가 아니라
+  floor 반올림이 원인이었습니다(커밋 3).
