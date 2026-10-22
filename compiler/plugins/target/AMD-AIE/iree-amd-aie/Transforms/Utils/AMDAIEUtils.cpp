@@ -193,6 +193,32 @@ int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr) {
   return attr ? attr->getInt() : 32;
 }
 
+llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy) {
+  switch (policy) {
+    case PoolColumnsPolicy::Odd:
+      return "odd";
+    case PoolColumnsPolicy::Cost:
+      return "cost";
+    case PoolColumnsPolicy::Full:
+      return "full";
+    case PoolColumnsPolicy::Max:
+      return "max";
+  }
+  return "max";
+}
+
+PoolColumnsPolicy getConfigPoolColumnsPolicy(
+    IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<StringAttr> attr =
+      getConfigAttr<StringAttr>(targetAttr, "pool_columns_policy");
+  if (!attr) return PoolColumnsPolicy::Max;
+  llvm::StringRef s = attr->getValue();
+  if (s == "odd") return PoolColumnsPolicy::Odd;
+  if (s == "cost") return PoolColumnsPolicy::Cost;
+  if (s == "full") return PoolColumnsPolicy::Full;
+  return PoolColumnsPolicy::Max;
+}
+
 /// Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles.
 static int64_t gemvL1Bytes(int64_t M, int64_t n1, int64_t kTile,
                            int64_t bytesLhs, int64_t bytesRhs,

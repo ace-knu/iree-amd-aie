@@ -129,6 +129,15 @@ int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
 /// executable target config; absent means 32).
 int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr);
 
+/// The pool column policy (`pool_columns_policy` in the executable target
+/// config, one of "odd" | "cost" | "full" | "max"; absent means `Max`). Read
+/// per dispatch by the Flow pooling pad pass so it pads OH exactly when the
+/// lowering strategy, running with the same policy, will spread the padded OH
+/// over all columns.
+PoolColumnsPolicy getConfigPoolColumnsPolicy(
+    IREE::HAL::ExecutableTargetAttr targetAttr);
+llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy);
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);
 

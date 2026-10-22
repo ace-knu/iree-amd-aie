@@ -93,6 +93,7 @@ iree_lit_test_suite(
     "convert_to_dma_failures.mlir"
     "pad.mlir"
     "pad_contraction_dispatches.mlir"
+    "pad_pooling_dispatches.mlir"
     "peel_for_loop.mlir"
     "propagate_data_layout.mlir"
     "remove_memory_space.mlir"

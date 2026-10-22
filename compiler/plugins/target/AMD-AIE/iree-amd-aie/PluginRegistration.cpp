@@ -74,7 +74,6 @@ struct AMDAIESession
       AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
       poolOptions.channelMultiple = options.getNumRows(deviceModel);
       poolOptions.haloSplitColumns = options.getNumCols(deviceModel);
-      poolOptions.rowMultiple = options.getNumCols(deviceModel);
       poolOptions.columnsPolicy = options.poolColumnsPolicy;
       passManager.addPass(
           AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass(poolOptions));
@@ -96,6 +95,13 @@ struct AMDAIESession
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.
     passManager.addPass(AMDAIE::createAMDAIEPadContractionDispatchesPass());
+    // Likewise pad NPU max pooling dispatches' OH up to what the target's pool
+    // column policy asks for (`full`: a multiple of the column count), so the
+    // pool pipeline can spread OH over every column. Done here, not in the
+    // preprocessing, because the dispatch's init fill is already inside the
+    // dispatch and just grows in place (a fill created before dispatch
+    // formation gets hoisted out as a splat the pool pipeline cannot take).
+    passManager.addPass(AMDAIE::createAMDAIEPadPoolingDispatchesPass());
     // Split large-(K,N) transpose_b NPU matmul dispatches (padded above) into
     // N-chunk sub-dispatches so each weight's L3->L2 shim DMA stays within the
     // shim addressing limits (a single large-N weight DMA degrades and stalls).

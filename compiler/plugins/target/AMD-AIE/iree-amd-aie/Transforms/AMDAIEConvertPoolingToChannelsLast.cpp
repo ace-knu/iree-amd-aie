@@ -44,14 +44,11 @@
 // Costs one host gather dispatch and `(window - stride) / (stride * t)` extra
 // input bytes.
 //
-// With `row-multiple` > 0 and a column policy that asks for more columns than
-// OH divides into (`columns-policy=full`, or `cost` when the model finds the
-// padded shape cheaper), OH is first padded up to a multiple of the column
-// count: the input grows by `stride` rows per extra output row (fill value)
-// and the padded output rows are sliced off the result. The halo split then
-// chunks the padded OH. The policy must be the one the lowering strategy runs
-// with (`pool-columns-policy`), since the root config recomputes the column
-// count from the padded shape with the same rule.
+// Row (OH) padding for the column policy is NOT done here: a fill created
+// before dispatch formation gets hoisted out of the dispatch as a splat the
+// pool pipeline cannot take. It is done at the Flow dispatch boundary by
+// AMDAIEPadPoolingDispatches, which grows the in-dispatch fill in place. The
+// halo split below therefore chunks the unpadded OH with `allowPad = false`.
 
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
@@ -212,100 +209,6 @@ static PoolShape poolShapeOf(linalg::PoolingNhwcMaxOp op) {
       /*bytesOut=*/outType.getElementTypeBitWidth() / 8};
 }
 
-/// Pad an NHWC max pooling's output rows up to the OH the column policy asks
-/// for (`choosePoolColumns` with `allowPad`): the input grows by `stride` rows
-/// per extra output row (fill value), the init is rebuilt at the padded size
-/// and the padded output rows are sliced off the result. Runs before the halo
-/// split (higher benefit) so an overlapping-window pooling is chunked on the
-/// padded OH. Max never mixes rows, so the pad value is irrelevant to the kept
-/// rows.
-struct PoolingNhwcMaxPadRows : OpRewritePattern<linalg::PoolingNhwcMaxOp> {
-  PoolingNhwcMaxPadRows(MLIRContext *ctx, int64_t columns,
-                        PoolColumnsPolicy policy)
-      : OpRewritePattern(ctx, /*benefit=*/2), columns(columns), policy(policy) {}
-
-  LogicalResult matchAndRewrite(linalg::PoolingNhwcMaxOp op,
-                                PatternRewriter &rewriter) const override {
-    if (columns <= 1 || policy == PoolColumnsPolicy::Odd ||
-        policy == PoolColumnsPolicy::Max)
-      return failure();
-    if (!op.hasPureTensorSemantics())
-      return rewriter.notifyMatchFailure(op, "expected tensor semantics");
-    Value input = op.getInputs()[0];
-    Value window = op.getInputs()[1];
-    Value init = op.getOutputs()[0];
-    auto inType = dyn_cast<RankedTensorType>(input.getType());
-    auto outType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
-    auto winType = dyn_cast<RankedTensorType>(window.getType());
-    if (!inType || !outType || !winType || !inType.hasStaticShape() ||
-        !outType.hasStaticShape() || !winType.hasStaticShape() ||
-        inType.getRank() != 4 || winType.getRank() != 2)
-      return rewriter.notifyMatchFailure(op, "expected static 4-D NHWC");
-    if (inType.getDimSize(0) != 1)
-      return rewriter.notifyMatchFailure(op, "expected N == 1");
-    int64_t OH = outType.getDimSize(1);
-    PoolShape shape = poolShapeOf(op);
-    PoolColumns pc =
-        choosePoolColumns(OH, columns, policy, shape, /*allowPad=*/true);
-    if (pc.ohPadded <= OH)
-      return rewriter.notifyMatchFailure(op, "no row padding needed");
-    int64_t padRows = pc.ohPadded - OH;
-    Location loc = op.getLoc();
-    Type elemType = inType.getElementType();
-
-    Value padValue;
-    if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
-      padValue = fill.getInputs()[0];
-    } else {
-      padValue = arith::ConstantOp::create(rewriter, loc,
-                                           rewriter.getZeroAttr(elemType));
-    }
-    auto padDim1 = [&](Value v, int64_t extra) {
-      auto type = cast<RankedTensorType>(v.getType());
-      SmallVector<OpFoldResult> low(4, rewriter.getIndexAttr(0));
-      SmallVector<OpFoldResult> high(4, rewriter.getIndexAttr(0));
-      high[1] = rewriter.getIndexAttr(extra);
-      SmallVector<int64_t> newShape(type.getShape());
-      newShape[1] += extra;
-      return tensor::PadOp::create(
-                 rewriter, loc,
-                 RankedTensorType::get(newShape, type.getElementType()), v,
-                 low, high, padValue)
-          .getResult();
-    };
-    Value inputPadded = padDim1(input, padRows * shape.strideH);
-    auto paddedOutType = RankedTensorType::get(
-        {1, pc.ohPadded, outType.getDimSize(2), outType.getDimSize(3)},
-        elemType);
-    Value initPadded;
-    if (auto fill = init.getDefiningOp<linalg::FillOp>()) {
-      Value empty = tensor::EmptyOp::create(rewriter, loc,
-                                            paddedOutType.getShape(), elemType);
-      initPadded = linalg::FillOp::create(rewriter, loc, fill.getInputs()[0],
-                                          empty)
-                       .getResult(0);
-    } else {
-      initPadded = padDim1(init, padRows);
-    }
-    auto pool = linalg::PoolingNhwcMaxOp::create(
-        rewriter, loc, TypeRange{paddedOutType},
-        ValueRange{inputPadded, window}, initPadded, op.getStrides(),
-        op.getDilations());
-    SmallVector<OpFoldResult> offsets(4, rewriter.getIndexAttr(0));
-    SmallVector<OpFoldResult> strides(4, rewriter.getIndexAttr(1));
-    SmallVector<OpFoldResult> sizes =
-        tensor::getMixedSizes(rewriter, loc, pool.getResult(0));
-    sizes[1] = rewriter.getIndexAttr(OH);
-    rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
-        op, outType, pool.getResult(0), offsets, sizes, strides);
-    return success();
-  }
-
- private:
-  int64_t columns;
-  PoolColumnsPolicy policy;
-};
-
 /// Pre-split an NHWC max pooling with an overlapping window along H into
 /// disjoint-per-chunk batched pooling (see the file comment).
 struct PoolingNhwcMaxHaloSplit : OpRewritePattern<linalg::PoolingNhwcMaxOp> {
@@ -337,8 +240,8 @@ struct PoolingNhwcMaxHaloSplit : OpRewritePattern<linalg::PoolingNhwcMaxOp> {
     if (winH == strideH)
       return rewriter.notifyMatchFailure(op, "windows do not overlap along H");
     int64_t OH = outType.getDimSize(1);
-    // Same rule as the root config; OH is already padded if the policy asked
-    // for it (`PoolingNhwcMaxPadRows` runs first).
+    // Same rule as the root config on the unpadded OH (`allowPad = false`):
+    // the Flow pooling pad pass does not touch a halo pre-split pooling.
     int64_t cols = choosePoolColumns(OH, columns, policy, poolShapeOf(op),
                                      /*allowPad=*/false)
                        .cols;
@@ -418,7 +321,6 @@ class AMDAIEConvertPoolingToChannelsLastPass
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<PoolingNchwMaxToNhwc>(ctx, channelMultiple);
-    patterns.add<PoolingNhwcMaxPadRows>(ctx, rowMultiple, columnsPolicy);
     patterns.add<PoolingNhwcMaxHaloSplit>(ctx, haloSplitColumns, columnsPolicy);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();

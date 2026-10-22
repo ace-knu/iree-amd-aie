@@ -110,6 +110,10 @@ std::unique_ptr<Pass> createAMDAIEConvertPoolingToChannelsLastPass(
 /// keep each weight L3->L2 shim DMA within the shim's addressing limits.
 std::unique_ptr<Pass> createAMDAIESplitLargeContractionDispatchesPass();
 
+/// Create a pass to pad NPU max pooling dispatches' OH at the Flow dispatch
+/// boundary per the target's pool column policy.
+std::unique_ptr<Pass> createAMDAIEPadPoolingDispatchesPass();
+
 /// Create a pass to assign types to `amdaie.connection` ops.
 std::unique_ptr<Pass> createAMDAIEAssignConnectionTypesPass(
     AMDAIEAssignConnectionTypesOptions options = {});

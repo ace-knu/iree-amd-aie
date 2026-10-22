@@ -104,8 +104,6 @@ def AMDAIEConvertPoolingToChannelsLast :
       "Pad the channel dim of the NHWC pooling up to a multiple of this value (the pool pipeline splits C over the array rows, so it is the row count); the padded channels are sliced off the result. 1 disables.">,
     Option<"haloSplitColumns", "halo-split-columns", "int64_t", /*default=*/"0",
       "Array column count. An NHWC max pooling whose window overlaps along H (window != stride) is pre-split on the host into `choosePoolColumns(OH, columns)` row chunks (each with its halo rows duplicated) stacked on a leading dim, so the pool pipeline can spread the chunks over the columns' memtiles. 0 disables.">,
-    Option<"rowMultiple", "row-multiple", "int64_t", /*default=*/"0",
-      "Array column count. When the column policy asks for more columns than OH divides into, OH is padded up to a multiple of this value (the input H grows by stride rows per output row, with the fill value) and the padded output rows are sliced off the result. 0 disables.">,
     Option<"columnsPolicy", "columns-policy",
       "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
       /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max",
@@ -117,6 +115,13 @@ def AMDAIEConvertPoolingToChannelsLast :
         clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max, "max", "OH's largest divisor that fits; never pads.")
       )}]>,
   ];
+}
+
+def AMDAIEPadPoolingDispatches :
+    Pass<"iree-amdaie-pad-pooling-dispatches", "ModuleOp"> {
+  let summary = "Pad an NPU max pooling dispatch's leading spatial output dim (OH) up to what the target's pool column policy asks for (`full`: a multiple of the column count; `cost`: when the model finds the padded shape cheaper), at the Flow dispatch boundary: the input grows by `stride` rows per extra output row on the host (fill value), the in-dispatch init/result/store grow, and the result is cropped back on the host.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEPadPoolingDispatchesPass()";
 }
 
 def AMDAIESplitLargeContractionDispatches :

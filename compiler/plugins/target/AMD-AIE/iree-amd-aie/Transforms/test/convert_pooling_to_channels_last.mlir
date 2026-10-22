@@ -1,6 +1,6 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(func.func(iree-amdaie-convert-pooling-to-channels-last{channel-multiple=4 halo-split-columns=8}))' %s | FileCheck %s
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(func.func(iree-amdaie-convert-pooling-to-channels-last{channel-multiple=4 halo-split-columns=8 columns-policy=cost}))' %s | FileCheck %s --check-prefix=COST
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(func.func(iree-amdaie-convert-pooling-to-channels-last{channel-multiple=4 halo-split-columns=8 row-multiple=8 columns-policy=full}))' %s | FileCheck %s --check-prefix=FULL
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(func.func(iree-amdaie-convert-pooling-to-channels-last{channel-multiple=4 halo-split-columns=8 columns-policy=full}))' %s | FileCheck %s --check-prefix=FULL
 
 // VGG-16 pool1: NCHW 1x64x224x224 -> 1x64x112x112, 2x2 window, stride 2.
 // The input is transposed to NHWC, the -inf fill init is rebuilt in NHWC, the
@@ -148,11 +148,10 @@ func.func @pool_nchw_max_3x3s2_halo(%in: tensor<1x64x114x114xf32>) -> tensor<1x6
 // -----
 
 // OH not a multiple of the column count (VGG-16 pool3: 56x56 -> 28x28, C 8):
-// with `columns-policy=full` and `row-multiple=8` the NHWC input is padded
-// 56 -> 64 rows (4 extra output rows x stride 2, fill value), the init is
-// rebuilt at [1, 32, 28, 8], and the 4 padded output rows are sliced off.
-// Without row padding (the default `max` policy never pads; `cost` finds the
-// padded candidate dearer) nothing changes.
+// the preprocessing never pads OH, under any policy. Row padding for the
+// column policy is done at the Flow dispatch boundary by
+// AMDAIEPadPoolingDispatches (see pad_pooling_dispatches.mlir), where the
+// dispatch's init fill is already inside the dispatch and can grow in place.
 // CHECK-LABEL: func.func @pool_nchw_max_pad_rows
 // CHECK-NOT:     tensor.pad
 // CHECK:         linalg.pooling_nhwc_max {{.*}} outs(%{{.+}} : tensor<1x28x28x8xf32>)
@@ -162,17 +161,9 @@ func.func @pool_nchw_max_3x3s2_halo(%in: tensor<1x64x114x114xf32>) -> tensor<1x6
 // COST:         linalg.pooling_nhwc_max {{.*}} outs(%{{.+}} : tensor<1x28x28x8xf32>)
 // COST-NOT:     tensor.pad
 // FULL-LABEL: func.func @pool_nchw_max_pad_rows
-// FULL-DAG:     %[[NINF:.+]] = arith.constant 0xFF800000 : f32
-// FULL:         %[[IN_T:.+]] = linalg.transpose ins(%{{.+}} : tensor<1x8x56x56xf32>) {{.*}} permutation = [0, 2, 3, 1]
-// FULL:         %[[PAD:.+]] = tensor.pad %[[IN_T]] low[0, 0, 0, 0] high[0, 8, 0, 0]
-// FULL:           tensor.yield %[[NINF]] : f32
-// FULL:         } : tensor<1x56x56x8xf32> to tensor<1x64x56x8xf32>
-// FULL:         %[[INIT_E:.+]] = tensor.empty() : tensor<1x32x28x8xf32>
-// FULL:         %[[INIT:.+]] = linalg.fill ins(%[[NINF]] : f32) outs(%[[INIT_E]] : tensor<1x32x28x8xf32>)
-// FULL:         %[[POOL:.+]] = linalg.pooling_nhwc_max
-// FULL-SAME:      ins(%[[PAD]], %{{.+}} : tensor<1x64x56x8xf32>, tensor<2x2xf32>) outs(%[[INIT]] : tensor<1x32x28x8xf32>)
-// FULL:         %[[SLICE:.+]] = tensor.extract_slice %[[POOL]][0, 0, 0, 0] [1, 28, 28, 8] [1, 1, 1, 1] : tensor<1x32x28x8xf32> to tensor<1x28x28x8xf32>
-// FULL:         linalg.transpose ins(%[[SLICE]] : tensor<1x28x28x8xf32>) {{.*}} permutation = [0, 3, 1, 2]
+// FULL-NOT:     tensor.pad
+// FULL:         linalg.pooling_nhwc_max {{.*}} outs(%{{.+}} : tensor<1x28x28x8xf32>)
+// FULL-NOT:     tensor.pad
 func.func @pool_nchw_max_pad_rows(%in: tensor<1x8x56x56xf32>) -> tensor<1x8x28x28xf32> {
   %cst = arith.constant 0xFF800000 : f32
   %win = tensor.empty() : tensor<2x2xf32>
