@@ -17,6 +17,11 @@ under build/onnx/ref/, its outputs per input set.
 
 Run time: wall time of iree-run-module (module load + execution), the median
 of --runs runs after --warmup runs. Writes result.json next to config.json.
+
+--verbose: one more run with the console-tracing iree-run-module of
+build-trace/, then per-dispatch times (see dispatch_times.py). It fails when
+that tool is missing or older than the main one, so the traced runtime does
+not differ from the main one; scripts/build/build.sh builds both.
 """
 
 import argparse
@@ -31,9 +36,11 @@ import onnx
 from onnx import helper
 
 import compile as compile_
+import dispatch_times
 
 REPO = Path(__file__).resolve().parents[2]
 TOOLS = REPO / "build" / "tools"
+TRACE_BUILD = REPO / "build-trace"
 REF_ROOT = REPO / "build" / "onnx" / "ref"
 
 
@@ -43,6 +50,8 @@ def add_run_args(ap):
                          "default: fixed-seed random inputs")
     ap.add_argument("--runs", type=int, default=3, help="timed runs (default: 3)")
     ap.add_argument("--warmup", type=int, default=1, help="untimed runs before (default: 1)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="also print per-dispatch times from a traced run")
 
 
 def sha(paths, extra=(), n=12):
@@ -75,10 +84,10 @@ def make_inputs(onnx_path, outdir):
     return paths
 
 
-def run_module(vmfb, function, run_flags, inputs, outputs, log):
+def run_module(vmfb, function, run_flags, inputs, outputs, log, tools=TOOLS):
     """Runs `function` of `vmfb`; returns the wall time in seconds."""
     return compile_.run_step(
-        [str(TOOLS / "iree-run-module"), *run_flags, f"--module={vmfb}",
+        [str(tools / "iree-run-module"), *run_flags, f"--module={vmfb}",
          f"--function={function}", *[f"--input=@{p}" for p in inputs],
          *[f"--output=@{p}" for p in outputs]], log)
 
@@ -98,6 +107,27 @@ def reference_outputs(config, mlir, inputs, num_outputs):
         run_module(vmfb, config["function"], reference["run"], inputs, outputs,
                    refdir / "run.log")
     return outputs
+
+
+def check_trace_build():
+    """Exits unless build-trace/ has an iree-run-module built along with the
+    main one. scripts/build/build.sh links the main one first, so a traced
+    one that is older was not rebuilt after a runtime change."""
+    how = "run scripts/build/configure.sh and scripts/build/build.sh"
+    tool, main = TRACE_BUILD / "tools" / "iree-run-module", TOOLS / "iree-run-module"
+    if not tool.is_file():
+        sys.exit(f"--verbose needs {tool}; {how}")
+    if tool.stat().st_mtime < main.stat().st_mtime:
+        sys.exit(f"{tool} is older than {main}; {how}")
+
+
+def trace_run(config, vmfb, inputs, outdir):
+    """Runs once with the traced runtime; returns the per-dispatch report."""
+    check_trace_build()
+    log = outdir / "trace.log"
+    run_module(vmfb, config["function"], config["device"]["run"], inputs, [], log,
+               tools=TRACE_BUILD / "tools")
+    return dispatch_times.format_report(*dispatch_times.parse(log))
 
 
 def compare(got, ref):
@@ -120,9 +150,9 @@ def format_metrics(m):
     return ", ".join(s)
 
 
-def run_model(outdir, inputs, runs, warmup):
+def run_model(outdir, inputs, runs, warmup, verbose=False):
     """Runs and checks the module in `outdir`; returns the result dict written
-    to outdir/result.json."""
+    to outdir/result.json, plus the per-dispatch report when `verbose`."""
     config = json.loads((outdir / "config.json").read_text())
     vmfb, mlir = outdir / "model.vmfb", outdir / "model.mlir"
     num_outputs = len(onnx.load(config["onnx"], load_external_data=False).graph.output)
@@ -146,14 +176,17 @@ def run_model(outdir, inputs, runs, warmup):
         "accuracy": [compare(o, r) for o, r in zip(outputs, refs)],
     }
     (outdir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-    return config, result
+    report = trace_run(config, vmfb, inputs, outdir) if verbose else None
+    return config, result, report
 
 
-def print_summary(config, result, runs):
+def print_summary(config, result, runs, report=None):
     accuracy = " | ".join(format_metrics(m) for m in result["accuracy"])
     print(f"{config['model']}: compile {config['compile_s']:.1f} s"
           f" | run {result['run_s']:.2f} s (median of {runs})"
           f" | {accuracy}")
+    if report:
+        print(report)
 
 
 def main():
@@ -162,8 +195,9 @@ def main():
     ap.add_argument("dir", type=Path, help="compile.py output directory")
     add_run_args(ap)
     args = ap.parse_args()
-    config, result = run_model(args.dir, args.inputs, args.runs, args.warmup)
-    print_summary(config, result, args.runs)
+    config, result, report = run_model(args.dir, args.inputs, args.runs, args.warmup,
+                                       args.verbose)
+    print_summary(config, result, args.runs, report)
 
 
 if __name__ == "__main__":

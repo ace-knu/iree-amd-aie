@@ -24,8 +24,9 @@ def main():
     selected = {name: getattr(args, name) for name in options.user_options()}
     outdir = args.outdir or compile_.default_outdir(args.onnx.stem, selected)
     compile_.compile_model(args.onnx, selected, outdir, args.extra_flags)
-    config, result = run.run_model(outdir, args.inputs, args.runs, args.warmup)
-    run.print_summary(config, result, args.runs)
+    config, result, report = run.run_model(outdir, args.inputs, args.runs, args.warmup,
+                                           args.verbose)
+    run.print_summary(config, result, args.runs, report)
 
 
 if __name__ == "__main__":
