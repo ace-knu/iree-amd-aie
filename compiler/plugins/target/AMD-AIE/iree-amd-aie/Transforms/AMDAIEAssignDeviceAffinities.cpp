@@ -375,7 +375,6 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   }
   // A host device is required; accelerators are optional.
   if (hosts.empty()) return;
-  if (accelerators.empty()) return;
 
   // Placement policy (currently trivial "front"). A performance/config-aware
   // policy would replace this selection (and then also need the two-phase
