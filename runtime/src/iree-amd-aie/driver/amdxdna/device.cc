@@ -119,8 +119,8 @@ static iree_status_t iree_hal_amdxdna_device_initialize_hal_resources(
     iree_hal_amdxdna_device* device) {
   IREE_ASSERT_ARGUMENT(device);
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_allocator_create(
-      device->host_allocator, device->native_device,
-      &device->device_allocator));
+      reinterpret_cast<iree_hal_device_t*>(device), device->host_allocator,
+      device->native_device, &device->device_allocator));
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_async_queue_create(
       &device->block_pool, device->host_allocator, &device->async_queue));
   return iree_ok_status();
@@ -1092,15 +1092,24 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
   std::lock_guard<std::mutex> lock(device->pdi_context_cache->mutex);
   auto it = device->pdi_context_cache->contexts.find(key);
   if (it != device->pdi_context_cache->contexts.end()) {
+    fprintf(stderr, "[T] ctx HIT  '%.*s' t=%.3fms\n",
+            static_cast<int>(kernel_name.size), kernel_name.data,
+            iree_time_now() / 1e6);
+    fflush(stderr);
     *out_context = it->second;
     return iree_ok_status();
   }
+  int64_t t0 = iree_time_now();
   iree_hal_amdxdna_native_context_t* raw_context = nullptr;
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_device_create_context(
       device->native_device,
       iree_make_const_byte_span(key.pdi.data(), key.pdi.size()),
       iree_make_string_view(key.kernel_name.data(), key.kernel_name.size()),
       &raw_context));
+  fprintf(stderr, "[T] ctx MISS '%.*s' create=%.3fms\n",
+          static_cast<int>(kernel_name.size), kernel_name.data,
+          (iree_time_now() - t0) / 1e6);
+  fflush(stderr);
   std::shared_ptr<iree_hal_amdxdna_native_context_t> ctx(
       raw_context, iree_hal_amdxdna_native_context_destroy);
   device->pdi_context_cache->contexts.emplace(std::move(key), ctx);

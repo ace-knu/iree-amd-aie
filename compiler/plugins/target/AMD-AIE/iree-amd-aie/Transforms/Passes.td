@@ -85,6 +85,36 @@ def AMDAIEAssignDeviceAffinities :
   let summary = "Pin each flow.dispatch to a device (contraction/conv -> NPU, else -> CPU) for heterogeneous CPU+NPU execution.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEAssignDeviceAffinitiesPass()";
+  let options = [
+    Option<"respectMarks", "respect-marks", "bool", /*default=*/"false",
+      "Debug: keep device marks instead of overwriting them. A dispatch that "
+      "already has stream.affinity keeps it; otherwise a stream.affinity on a "
+      "linalg op inside its executable (the contraction/conv root first) pins "
+      "the dispatch. Unmarked dispatches are placed as before.">,
+    Option<"placementMap", "placement-map", "std::string", /*default=*/"\"\"",
+      "Experiment: pin dispatches by rules '<selector>=<device>' separated by "
+      "';' (or '@<file>', one rule per line, '#' comments); the first "
+      "matching rule wins and takes precedence over respect-marks and the "
+      "round-robin. Selectors: dN, dN-dM, dA,dB (dispatch number from the "
+      "executable name '_dispatch_N'), ~substr (executable/export name), *. "
+      "Devices: npu, gpu, cpu (first amd-aie / vulkan-spirv / llvm-cpu "
+      "device) or @<device global>. Unmatched dispatches are placed as "
+      "before. Prints the placement to stderr. Empty = off.">
+  ];
+}
+
+def AMDAIEResolveBufferOwner :
+    Pass<"iree-amdaie-resolve-buffer-owner", "ModuleOp"> {
+  let summary = "Resolve #hal.device.optimal allocation affinities to a single owner using stream.topology (all other candidates must have transparent access to the owner).";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEResolveBufferOwnerPass()";
+}
+
+def AMDAIEAnnotateInputDevices :
+    Pass<"iree-amdaie-annotate-input-devices", "ModuleOp"> {
+  let summary = "Record per-argument input device IDs (amdaie.input_devices) in the iree.reflection of public entry points, chosen from the stream.tensor.import affinities with the stream.topology owner rule, so tooling can place inputs without --input_device.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEAnnotateInputDevicesPass()";
 }
 
 def AMDAIEPadContractionDispatches :

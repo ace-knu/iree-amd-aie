@@ -82,7 +82,13 @@ std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 
 /// Create a pass to assign per-dispatch device affinities (contraction/conv ->
 /// NPU, everything else -> CPU) for heterogeneous CPU+NPU execution.
-std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass();
+std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass(
+    AMDAIEAssignDeviceAffinitiesOptions options = {});
+std::unique_ptr<Pass> createAMDAIEResolveBufferOwnerPass();
+
+/// Create a pass that records per-argument input device IDs
+/// (`amdaie.input_devices`) in the reflection of public entry points.
+std::unique_ptr<Pass> createAMDAIEAnnotateInputDevicesPass();
 
 /// Create a pass to pad the operands of NPU contraction dispatches up to the
 /// target's pack-peel tile multiples (so divisibility holds inside the

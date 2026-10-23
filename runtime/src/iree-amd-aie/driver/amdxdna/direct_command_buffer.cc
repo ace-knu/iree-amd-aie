@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Copyright 2024 The IREE Authors
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -343,6 +344,14 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_copy_buffer(
       IREE_HAL_MEMORY_ACCESS_DISCARD_WRITE, target_ref.offset, target_ref.length,
       &target_mapping);
   if (iree_status_is_ok(status)) {
+    {
+      const float* f = (const float*)source_mapping.contents.data;
+      fprintf(stderr, "[BR] amdxdna copy src=%p(+%llu) dst=%p(+%llu) len=%llu first=[%g %g %g %g]\n",
+              (void*)source_ref.buffer, (unsigned long long)source_ref.offset,
+              (void*)target_ref.buffer, (unsigned long long)target_ref.offset,
+              (unsigned long long)target_ref.length, f[0], f[1], f[2], f[3]);
+      fflush(stderr);
+    }
     memcpy(target_mapping.contents.data, source_mapping.contents.data,
            target_ref.length);
     status = iree_hal_buffer_unmap_range(&target_mapping);
@@ -938,6 +947,9 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
     iree_hal_executable_t* base_executable, unsigned entry_point,
     const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
     iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
+  fprintf(stderr, "[T] dispatch enter t=%.3fms\n", iree_time_now() / 1e6);
+  fflush(stderr);
+  fprintf(stderr, "[DBG] amdxdna dispatch recorded\n");
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_hal_amdxdna_direct_command_buffer* command_buffer =
@@ -977,12 +989,24 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
   std::shared_ptr<iree_hal_amdxdna_native_context_t> context;
   iree_hal_amdxdna_native_cu_index_t cu_idx;
   if (num_reconfigurations == 0) {
-    iree_hal_amdxdna_native_context_t* raw_context = nullptr;
-    IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_amdxdna_native_device_create_context(
-                command_buffer->device->native_device, pdi_span, kernel_name,
-                &raw_context));
-    context.reset(raw_context, iree_hal_amdxdna_native_context_destroy);
+    // Reuse a cached hw context keyed on (PDI, kernel) instead of creating and
+    // destroying one per dispatch (CREATE/DESTROY_HWCTX ioctls cost ~40ms each).
+    // Opt-in: kernels are only re-entrant when compiled with
+    // --iree-amdaie-enable-infinite-loop-around-core-block; otherwise a
+    // cached context hangs on the second dispatch of the same kernel.
+    static const bool cache_hwctx = getenv("IREE_AMDXDNA_CACHE_HWCTX") != nullptr;
+    if (cache_hwctx && !kernel_params.pdi.empty()) {
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_amdxdna_device_get_or_create_context(
+                  command_buffer->device, pdi_span, kernel_name, &context));
+    } else {
+      iree_hal_amdxdna_native_context_t* raw_context = nullptr;
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_amdxdna_native_device_create_context(
+                  command_buffer->device->native_device, pdi_span, kernel_name,
+                  &raw_context));
+      context.reset(raw_context, iree_hal_amdxdna_native_context_destroy);
+    }
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_context_open_cu(context.get(), kernel_name,
                                                     &cu_idx));

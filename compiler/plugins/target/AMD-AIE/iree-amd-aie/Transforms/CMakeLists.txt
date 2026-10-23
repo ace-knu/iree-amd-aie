@@ -49,6 +49,8 @@ iree_cc_library(
     "AMDAIEAssignChannels.cpp"
     "AMDAIEAssignConnectionTypes.cpp"
     "AMDAIEAssignDeviceAffinities.cpp"
+    "AMDAIEResolveBufferOwner.cpp"
+    "AMDAIEAnnotateInputDevices.cpp"
     "AMDAIEAssignLogicalObjectFifoDepth.cpp"
     "AMDAIEAssignNpuDmaBdIds.cpp"
     "AMDAIEAssignPacketIds.cpp"
@@ -133,6 +135,7 @@ iree_cc_library(
     iree::compiler::Dialect::TensorExt::IR
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::IR::HALDialect
+    iree::compiler::Dialect::Stream::IR
     iree::compiler::Dialect::Util::IR
     iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::LinalgExt::Transforms

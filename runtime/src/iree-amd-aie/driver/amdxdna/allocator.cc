@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-amd-aie/driver/amdxdna/allocator.h"
+#include <unistd.h>
+#include <cinttypes>
 
 #include <memory>
 
@@ -13,17 +15,43 @@
 
 namespace {
 extern const iree_hal_allocator_vtable_t iree_hal_amdxdna_allocator_vtable;
+static iree_status_t iree_hal_amdxdna_allocator_export_buffer(
+    iree_hal_allocator_t* base_allocator, iree_hal_buffer_t* buffer,
+    iree_hal_external_buffer_type_t requested_type,
+    iree_hal_external_buffer_flags_t requested_flags,
+    iree_hal_external_buffer_t* out_external_buffer) {
+  if (requested_type != IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD) {
+    return iree_make_status(IREE_STATUS_UNAVAILABLE,
+                            "amdxdna only exports OPAQUE_FD");
+  }
+  iree_hal_amdxdna_native_buffer_t* native_buffer =
+      iree_hal_amdxdna_buffer_handle(buffer);
+  int fd = -1;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdxdna_native_buffer_export_fd(native_buffer, &fd));
+  out_external_buffer->type = IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD;
+  out_external_buffer->flags = requested_flags;
+  out_external_buffer->size = iree_hal_buffer_allocation_size(buffer);
+  out_external_buffer->handle.opaque_fd.fd = fd;
+  return iree_ok_status();
+}
 }
 
 struct iree_hal_amdxdna_allocator {
   iree_hal_resource_t resource;
+  // 3DEV: parent device that this allocator is associated with. Unowned.
+  // Recorded as placement.device so other devices can find the owner.
+  iree_hal_device_t* parent_device;
   iree_allocator_t host_allocator;
   iree_hal_amdxdna_native_device_t* native_device;
   IREE_STATISTICS(iree_hal_allocator_statistics_t statistics;)
 
-  iree_hal_amdxdna_allocator(iree_allocator_t host_allocator,
+  iree_hal_amdxdna_allocator(iree_hal_device_t* parent_device,
+                             iree_allocator_t host_allocator,
                              iree_hal_amdxdna_native_device_t* native_device)
-      : host_allocator(host_allocator), native_device(native_device) {
+      : parent_device(parent_device),
+        host_allocator(host_allocator),
+        native_device(native_device) {
     IREE_TRACE_ZONE_BEGIN(z0);
 
     iree_hal_resource_initialize(&iree_hal_amdxdna_allocator_vtable,
@@ -40,7 +68,9 @@ iree_hal_amdxdna_allocator_query_buffer_compatibility(
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_hal_buffer_compatibility_t compatibility =
-      IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE;
+      // Every amdxdna allocation is a DRM BO exportable via PRIME_HANDLE_TO_FD.
+      IREE_HAL_BUFFER_COMPATIBILITY_ALLOCATABLE |
+      IREE_HAL_BUFFER_COMPATIBILITY_EXPORTABLE;
 
   if (iree_any_bit_set(params->usage, IREE_HAL_BUFFER_USAGE_TRANSFER)) {
     compatibility |= IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER;
@@ -80,16 +110,22 @@ iree_hal_amdxdna_allocator_query_buffer_compatibility(
   return compatibility;
 }
 
+    
 static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
     iree_hal_allocator_t* base_allocator,
     const iree_hal_buffer_params_t* params, iree_device_size_t allocation_size,
     iree_hal_buffer_t** out_buffer) {
+  fprintf(stderr, "[T] %s t=%.3fms\n", __func__, iree_time_now() / 1e6); fflush(stderr);
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_hal_amdxdna_allocator* allocator = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
       base_allocator, iree_hal_amdxdna_allocator_vtable,
       iree_hal_amdxdna_allocator);
   iree_hal_buffer_params_t compat_params = *params;
+  fprintf(stderr, "[DBG] amdxdna alloc req_usage=0x%x type=0x%x size=%" PRIu64 "\n",
+          (unsigned)params->usage, (unsigned)params->type,
+          (uint64_t)allocation_size);
+  fflush(stderr);
   iree_hal_buffer_compatibility_t compatibility =
       iree_hal_amdxdna_allocator_query_buffer_compatibility(
           base_allocator, &compat_params, &allocation_size);
@@ -108,7 +144,11 @@ static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
           allocator->native_device, allocation_size,
           iree_hal_amdxdna_native_buffer_type_t::host_only, &native_buffer));
   iree_hal_buffer_t* buffer = nullptr;
+  // 3DEV: record the owning device like other drivers do (Vulkan/HIP). Without
+  // it synchronously allocated BOs (constants, relocated inputs) look like
+  // host heap buffers to other devices and cannot be exported/imported.
   const iree_hal_buffer_placement_t placement = {
+      .device = allocator->parent_device,
       .queue_affinity = params->queue_affinity ? params->queue_affinity
                                                : IREE_HAL_QUEUE_AFFINITY_ANY,
       .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_NONE,
@@ -125,6 +165,21 @@ static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
         &allocator->statistics, compat_params.type, allocation_size));
     native_buffer.release();
     *out_buffer = buffer;
+    if (getenv("IREE_AMDXDNA_TEST_EXPORT")) {
+      iree_hal_external_buffer_t ext;
+      iree_status_t s = iree_hal_amdxdna_allocator_export_buffer(
+          base_allocator, buffer, IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD,
+          IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &ext);
+      if (iree_status_is_ok(s)) {
+        fprintf(stderr, "[DBG] export_fd ok fd=%d size=%" PRIu64 "\n",
+                ext.handle.opaque_fd.fd, (uint64_t)ext.size);
+        close(ext.handle.opaque_fd.fd);
+      } else {
+        fprintf(stderr, "[DBG] export_fd FAILED\n");
+        iree_status_ignore(s);
+      }
+      fflush(stderr);
+    }
   } else {
     iree_hal_buffer_release(buffer);
   }
@@ -149,7 +204,7 @@ static void iree_hal_amdxdna_allocator_deallocate_buffer(
 }
 
 iree_status_t iree_hal_amdxdna_allocator_create(
-    iree_allocator_t host_allocator,
+    iree_hal_device_t* parent_device, iree_allocator_t host_allocator,
     iree_hal_amdxdna_native_device_t* native_device,
     iree_hal_allocator_t** out_allocator) {
   IREE_ASSERT_ARGUMENT(out_allocator);
@@ -159,8 +214,8 @@ iree_status_t iree_hal_amdxdna_allocator_create(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_allocator_malloc(host_allocator, sizeof(*allocator),
                                 reinterpret_cast<void**>(&allocator)));
-  allocator =
-      new (allocator) iree_hal_amdxdna_allocator(host_allocator, native_device);
+  allocator = new (allocator)
+      iree_hal_amdxdna_allocator(parent_device, host_allocator, native_device);
   iree_status_t status = iree_ok_status();
 
   if (iree_status_is_ok(status)) {
@@ -238,7 +293,7 @@ const iree_hal_allocator_vtable_t iree_hal_amdxdna_allocator_vtable = {
     // memcpy host data into it (gives a dispatch-capable buffer at the cost
     // of one copy), or add a kernel userptr path (zero-copy, kernel work).
     .import_buffer = unimplemented,
-    .export_buffer = unimplemented,
+    .export_buffer = iree_hal_amdxdna_allocator_export_buffer,
     // Virtual memory is not supported on XDNA. supports_virtual_memory
     // returns false so callers short-circuit before reaching the rest of
     // the VM vtable; the remaining slots are filled with UNIMPLEMENTED
