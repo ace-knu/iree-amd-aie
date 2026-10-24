@@ -17,8 +17,10 @@
 //
 // Written into the function's `iree.reflection` dictionary:
 //   amdaie.input_devices         = "amdxdna,amdxdna,vulkan"  (device target IDs)
-//   amdaie.input_device_ordinals = "0,0,1"                    (debug only)
-// Per argument: one ID when |Q| == 1, "a|b" (compile order) on ties, "?" when
+//   amdaie.input_device_ordinals = "0,0,1"                    (compile order)
+// The runtime reads only amdaie.input_devices; the ordinals let a vmfb's input
+// placement be checked against the compile order (--iree-hal-target-device
+// indices) without the device IDs. Per argument: one ID when |Q| == 1, "a|b" (compile order) on ties, "?" when
 // no importer qualifies (a warning is emitted; tooling must refuse to guess),
 // and an empty entry when the argument is never imported (scalars etc.).
 // Sync wrappers that only `util.call` an annotated `$async` function receive
