@@ -12,7 +12,7 @@ CLAUDE.md 1-4의 2(구현 명세) 형식의 주제별 명세다. 변경 장부�
 | S3 | Vulkan 남의 버퍼 BRIDGE 공통화 + 명시적 에러 | 런타임 |
 | S4 | Vulkan 영구 매핑 + 디버그 로그 map 분리 | 런타임 |
 | S5 | `AMDAIEAnnotateInputDevices` + 입력 자동 배치 | 신규 Pass + 도구 |
-| S6 | `respect-marks` | 수정 Pass(옵션) |
+| S6 | (삭제) `respect-marks` | dev 통합 때 옵션과 함께 제거(디버그 전용) |
 | S7 | `placement-map` | 수정 Pass(실험 옵션) |
 | S8 | 전임자 `ResolveBufferOwner` + stream hook + 링크 표 | 인수인계 기준선 |
 | S9 | 전임자 런타임 공유 경로 | 인수인계 기준선 |

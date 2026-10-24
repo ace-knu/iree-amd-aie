@@ -115,47 +115,6 @@ static bool executableIsContractionOrConv(IREE::Flow::ExecutableOp exe) {
   return found;
 }
 
-/// Device mark read from an executable for `respect-marks`: a
-/// `stream.affinity = #hal.device.affinity<@dev>` attribute on a linalg op
-/// inside the executable. The contraction/conv root's mark wins; without one,
-/// the first mark in walk order is used. Marks that disagree are reported with
-/// a warning (the chosen mark still applies). Returns failure, after emitting
-/// an error, for a mark that is not a `#hal.device.affinity`; returns a null
-/// attribute when the executable carries no mark.
-static FailureOr<SymbolRefAttr> readExecutableMark(
-    IREE::Flow::ExecutableOp exe) {
-  ModuleOp innerModule = exe.getInnerModule();
-  if (!innerModule) return SymbolRefAttr();
-  SymbolRefAttr rootMark;
-  SmallVector<SymbolRefAttr> marks;
-  bool invalid = false;
-  innerModule.walk([&](linalg::LinalgOp linalgOp) {
-    Attribute attr = linalgOp->getAttr("stream.affinity");
-    if (!attr) return WalkResult::advance();
-    auto affinity = dyn_cast<IREE::HAL::DeviceAffinityAttr>(attr);
-    if (!affinity) {
-      linalgOp->emitError("device mark must be a #hal.device.affinity, got ")
-          << attr;
-      invalid = true;
-      return WalkResult::interrupt();
-    }
-    bool isRoot = linalg::isaContractionOpInterface(linalgOp) ||
-                  (linalg::isaConvolutionOpInterface(linalgOp) &&
-                   hasMultiplyAccumulateBody(linalgOp));
-    if (isRoot && !rootMark) rootMark = affinity.getDevice();
-    marks.push_back(affinity.getDevice());
-    return WalkResult::advance();
-  });
-  if (invalid) return failure();
-  if (marks.empty()) return SymbolRefAttr();
-  SymbolRefAttr chosen = rootMark ? rootMark : marks.front();
-  if (!llvm::all_equal(marks)) {
-    exe.emitWarning("dispatch has conflicting device marks; using ")
-        << chosen << (rootMark ? " (contraction/conv root)" : " (first mark)");
-  }
-  return chosen;
-}
-
 //===----------------------------------------------------------------------===//
 // placement-map (experiment, default empty = off)
 //
@@ -394,20 +353,6 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
     executableIsAccel[exe.getSymName()] = executableIsContractionOrConv(exe);
   unsigned accelIdx = 0;
   DenseSet<Attribute> usedRefs;
-  // respect-marks (debug, default off): only consulted inside the
-  // `if (respectMarks)` block below, so the default path is unchanged.
-  DenseMap<StringRef, IREE::Flow::ExecutableOp> executablesByName;
-  if (respectMarks) {
-    for (auto exe : moduleOp.getOps<IREE::Flow::ExecutableOp>())
-      executablesByName[exe.getSymName()] = exe;
-  }
-  auto isPlacementDevice = [&](SymbolRefAttr ref) {
-    for (const DeviceInfo &d : accelerators)
-      if (Attribute(d.ref) == Attribute(ref)) return true;
-    for (const DeviceInfo &d : hosts)
-      if (Attribute(d.ref) == Attribute(ref)) return true;
-    return false;
-  };
   // placement-map (experiment, default empty): only consulted inside the
   // `if (!placementMap.empty())` blocks below, so the default path is
   // unchanged. Rules pin first; unmatched dispatches fall through.
@@ -425,7 +370,6 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
     if (failed(parsePlacementMap(placementMap, devices, moduleOp, mapRules)))
       return signalPassFailure();
   }
-  bool markFailed = false;
   moduleOp.walk([&](IREE::Flow::DispatchOp dispatchOp) {
     if (!placementMap.empty()) {
       SymbolRefAttr entryPoint = *dispatchOp.getEntryPointRefs().begin();
@@ -451,44 +395,7 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
         dispatchOp->setAttr("stream.affinity", affinityFor(rule.device));
         return;
       }
-      // No rule matched: fall through to respect-marks / the default below.
-    }
-    if (respectMarks) {
-      // (1) An affinity already on the dispatch is kept.
-      if (Attribute existing = dispatchOp->getAttr("stream.affinity")) {
-        if (auto affinity = dyn_cast<IREE::HAL::DeviceAffinityAttr>(existing))
-          usedRefs.insert(affinity.getDevice());
-        return;
-      }
-      // (2) Otherwise a mark inside the (first) entry point's executable pins
-      // the dispatch. Marked dispatches do not advance the round-robin.
-      SymbolRefAttr mark;
-      for (SymbolRefAttr entryPoint : dispatchOp.getEntryPointRefs()) {
-        auto it = executablesByName.find(
-            entryPoint.getRootReference().getValue());
-        if (it == executablesByName.end()) continue;
-        FailureOr<SymbolRefAttr> read = readExecutableMark(it->second);
-        if (failed(read)) {
-          markFailed = true;
-          return;
-        }
-        mark = *read;
-        break;
-      }
-      if (mark) {
-        if (!isPlacementDevice(mark)) {
-          dispatchOp.emitError("device mark ")
-              << mark << " does not name a placement device";
-          markFailed = true;
-          return;
-        }
-        usedRefs.insert(mark);
-        dispatchOp->setAttr("stream.affinity",
-                            IREE::HAL::DeviceAffinityAttr::get(
-                                ctx, mark, /*queue_mask=*/-1ll));
-        return;
-      }
-      // (3) No mark: fall through to the default placement below.
+      // No rule matched: fall through to the default below.
     }
     bool onAccel = false;
     for (SymbolRefAttr entryPoint : dispatchOp.getEntryPointRefs()) {
@@ -503,7 +410,6 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
     usedRefs.insert(target.ref);
     dispatchOp->setAttr("stream.affinity", affinityFor(target.ref));
   });
-  if (markFailed) return signalPassFailure();
 
   if (!placementMap.empty() && !mapEntries.empty()) {
     // A number rule that matched nothing is a typo or is shadowed by an

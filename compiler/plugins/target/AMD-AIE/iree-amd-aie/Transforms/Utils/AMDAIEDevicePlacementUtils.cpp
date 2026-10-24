@@ -21,7 +21,9 @@ StringRef getDeviceBackend(IREE::Util::GlobalOpInterface global) {
 DeviceRole deviceRole(StringRef backend) {
   if (backend == "llvm-cpu") return DeviceRole::Host;
   if (backend == "amd-aie") return DeviceRole::Accelerator;
-  if (backend == "vulkan-spirv") return DeviceRole::Accelerator;  // TEMP: experiment
+  // GPU: takes contraction/conv dispatches like the NPU (round-robin across
+  // accelerators unless a placement-map pins them).
+  if (backend == "vulkan-spirv") return DeviceRole::Accelerator;
   return DeviceRole::Unknown;  // not managed by this plugin
 }
 

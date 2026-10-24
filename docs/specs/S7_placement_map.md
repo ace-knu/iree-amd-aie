@@ -7,15 +7,13 @@
 
 ## 1. 흐름상 위치
 
-S6과 같다(flow hook 첫 패스, 2회차). 2회차 안에서 **가장 먼저** 본다: placement-map → respect-marks → 기본 라운드로빈.
+flow hook 첫 패스(`AMDAIEAssignDeviceAffinities`) 2회차. 2회차 안에서 **가장 먼저** 본다: placement-map → 기본 라운드로빈.
 
 ```mermaid
 flowchart TD
   W["dispatch walk (2회차)"] --> M{"placement-map 규칙 중<br/>처음 맞는 것?"}
   M -- "있음" --> PIN["그 장치로 고정<br/>(amd-aie인데 contraction/conv 아니면 경고)<br/>라운드로빈 순번 안 씀"]
-  M -- "없음" --> RM{"respect-marks 켜짐?"}
-  RM -- "예" --> S6["S6 처리"]
-  RM -- "아니오 / 표식 없음" --> RR["기본: contraction/conv → 가속기 라운드로빈,<br/>나머지 → 첫 host"]
+  M -- "없음" --> RR["기본: contraction/conv → 가속기 라운드로빈,<br/>나머지 → 첫 host"]
   PIN --> END["끝: 안 맞은 번호 규칙 = 에러,<br/>stderr에 요약·dispatch별 배정"]
   RR --> END
 ```
@@ -28,7 +26,7 @@ flowchart TD
 - **동작**:
   1. 파싱하면서 장치를 모듈의 배정 대상 장치에 맞춰 본다. 문법 오류, 모르는 장치, 그 백엔드 장치 없음, 범위가 거꾸로 됨 → 에러.
   2. dispatch마다 번호(N, 없으면 -1)를 구하고 규칙을 앞에서부터 본다. 처음 맞는 규칙의 장치로 고정한다. amd-aie로 고정했는데 executable이 contraction/conv가 아니면 경고(amd-aie가 못 내릴 수 있음).
-  3. 맞는 규칙이 없으면 respect-marks / 기본 배정으로 넘긴다.
+  3. 맞는 규칙이 없으면 기본 배정으로 넘긴다.
   4. walk 뒤: 번호 규칙이 하나도 안 맞았으면(오타 또는 앞 규칙에 가려짐) 에러. dispatch가 없는 실행(1회차에 해당하는 경우)에서는 검사하지 않는다.
   5. stderr에 `[amdaie placement-map] rules=… dispatches=… npu=… gpu=… cpu=… unmatched=…`, 규칙별 맞은 수, dispatch별 `dN  export  rule#k …  @dev (label)`을 찍는다(옵션을 줄 때만).
   6. topology 주입 블록: 맵이 켜졌으면 첫 host가 아닌 host도 사용됐을 때 링크에 넣는다(O09). **아래 3절 주의**.

@@ -10,7 +10,7 @@ Stream 단계의 async 파이프라인(`Dialect/Stream/Transforms/Passes.cpp` `b
 - 1회차 `:257`: `MaterializeCopyOnWrite` 뒤, `EmplaceAllocations` 앞
 - 2회차 `:274`: `RefineUsage`가 lifetime을 확정한 뒤
 
-`stream.topology`는 Flow 단계 배정 패스(`AMDAIEAssignDeviceAffinities`, S6·S7)가 모듈에 주입한 것을 읽는다. 결과(남은 `stream.async.transfer`)는 뒤의 `ScheduleAllocation`이 `optimal<[...]>` 경계 버퍼를 만들 때와 `AMDAIEResolveBufferOwner`(S8)가 소유자를 고를 때의 입력이 된다.
+`stream.topology`는 Flow 단계 배정 패스(`AMDAIEAssignDeviceAffinities`, S7)가 모듈에 주입한 것을 읽는다. 결과(남은 `stream.async.transfer`)는 뒤의 `ScheduleAllocation`이 `optimal<[...]>` 경계 버퍼를 만들 때와 `AMDAIEResolveBufferOwner`(S8)가 소유자를 고를 때의 입력이 된다.
 
 ```mermaid
 flowchart LR
