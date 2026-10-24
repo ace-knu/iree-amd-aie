@@ -37,7 +37,7 @@ static iree_status_t iree_hal_amdxdna_allocator_export_buffer(
 
 struct iree_hal_amdxdna_allocator {
   iree_hal_resource_t resource;
-  // 3DEV: parent device that this allocator is associated with. Unowned.
+  // Parent device that this allocator is associated with. Unowned.
   // Recorded as placement.device so other devices can find the owner.
   iree_hal_device_t* parent_device;
   iree_allocator_t host_allocator;
@@ -136,7 +136,7 @@ static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
           allocator->native_device, allocation_size,
           iree_hal_amdxdna_native_buffer_type_t::host_only, &native_buffer));
   iree_hal_buffer_t* buffer = nullptr;
-  // 3DEV: record the owning device like other drivers do (Vulkan/HIP). Without
+  // Record the owning device like other drivers do (Vulkan/HIP). Without
   // it synchronously allocated BOs (constants, relocated inputs) look like
   // host heap buffers to other devices and cannot be exported/imported.
   const iree_hal_buffer_placement_t placement = {

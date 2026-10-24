@@ -81,7 +81,8 @@ std::unique_ptr<Pass> createAMDAIEAcquireReleaseToUseLockPass();
 std::unique_ptr<Pass> createAMDAIEAssignChannelsPass();
 
 /// Create a pass to assign per-dispatch device affinities (contraction/conv ->
-/// NPU, everything else -> CPU) for heterogeneous CPU+NPU execution.
+/// accelerators round-robin, everything else -> host) for heterogeneous
+/// execution.
 std::unique_ptr<Pass> createAMDAIEAssignDeviceAffinitiesPass(
     AMDAIEAssignDeviceAffinitiesOptions options = {});
 std::unique_ptr<Pass> createAMDAIEResolveBufferOwnerPass();

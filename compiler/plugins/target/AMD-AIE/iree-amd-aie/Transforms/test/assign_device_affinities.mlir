@@ -64,9 +64,9 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 
 // -----
 
-// Multiple accelerators: the front policy uses only the first accelerator
-// (@npu0), so the matmul is pinned to @npu0 and the topology meshes just
-// @npu0 <-> @cpu -- the extra accelerator @npu1 is not referenced (DCE'd).
+// Multiple accelerators: the single matmul takes the first round-robin slot
+// (@npu0), and the topology meshes just the used devices @npu0 <-> @cpu --
+// the unused accelerator @npu1 is not referenced (DCE'd).
 
 // CHECK: module attributes {
 // CHECK-SAME: stream.topology = #hal.device.topology<links = [(@npu0 -> @cpu = {}), (@cpu -> @npu0 = {transparent_access = true})]>

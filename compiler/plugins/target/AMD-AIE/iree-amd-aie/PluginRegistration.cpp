@@ -66,7 +66,8 @@ struct AMDAIESession
     // (an unused CPU device global would otherwise be DCE'd before the Flow
     // phase). The topology's symbol references keep the CPU device global
     // alive through SymbolDCE. No dispatches exist yet, so no affinity is set
-    // here. No-op unless both an amd-aie and an llvm-cpu device are declared.
+    // here. Requires a host device; the topology is injected only when two or
+    // more devices are used.
     passManager.addPass(AMDAIE::createAMDAIEAssignDeviceAffinitiesPass());
   }
 
@@ -81,9 +82,9 @@ struct AMDAIESession
   }
 
   void extendFlowTransformPassPipeline(OpPassManager &passManager) override {
-    // Heterogeneous placement: pin contraction/conv dispatches to the amd-aie
-    // (NPU) device and everything else (transposes, casts) to the CPU device.
-    // No-op unless both an amd-aie and an llvm-cpu device are declared.
+    // Heterogeneous placement: pin contraction/conv dispatches to the
+    // accelerators (round-robin) and everything else (transposes, casts) to the
+    // host. Requires a host device.
     // --iree-amdaie-placement-map (experiment, default empty) pins dispatches
     // by number/name rules.
     AMDAIE::AMDAIEAssignDeviceAffinitiesOptions placementOptions;

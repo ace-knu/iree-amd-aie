@@ -6,8 +6,8 @@
 
 // Heterogeneous accelerator + host device placement.
 //
-// This pass offloads the ops amd-aie can codegen (contraction/convolution) to
-// an accelerator device and runs everything else (layout transposes, f32->bf16
+// This pass offloads contraction/convolution ops to accelerator devices
+// (amd-aie, vulkan-spirv) and runs everything else (layout transposes, f32->bf16
 // casts introduced by demotion, other elementwise leftovers) on a host device.
 // Devices are declared via `--iree-hal-target-device` (util.global with a
 // DeviceTargetAttr); a single device-capability table, in
@@ -22,8 +22,9 @@
 // module attribute over the devices it places work on (unless one is already
 // provided) so cross-device buffers can be resolved.
 //
-// Requires at least one host device (accelerators are optional). Choosing among
-// multiple same-role devices currently uses the first one (see policy TODO).
+// Requires at least one host device (accelerators are optional).
+// Contraction/conv dispatches go round-robin across the accelerators in
+// declaration order; everything else goes to the first host (see policy TODO).
 
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
@@ -335,9 +336,8 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   // A host device is required; accelerators are optional.
   if (hosts.empty()) return;
 
-  // Placement policy (currently trivial "front"). A performance/config-aware
-  // policy would replace this selection (and then also need the two-phase
-  // topology keep-alive noted below).
+  // Placement policy: round-robin over the accelerators, first host for the
+  // rest. A performance/config-aware policy would replace this selection.
   // TODO: choose among multiple accelerators/hosts by device performance/config.
   DeviceInfo hostTarget = hosts.front();
 
@@ -474,9 +474,6 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   // Inject the device topology over the devices we place work on so cross-device
   // boundary buffers resolve (ResolveTopologyQueries). Respect a user-provided
   // topology if present. Link flags come from the capability table.
-  // NOTE: the "used" set is derivable here (before dispatches) only because the
-  // front policy is dispatch-independent; a per-dispatch policy would instead
-  // keep all candidates alive at preprocessing and narrow at the Flow call.
   if (!moduleOp->hasAttr("stream.topology")) {
     SmallVector<DeviceInfo> used;
     // This pass runs twice. The first run happens before any flow.dispatch

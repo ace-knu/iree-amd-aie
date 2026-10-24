@@ -43,7 +43,7 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
   //  - ElideAsyncCopies asks hasTransparentAccess(source, result) before
   //    dropping a transfer, so flipping a row to true can remove a copy that
   //    was previously kept. Treat every change here as a behavior change and
-  //    re-run the boundary tests (chain2, mlp_reduce, cpu_gpu_reduce).
+  //    re-run tests/regression.
   //
   // Unlisted pairs fall through to the conservative default at the bottom.
 
@@ -63,7 +63,7 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
   //  - llvm-cpu -> vulkan-spirv is true. Vulkan dispatch allocations are
   //    selected as DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT on this platform,
   //    so a CPU dispatch host-maps them directly.
-  //    Verified: cpu_gpu_reduce, GPU owner (lead=1) -> 1.
+  //    Covered by regression cg_topo_lead0/lead1.
   //    NOTE: on a discrete GPU whose dispatch memory is not host-visible this
   //    row must be false.
   if (srcBackend == "llvm-cpu" && dstBackend == "vulkan-spirv")
@@ -83,13 +83,13 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
   //  - vulkan-spirv -> amd-aie is true. The amdxdna allocator exports a BO as
   //    a dma-buf fd (OPAQUE_FD), and the Vulkan allocator imports it as
   //    VkDeviceMemory; the dispatch binding bridge does this automatically.
-  //    Verified: chain2 -> 32768, "import binding ok fd=N".
+  //    Covered by regression chain2_3dev.
   if (srcBackend == "vulkan-spirv" && dstBackend == "amd-aie")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
   //  - amd-aie -> vulkan-spirv is false. amdxdna has no `import_buffer`, and
   //    the Vulkan allocator cannot export, so the NPU cannot bind a
   //    GPU-allocated buffer. A buffer shared by the two must be NPU-owned.
-  //    Verified: setting this false still compiles and runs (chain2 -> 32768).
+  //    Covered by regression chain2_3dev.
   if (srcBackend == "amd-aie" && dstBackend == "vulkan-spirv")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/false};
 
