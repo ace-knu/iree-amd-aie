@@ -3,7 +3,9 @@
 DEVICES holds, per device, the `compile` flags (iree-compile) that declare it
 and the `run` flags (iree-run-module) that open it; `{symbol}` is filled with
 the device symbol (the name with '-' as '_'). A model is placed on the devices
-picked with --devices, in that order: the first is the default (lead) device.
+picked with --devices, in that order. The CPU (local-host) comes first: it
+runs the host code and is the default (lead) device; the accelerators after it
+take contraction/conv dispatches round-robin in the listed order.
 Every OPTIONS group holds either fixed `flags` (always passed) or user options,
 each a map of choice -> flags. To add, remove or change a device or an option,
 edit this file only. A flag that only works around a current gap is marked with
@@ -51,7 +53,7 @@ DEVICES = {
 
 # Devices of a model by default, and of its accuracy reference (which uses the
 # same options otherwise, with numeric f32).
-DEFAULT_DEVICES = ["amdxdna-npu4", "local-host"]
+DEFAULT_DEVICES = ["local-host", "amdxdna-npu4"]
 REFERENCE_DEVICES = ["local-host"]
 
 OPTIONS = {
@@ -121,6 +123,9 @@ def user_options():
 
 def check(selected, devices):
     """Returns an error message for an unsupported combination, else None."""
+    if devices[0] != "local-host":
+        return ("local-host must be the first device: the CPU runs the host "
+                "code and is the lead device")
     # workaround: bf16 contractions fail to compile for the GPU; use f32.
     if selected.get("numeric") == "bf16" and any(d.startswith("vulkan-") for d in devices):
         return "--numeric bf16 is not supported with a vulkan device; use f32"

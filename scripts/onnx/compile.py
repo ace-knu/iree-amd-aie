@@ -46,8 +46,8 @@ def add_compile_args(ap):
     """Adds --devices, one --<option> argument per user option in options.py,
     plus --extra-flag and --outdir."""
     ap.add_argument("--devices", type=device_list, default=options.DEFAULT_DEVICES,
-                    help="comma-separated devices from options.py, the first is "
-                         "the default (lead) device; default: "
+                    help="comma-separated devices from options.py, local-host "
+                         "(the lead device) first; default: "
                          + ",".join(options.DEFAULT_DEVICES))
     for name, choices in options.user_options().items():
         ap.add_argument(f"--{name}", choices=choices,

@@ -72,4 +72,4 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 �
 | v7 | 2026-09-29, `docs/2026-09-29/1_구조전환_offset회귀_input_device준비/03_BRIDGE_subspan_offset_회귀케이스` | 25 | BRIDGE subspan offset 케이스 2개(cpu2export lead=vulkan / lead=local-task) 편입 |
 | v8 | 2026-09-29, `docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현` | 26 | `REG_INPUT_DEVICE=auto` 모드, `placed` 지표 열, npu2out 편입, 2장치 4케이스의 수동 `--input_device`를 lead 인덱스로 명시(자동 배치가 기본이 되어서) |
 | v8 (기본 모드) | 2026-09-29, 같은 챕터 | 26 | 기본 실행을 수동+자동 둘 다로 변경(`REG_INPUT_DEVICE=both`), 한쪽만은 `manual`/`auto` |
-| v9 | 2026-10-25, dev 통합(3devices-integration) | 26 | `tests/regression/`으로 이전. 런타임 디버그 로그 제거에 맞춰 판정을 rc + 기대값으로 줄이고 `alloc_select`·지표 열과 stream 단계 별도 컴파일을 뺌. 기본 `IREE_BUILD=/workspace/build`, 산출물은 `build/regression/` |
+| v9 | 2026-10-25, dev 통합(3devices-integration) | 26 | `tests/regression/`으로 이전. 런타임 디버그 로그 제거에 맞춰 판정을 rc + 기대값으로 줄이고 `alloc_select`·지표 열과 stream 단계 별도 컴파일을 뺌. 기본 `IREE_BUILD=/workspace/build`, 산출물은 `build/regression/`. `--iree-amdaie-stack-size=2048`을 뺌(기본 1024로 26/26), `--iree-hal-external-resources-mappable`은 vulkan이 있을 때만(lead가 CPU가 아닌 케이스에 필요) |
