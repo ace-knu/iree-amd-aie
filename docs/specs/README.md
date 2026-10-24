@@ -16,4 +16,4 @@ CLAUDE.md 1-4의 2(구현 명세) 형식의 주제별 명세다. 변경 장부�
 | S7 | `placement-map` | 수정 Pass(실험 옵션) |
 | S8 | 전임자 `ResolveBufferOwner` + stream hook + 링크 표 | 인수인계 기준선 |
 | S9 | 전임자 런타임 공유 경로 | 인수인계 기준선 |
-| S10 | ukernel bf16 반올림 | **커밋 보류**(백엔드 담당과 상의) |
+| S10 | (삭제) ukernel bf16 반올림 | dev에 반영됨(`cff1e56e`, 반올림 모드 저장·복원 포함) |
