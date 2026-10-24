@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #   at /workspace. The container only builds/runs.
 # ============================================================
 FROM base-deps AS dev
+# GPU (Vulkan) runtime: loader + Mesa RADV; vulkan-tools for `vulkaninfo` checks.
+# Build needs nothing extra (IREE vendors the Vulkan headers).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libvulkan1 mesa-vulkan-drivers vulkan-tools \
+    && rm -rf /var/lib/apt/lists/*
 # Model-import deps so dev can also exercise the full ONNX/PyTorch -> NPU flow
 # (superset of the deploy image). Kept in a venv (PEP 668) at /opt/venv; the build
 # itself still uses the system python3, so validated build behavior is unchanged.
@@ -76,6 +81,7 @@ RUN cd /src/iree-amd-aie && cmake -B /build -S third_party/iree -G Ninja \
       -DIREE_INPUT_TORCH=ON -DIREE_INPUT_STABLEHLO=ON -DIREE_INPUT_TOSA=ON \
       -DIREE_HAL_DRIVER_DEFAULTS=OFF -DIREE_TARGET_BACKEND_DEFAULTS=OFF \
       -DIREE_TARGET_BACKEND_LLVM_CPU=ON -DIREE_EXTERNAL_HAL_DRIVERS=amdxdna \
+      -DIREE_HAL_DRIVER_VULKAN=ON -DIREE_TARGET_BACKEND_VULKAN_SPIRV=ON \
       -DIREE_BUILD_TESTS=OFF \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
@@ -91,8 +97,9 @@ RUN cd /src/iree-amd-aie && cmake -B /build -S third_party/iree -G Ninja \
 FROM ${UBUNTU_BASE} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 # python3 for the importers; venv avoids PEP 668. libstdc++6 for the native tools/.so.
+# libvulkan1 + mesa-vulkan-drivers: Vulkan loader and Mesa RADV for the GPU.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libstdc++6 python3 python3-venv \
+      libstdc++6 python3 python3-venv libvulkan1 mesa-vulkan-drivers \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 

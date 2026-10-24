@@ -31,3 +31,8 @@ npu_device() { ls /dev/accel/ 2>/dev/null | head -1; }
 # container user open a 0660 root:render node without host-side group changes
 # (docker --user drops supplementary groups). Arg defaults to npu_device().
 device_gid() { local n="${1:-$(npu_device)}"; [ -n "$n" ] && stat -c '%g' "/dev/accel/$n"; }
+
+# First GPU render node path (e.g. /dev/dri/renderD128); empty if none present.
+gpu_device() { ls /dev/dri/renderD* 2>/dev/null | head -1; }
+# Owning-group gid of the GPU render node (see device_gid).
+gpu_gid() { local n="${1:-$(gpu_device)}"; [ -n "$n" ] && stat -c '%g' "$n"; }

@@ -26,6 +26,13 @@ if [ -n "$npu" ]; then
   # Unlock it so full-resolution models (e.g. VGG at 224x224) can run.
   args+=(--ulimit memlock=-1)
 fi
+gpu="$(gpu_device)"
+if [ -n "$gpu" ]; then
+  # GPU (Vulkan): render node plus its owning group, as for the NPU above
+  args+=(--device="$gpu")
+  gid="$(gpu_gid "$gpu")"
+  [ -n "$gid" ] && args+=(--group-add "$gid")
+fi
 args+=(-v "$root:/workspace" -w /workspace -e HOME=/workspace -e PEANO_INSTALL_DIR=/workspace/llvm-aie)
 
 exec docker run "${args[@]}" "$IMAGE_DEV" bash -lc '
