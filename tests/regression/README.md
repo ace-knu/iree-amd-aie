@@ -17,14 +17,14 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 �
 ```
 - 케이스 이름 필터: 마지막에 정규식 인자를 준다. 예: `run_regression.sh '^fanout3'`
 - 환경 변수: `REG_OUT`(산출물 폴더 전체 경로), `REG_TIMEOUT`(케이스별 제한 시간, 기본 600초), `REG_EXTRA_CASES`(`run_case` 줄만 담은 실험용 bash 파일을 source), `IREE_BUILD`(기본 `/workspace/build`), `REG_ROOT`(산출물 상위 폴더, 기본 `$IREE_BUILD/regression`), `MODEL_DIR`(기본 이 폴더의 `models/`)
-- 결과: `$REG_OUT/summary.txt`. 26케이스 기준 약 2~12분 걸린다(컴파일 캐시 없음, NPU 코드젠 시간에 따라 다름).
-- **입력 배치 모드** (v8~): **기본은 두 모드를 차례로 모두 돌린다**(`REG_INPUT_DEVICE=both`). 결과는 `$REG_OUT/manual/`, `$REG_OUT/auto/`에 남고, 합친 요약은 `$REG_OUT/summary.txt`의 마지막 줄 `BOTH: manual PASS=… / auto PASS=…`이다. 한쪽만 돌리려면 `REG_INPUT_DEVICE=manual` 또는 `auto`를 준다. `manual`은 케이스에 적힌 `--input_device`를 붙이고, `auto`는 `--input_device`를 빼고 실행한다. 그러면 `iree-run-module`이 컴파일러의 reflection `amdaie.input_devices`로 배치한다(`docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현`). 두 모드 모두 26/26이 기준이다.
+- 결과: `$REG_OUT/summary.txt`. 27케이스 기준 약 2~12분 걸린다(컴파일 캐시 없음, NPU 코드젠 시간에 따라 다름).
+- **입력 배치 모드** (v8~): **기본은 두 모드를 차례로 모두 돌린다**(`REG_INPUT_DEVICE=both`). 결과는 `$REG_OUT/manual/`, `$REG_OUT/auto/`에 남고, 합친 요약은 `$REG_OUT/summary.txt`의 마지막 줄 `BOTH: manual PASS=… / auto PASS=…`이다. 한쪽만 돌리려면 `REG_INPUT_DEVICE=manual` 또는 `auto`를 준다. `manual`은 케이스에 적힌 `--input_device`를 붙이고, `auto`는 `--input_device`를 빼고 실행한다. 그러면 `iree-run-module`이 컴파일러의 reflection `amdaie.input_devices`로 배치한다(`docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현`). 두 모드 모두 27/27이 기준이다.
   - 한쪽만: `./scripts/docker/run-dev.sh env REG_INPUT_DEVICE=manual bash tests/regression/run_regression.sh`(또는 `auto`).
   - `--input_device`가 없으면 `iree-run-module`은 **reflection 자동 배치가 기본**이다. 그래서 수동 모드에서 입력을 lead에 두려는 케이스는 lead 인덱스를 명시한다(2장치 4케이스).
 
 **판정 (PASS 조건)**: 컴파일 rc 0 **그리고** 실행 rc 0 **그리고** 첫 원소가 기대값과 상대 오차 1e-3 이내. v8까지 있던 `alloc_select` 후보 조건과 지표 열(`cmd.copy`, `xdna_copy`, `placed`)은 런타임 디버그 로그에 기대던 것이라 로그를 지우면서 v9에서 뺐다.
 
-## 케이스 목록 (v9, 26케이스)
+## 케이스 목록 (v9, 27케이스)
 약어: 순서 a=amdxdna, v=vulkan, l=local(실행 시 local-task). 입력은 전부 `128x128xf32`. `--input_device`와 lead(`--device_lead_allocator`)는 스크립트에 적힌 값이다.
 
 | # | 케이스 | 모델 | 컴파일 순서 | `--input_device` | lead | 기대값 | 무엇을 검증하는가 | 편입 |
@@ -55,6 +55,7 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 �
 | 24 | c2e_avl_lead1 | cpu2export.mlir | a,v,l | 0,2,2 | 1 | 4 | CPU 출력 2개가 한 외부 할당에 packing되어 subview로 export됨. lead=vulkan 전송에서 **byte_offset=65536 BRIDGE import** (subspan offset 재계산 검증) | v7 (09-29/1/03) |
 | 25 | c2e_avl_lead2 | cpu2export.mlir | a,v,l | 0,2,2 | 2 | 4 | 같은 모델, lead=local-task 대조군(BRIDGE 안 탐) | v7 |
 | 26 | n2o_avl | npu2out.mlir | a,v,l | 0,0,0 | - | 4194304 | 한 입력을 여러 장치가 import(arg0 → {NPU, GPU}, arg2 → {GPU, NPU}). 입력은 모든 importer가 읽을 수 있는 NPU에 있어야 함. 자동 모드는 reflection `amdxdna,amdxdna,amdxdna` | v8 (09-29/2/02) |
+| 27 | fc_matvec_lv | fc_matvec.mlir | l,v | 1,1 | - | 4096 | GPU FC(M=1 matvec) = SPIR-V SubgroupReduce. 컴파일러가 고른 subgroup 크기가 pipeline에 전달되지 않으면 2배(8192) | v9 |
 
 기대값 계산: 입력 1(또는 명시된 2), 128×128 matmul이면 원소 = 128 × 값. 예: chain2 = (1·1·128)·2·128 = 32768, softmax(균등) = 1/128. 모델별 근거는 `docs/2026-09-28/02`, `05` README에 있다.
 스크립트는 **첫 출력 텐서의 첫 원소만** 비교한다. fanout3 계열의 두 번째 출력(s = 0.0078125), cpu2export의 두 번째·세 번째 출력(0.0078125, 128)은 챕터별로 손으로 확인했다. cpu2export 기대값: z=2 → s2 = z·z = 4 (offset을 잃으면 s1 = 1/128을 읽음).
@@ -72,4 +73,4 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 �
 | v7 | 2026-09-29, `docs/2026-09-29/1_구조전환_offset회귀_input_device준비/03_BRIDGE_subspan_offset_회귀케이스` | 25 | BRIDGE subspan offset 케이스 2개(cpu2export lead=vulkan / lead=local-task) 편입 |
 | v8 | 2026-09-29, `docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현` | 26 | `REG_INPUT_DEVICE=auto` 모드, `placed` 지표 열, npu2out 편입, 2장치 4케이스의 수동 `--input_device`를 lead 인덱스로 명시(자동 배치가 기본이 되어서) |
 | v8 (기본 모드) | 2026-09-29, 같은 챕터 | 26 | 기본 실행을 수동+자동 둘 다로 변경(`REG_INPUT_DEVICE=both`), 한쪽만은 `manual`/`auto` |
-| v9 | 2026-10-25, dev 통합(3devices-integration) | 26 | `tests/regression/`으로 이전. 런타임 디버그 로그 제거에 맞춰 판정을 rc + 기대값으로 줄이고 `alloc_select`·지표 열과 stream 단계 별도 컴파일을 뺌. 기본 `IREE_BUILD=/workspace/build`, 산출물은 `build/regression/`. `--iree-amdaie-stack-size=2048`을 뺌(기본 1024로 26/26), `--iree-hal-external-resources-mappable=true`를 뺌(CPU↔GPU 링크 표 수정 + Vulkan mapping usage 수정 뒤 어느 lead든 26/26) |
+| v9 | 2026-10-25, dev 통합(3devices-integration) | 27 | `tests/regression/`으로 이전. 런타임 디버그 로그 제거에 맞춰 판정을 rc + 기대값으로 줄이고 `alloc_select`·지표 열과 stream 단계 별도 컴파일을 뺌. 기본 `IREE_BUILD=/workspace/build`, 산출물은 `build/regression/`. `--iree-amdaie-stack-size=2048`을 뺌(기본 1024로 26/26), `--iree-hal-external-resources-mappable=true`를 뺌(CPU↔GPU 링크 표 수정 + Vulkan mapping usage 수정 뒤 어느 lead든 26/26). GPU FC 케이스 `fc_matvec_lv` 편입 |

@@ -219,6 +219,10 @@ run_case c2e_avl_lead2        c2e_avl              cpu2export.mlir       $T3    
 # m0 = x@y(NPU), m1 = x@z(GPU), m2 = y@z(NPU), r = m0@m2(GPU). x=1,y=1,z=2 -> r = 4194304
 run_case n2o_avl              n2o_avl              npu2out.mlir          $T3                  $R3                        npu2out     4194304 0,0,0 - "$X=1" "$X=1" "$X=2"
 
+# GPU FC(M=1 matvec): SPIR-V SubgroupReduce 경로. 컴파일러가 고른 subgroup 크기가 pipeline 에
+# 전달되지 않으면 드라이버 기본값(gfx1150 = 64)으로 돌아 정확히 2배(8192)가 나온다. CPU+GPU, 기대값 K = 4096
+run_case fc_matvec_lv         fc_matvec            fc_matvec.mlir        $T2                  $R2                        fc          4096  1,1 - "1x4096xf32=1" "4096x1000xf32=1"
+
 # 추가 케이스 파일(실험용). run_case 줄만 담은 bash 파일을 source 한다.
 if [[ -n ${REG_EXTRA_CASES:-} ]]; then
   # shellcheck disable=SC1090
