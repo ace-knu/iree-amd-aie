@@ -1,6 +1,6 @@
-# 3-device 회귀 테스트 (docs/regression)
+# 3-device 회귀 테스트 (tests/regression)
 
-CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 테스트다. 이 폴더는 날짜와 상관없는 고정 위치이고, 스크립트와 모델은 여기서만 관리한다(v6부터). v1~v6의 이전 사본은 `docs/2026-09-28/02_회귀테스트_기준선_재현/`에 있고, 더 이상 갱신하지 않는다.
+CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 테스트다. 스크립트와 모델은 여기서만 관리한다(v9부터 `tests/regression/`, v6~v8은 `docs/regression/`). 3장치 관련 변경(배치, 버퍼 소유, BRIDGE, HAL 드라이버)이 있을 때 ctest와 MLP/VGG e2e에 더해 돌린다.
 
 ## 구성
 | 파일 | 내용 |
@@ -11,24 +11,20 @@ CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 �
 | `input_device_expected.md` | 케이스별 `--input_device` 기대값 표 (`--input_device` 자동화의 비교 기준. `docs/2026-09-29/1_…/04_…`에서 작성) |
 
 ## 실행 방법
-컨테이너 한 줄 명령 (산출물은 저장소 밖 `/tmp/iree-regression/`에 쓴다):
+호스트에서 dev 컨테이너로 실행한다(NPU, GPU 전달은 `run-dev.sh`가 한다). 산출물은 `build/regression/regression_YYYYMMDD_HHMM/`에 쓴다:
 ```bash
-mkdir -p /tmp/iree-regression && docker run --rm --device=/dev/accel/accel0 --device=/dev/dri/renderD128 --group-add 992 \
-  -v /home/mkchoi/Projects/iree-amd-aie:/workspace -v /tmp/iree-regression:/tmp/iree-regression \
-  -w /workspace --user 1004:1004 -e HOME=/workspace/.home-gpu -e REG_ROOT=/tmp/iree-regression \
-  iree-aie-gpu:dev bash -lc "bash /workspace/docs/regression/run_regression.sh"
+./scripts/docker/run-dev.sh bash tests/regression/run_regression.sh
 ```
 - 케이스 이름 필터: 마지막에 정규식 인자를 준다. 예: `run_regression.sh '^fanout3'`
-- 환경 변수: `REG_OUT`(산출물 폴더 전체 경로), `REG_TIMEOUT`(케이스별 제한 시간, 기본 600초), `REG_EXTRA_CASES`(`run_case` 줄만 담은 실험용 bash 파일을 source), `IREE_BUILD`(기본 `/workspace/build-gpu`), `MODEL_DIR`(기본 이 폴더의 `models/`)
+- 환경 변수: `REG_OUT`(산출물 폴더 전체 경로), `REG_TIMEOUT`(케이스별 제한 시간, 기본 600초), `REG_EXTRA_CASES`(`run_case` 줄만 담은 실험용 bash 파일을 source), `IREE_BUILD`(기본 `/workspace/build`), `REG_ROOT`(산출물 상위 폴더, 기본 `$IREE_BUILD/regression`), `MODEL_DIR`(기본 이 폴더의 `models/`)
 - 결과: `$REG_OUT/summary.txt`. 26케이스 기준 약 2~12분 걸린다(컴파일 캐시 없음, NPU 코드젠 시간에 따라 다름).
 - **입력 배치 모드** (v8~): **기본은 두 모드를 차례로 모두 돌린다**(`REG_INPUT_DEVICE=both`). 결과는 `$REG_OUT/manual/`, `$REG_OUT/auto/`에 남고, 합친 요약은 `$REG_OUT/summary.txt`의 마지막 줄 `BOTH: manual PASS=… / auto PASS=…`이다. 한쪽만 돌리려면 `REG_INPUT_DEVICE=manual` 또는 `auto`를 준다. `manual`은 케이스에 적힌 `--input_device`를 붙이고, `auto`는 `--input_device`를 빼고 실행한다. 그러면 `iree-run-module`이 컴파일러의 reflection `amdaie.input_devices`로 배치한다(`docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현`). 두 모드 모두 26/26이 기준이다.
-  - 한쪽만: 위 명령에 `-e REG_INPUT_DEVICE=manual`(또는 `auto`)을 더한다.
+  - 한쪽만: `./scripts/docker/run-dev.sh env REG_INPUT_DEVICE=manual bash tests/regression/run_regression.sh`(또는 `auto`).
   - `--input_device`가 없으면 `iree-run-module`은 **reflection 자동 배치가 기본**이다. 그래서 수동 모드에서 입력을 lead에 두려는 케이스는 lead 인덱스를 명시한다(2장치 4케이스).
 
-**판정 (PASS 조건)**: 실행 rc 0 **그리고** 첫 원소가 기대값과 상대 오차 1e-3 이내 **그리고** 런타임 폴백 `alloc_select` 후보에 amdxdna가 없음. 마지막 조건은 NPU가 끼는 경계가 컴파일 시점에 확정됐는지 보는 것이다.
-**지표 열 (판정에 안 씀)**: `cmd.copy` = `--compile-to=stream` 결과의 `stream.cmd.copy` 개수, `xdna_copy` = stderr의 `[BR] amdxdna copy` 줄 수(툴링 출력 전송 포함), `placed`(v8~) = 입력 재배치 결과(i번째 칸 = 옮긴 장치 인덱스(`--device` 순서), `L` = lead에 둠).
+**판정 (PASS 조건)**: 컴파일 rc 0 **그리고** 실행 rc 0 **그리고** 첫 원소가 기대값과 상대 오차 1e-3 이내. v8까지 있던 `alloc_select` 후보 조건과 지표 열(`cmd.copy`, `xdna_copy`, `placed`)은 런타임 디버그 로그에 기대던 것이라 로그를 지우면서 v9에서 뺐다.
 
-## 케이스 목록 (v8, 26케이스)
+## 케이스 목록 (v9, 26케이스)
 약어: 순서 a=amdxdna, v=vulkan, l=local(실행 시 local-task). 입력은 전부 `128x128xf32`. `--input_device`와 lead(`--device_lead_allocator`)는 스크립트에 적힌 값이다.
 
 | # | 케이스 | 모델 | 컴파일 순서 | `--input_device` | lead | 기대값 | 무엇을 검증하는가 | 편입 |
@@ -76,3 +72,4 @@ mkdir -p /tmp/iree-regression && docker run --rm --device=/dev/accel/accel0 --de
 | v7 | 2026-09-29, `docs/2026-09-29/1_구조전환_offset회귀_input_device준비/03_BRIDGE_subspan_offset_회귀케이스` | 25 | BRIDGE subspan offset 케이스 2개(cpu2export lead=vulkan / lead=local-task) 편입 |
 | v8 | 2026-09-29, `docs/2026-09-29/2_VGG16상수묶음확인_input_device자동화/02_input_device_자동화_구현` | 26 | `REG_INPUT_DEVICE=auto` 모드, `placed` 지표 열, npu2out 편입, 2장치 4케이스의 수동 `--input_device`를 lead 인덱스로 명시(자동 배치가 기본이 되어서) |
 | v8 (기본 모드) | 2026-09-29, 같은 챕터 | 26 | 기본 실행을 수동+자동 둘 다로 변경(`REG_INPUT_DEVICE=both`), 한쪽만은 `manual`/`auto` |
+| v9 | 2026-10-25, dev 통합(3devices-integration) | 26 | `tests/regression/`으로 이전. 런타임 디버그 로그 제거에 맞춰 판정을 rc + 기대값으로 줄이고 `alloc_select`·지표 열과 stream 단계 별도 컴파일을 뺌. 기본 `IREE_BUILD=/workspace/build`, 산출물은 `build/regression/` |

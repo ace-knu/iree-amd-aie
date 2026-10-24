@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # 3-device (CPU + NPU + GPU) 회귀 테스트.
 #
-# 위치: docs/regression/run_regression.sh (v6 부터 여기서 관리, 현재 v8(기본 실행 = 수동+자동). 케이스 목록·버전 이력은
-#       같은 폴더 README.md). v1~v6 의 이전 사본은 docs/2026-09-28/02_회귀테스트_기준선_재현/.
+# 위치: tests/regression/run_regression.sh (현재 v9(기본 실행 = 수동+자동). 케이스 목록·버전 이력은
+#       같은 폴더 README.md).
 #
 # 각 케이스: .mlir 을 현재 컴파일러로 새로 컴파일 -> iree-run-module 실행 ->
 # 출력 첫 원소를 기대값과 비교 -> PASS/FAIL. 기존 vmfb 는 절대 재사용하지 않는다
 # (바이너리가 바뀌었는데 옛 vmfb 로 정답이 나오는 착시를 막기 위해).
 #
-# 컨테이너(iree-aie-gpu:dev, /workspace = 저장소 루트) 안에서 실행한다.
-#   bash /workspace/docs/regression/run_regression.sh              # 전체
-#   bash /workspace/docs/regression/run_regression.sh 'mm_probe'   # 케이스 이름 정규식 필터
+# dev 컨테이너(/workspace = 저장소 루트) 안에서 실행한다. 호스트에서:
+#   ./scripts/docker/run-dev.sh bash tests/regression/run_regression.sh              # 전체
+#   ./scripts/docker/run-dev.sh bash tests/regression/run_regression.sh 'mm_probe'   # 케이스 이름 정규식 필터
 #
 # 환경 변수
-#   IREE_BUILD   빌드 디렉토리            (기본 /workspace/build-gpu)
+#   IREE_BUILD   빌드 디렉토리            (기본 /workspace/build)
 #   MODEL_DIR    입력 .mlir 폴더           (기본 이 스크립트 옆 models/)
-#   REG_ROOT     산출물 상위 폴더          (기본 /tmp)
+#   REG_ROOT     산출물 상위 폴더          (기본 $IREE_BUILD/regression)
 #   REG_OUT      산출물 폴더 전체 경로     (기본 $REG_ROOT/regression_YYYYMMDD_HHMM)
 #   REG_TIMEOUT  케이스별 컴파일/실행 제한 시간(초) (기본 600)
 #   REG_INPUT_DEVICE  both(기본): manual 과 auto 를 차례로 둘 다 돌린다. 결과는
@@ -24,18 +24,17 @@
 #                     auto: --input_device 를 빼고 실행한다 (iree-run-module 이 컴파일러의
 #                     reflection amdaie.input_devices 로 배치). lead 등 나머지 인자는 같다.
 #
-# 산출물($REG_OUT): <key>.vmfb, <key>.compile.log, <key>.stream.mlir(지표용),
-#                   <key>.stream.log, <case>.stdout, <case>.stderr,
-#                   summary.txt. 저장소 안에는 아무것도 쓰지 않는다.
+# 산출물($REG_OUT): <key>.vmfb, <key>.compile.log, <case>.stdout, <case>.stderr,
+#                   summary.txt. 기본 위치는 build/ 아래다(git 추적 안 함).
 
 set -u -o pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-IREE_BUILD=${IREE_BUILD:-/workspace/build-gpu}
+IREE_BUILD=${IREE_BUILD:-/workspace/build}
 COMPILE=$IREE_BUILD/tools/iree-compile
 RUN=$IREE_BUILD/tools/iree-run-module
 MODEL_DIR=${MODEL_DIR:-$SCRIPT_DIR/models}
-REG_ROOT=${REG_ROOT:-/tmp}
+REG_ROOT=${REG_ROOT:-$IREE_BUILD/regression}
 OUT=${REG_OUT:-$REG_ROOT/regression_$(date +%Y%m%d_%H%M)}
 TIMEOUT=${REG_TIMEOUT:-600}
 INPUT_MODE=${REG_INPUT_DEVICE:-both}
@@ -96,7 +95,6 @@ matches() {
 }
 
 declare -A COMPILED   # key -> 컴파일 rc (같은 실행 안에서 같은 key 는 한 번만 컴파일)
-declare -A NCMDCOPY   # key -> 최종 stream IR 의 stream.cmd.copy 개수 (지표)
 ROWS=()
 NPASS=0; NFAIL=0
 
@@ -122,15 +120,6 @@ run_case() {
       timeout "$TIMEOUT" "$COMPILE" "$src" $flags -o "$vmfb"
     } >"$OUT/$key.compile.log" 2>&1
     COMPILED[$key]=$?
-    # 지표(판정에는 쓰지 않음): stream 단계까지만 따로 컴파일해서 최종 stream IR 의
-    # stream.cmd.copy 개수를 센다. 위 본 컴파일 명령은 건드리지 않는다.
-    # shellcheck disable=SC2086
-    if timeout "$TIMEOUT" "$COMPILE" "$src" $flags --compile-to=stream \
-         -o "$OUT/$key.stream.mlir" >"$OUT/$key.stream.log" 2>&1; then
-      NCMDCOPY[$key]=$(grep -c 'stream\.cmd\.copy' "$OUT/$key.stream.mlir")
-    else
-      NCMDCOPY[$key]=err
-    fi
   fi
   local crc=${COMPILED[$key]}
 
@@ -143,50 +132,22 @@ run_case() {
   [[ $lead != - ]] && args+=(--device_lead_allocator="$lead")
   for i in "${inputs[@]}"; do args+=(--input="$i"); done
 
-  local rrc=- actual=- nsel=- nxcopy=- placed=- status=FAIL
+  local rrc=- actual=- status=FAIL
   if [[ $crc -eq 0 ]]; then
     echo "[run]     $name"
     echo "# $RUN ${args[*]}" >"$OUT/$name.cmd"
     timeout "$TIMEOUT" "$RUN" "${args[@]}" >"$OUT/$name.stdout" 2>"$OUT/$name.stderr"
     rrc=$?
     actual=$(first_elem "$OUT/$name.stdout"); actual=${actual:--}
-    # 런타임 폴백(hal.allocator.select)이 실제로 후보를 고른 횟수.
-    # module.c 의 [DBG] 로그 기준: "policy pairs=N -> K" / "no policy ... -> first".
-    nsel=$(grep -cE '^\[DBG\] alloc_select: (policy|no policy)' "$OUT/$name.stderr")
-    # 후보 장치 이름: "alloc_select cand[i] dev=PTR" 의 PTR 을
-    # "fence_create dev='NAME' ptr=PTR" 로 역참조한다. amdxdna 가 후보에 있으면
-    # NPU 가 끼는 경계가 컴파일 타임에 확정되지 않았다는 뜻이므로 FAIL 로 본다.
-    # 표시 형식: 횟수(cand0+cand1->선택). 후보는 cand 인덱스 순서(첫 호출 기준).
-    local cands="" p nm pick selnm=""
-    for p in $(grep -oE 'alloc_select cand\[[0-9]+\] dev=0x[0-9a-f]+' "$OUT/$name.stderr" | sed 's/.*dev=//' | awk '!s[$0]++'); do
-      nm=$(grep -m1 -oE "fence_create dev='[a-z-]+' ptr=$p\b" "$OUT/$name.stderr" | sed -E "s/.*dev='([a-z-]+)'.*/\1/")
-      cands+="${cands:++}${nm:-?}"
-    done
-    pick=$(grep -m1 -oE 'alloc_select: policy pairs=[0-9]+ -> [0-9]+' "$OUT/$name.stderr" | sed 's/.*-> //')
-    if [[ -n $pick ]]; then
-      IFS=+ read -ra cn <<<"$cands"; selnm=${cn[$pick]:-?}
-    fi
-    [[ $nsel != 0 ]] && nsel="$nsel($cands${selnm:+->$selnm})"
-    # 지표(판정에는 쓰지 않음): amdxdna copy_buffer 실행 횟수. 경계 복사와
-    # 툴링의 출력 전송(lead 로 옮기기)이 모두 포함된다.
-    nxcopy=$(grep -c '^\[BR\] amdxdna copy' "$OUT/$name.stderr")
-    # 지표(판정에는 쓰지 않음): 입력 재배치 결과. i 번째 칸 = 옮긴 장치 인덱스(--device 순서),
-    # L = 옮기지 않음(lead 에 둠). "[BR] input[i] -> device N" / "-> lead" 로그 기준.
-    local ni=${#inputs[@]} k
-    placed=""
-    for ((k = 0; k < ni; ++k)); do
-      local d; d=$(grep -m1 -oE "^\[BR\] input\[$k\] -> device [0-9]+" "$OUT/$name.stderr" | sed 's/.* //')
-      placed+="${placed:+,}${d:-L}"
-    done
-    if [[ $rrc -eq 0 ]] && matches "$actual" "$expect" && [[ $cands != *amdxdna* ]]; then status=PASS; fi
+    if [[ $rrc -eq 0 ]] && matches "$actual" "$expect"; then status=PASS; fi
   fi
   if [[ $status == PASS ]]; then NPASS=$((NPASS + 1)); else NFAIL=$((NFAIL + 1)); fi
-  ROWS+=("$(printf '| %-26s | %-8s | %-10s | %-3s | %-3s | %-32s | %-8s | %-10s | %-9s | %-4s |' \
-    "$name" "$expect" "$actual" "$crc" "$rrc" "$nsel" "${NCMDCOPY[$key]:--}" "$nxcopy" "$placed" "$status")")
+  ROWS+=("$(printf '| %-26s | %-8s | %-10s | %-3s | %-3s | %-4s |' \
+    "$name" "$expect" "$actual" "$crc" "$rrc" "$status")")
 }
 
 # ---------------------------------------------------------------------------
-# 케이스 정의 (근거: /workspace/.home-gpu/.bash_history 263, 318, 323-327, 331행)
+# 케이스 정의
 # ---------------------------------------------------------------------------
 T3=amdxdna,vulkan,local
 R3=amdxdna,vulkan,local-task
@@ -211,7 +172,7 @@ run_case mm_probe_lead0       mm_probe      mm_probe.mlir        $T2 $R2 mm     
 run_case mm_probe_lead1       mm_probe      mm_probe.mlir        $T2 $R2 mm         256   1,1   1 "$X=1" "$X=2"
 
 # 디바이스 선언 순서 뒤집기 (docs/2026-09-28/03). NPU 가 index 0 이 아니어도 NPU 경계
-# 소유자가 topology 로 확정되는지 본다: 정답 + alloc_select 후보에 amdxdna 없음.
+# 소유자가 topology 로 확정되는지 본다.
 # 약어 a=amdxdna v=vulkan l=local. --input_device 는 각 순서의 stream.tensor.import 기준.
 # (chain2_order_vla/val 은 NPU 코드젠 실패로 여기서는 제외했었다 -> docs/2026-09-28/03 README 6절.
 #  docs/2026-09-28/06, 10 에서 해결되어 아래 placement 블록에 편입됨)
@@ -274,14 +235,12 @@ fi
   echo "model dir     : $MODEL_DIR"
   echo "input mode    : $INPUT_MODE (REG_INPUT_DEVICE)"
   echo
-  echo "| case                       | expected | actual     | crc | rrc | alloc_select(후보->선택)         | cmd.copy | xdna_copy  | placed    | res  |"
-  echo "|----------------------------|----------|------------|-----|-----|----------------------------------|----------|------------|-----------|------|"
+  echo "| case                       | expected | actual     | crc | rrc | res  |"
+  echo "|----------------------------|----------|------------|-----|-----|------|"
   printf '%s\n' "${ROWS[@]}"
   echo
   echo "PASS=$NPASS FAIL=$NFAIL"
-  echo "(crc/rrc = compile/run exit code, alloc_select = 런타임 폴백 선택 횟수(cand 순서 후보->선택 장치). 후보에 amdxdna 가 있으면 FAIL)"
-  echo "(cmd.copy = --compile-to=stream 결과의 stream.cmd.copy 개수, xdna_copy = stderr 의 '[BR] amdxdna copy' 줄 수(출력 전송 포함). 둘 다 지표이고 판정에 쓰지 않음)"
-  echo "(placed = 입력 재배치 결과, i 번째 칸 = 옮긴 장치 인덱스(--device 순서), L = lead 에 둠. 지표이고 판정에 쓰지 않음)"
+  echo "(crc/rrc = compile/run exit code)"
 } | tee "$SUMMARY"
 
 [[ $NFAIL -eq 0 ]]
