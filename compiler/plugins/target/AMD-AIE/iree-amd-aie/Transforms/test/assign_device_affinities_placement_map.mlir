@@ -79,7 +79,7 @@
 // List and direct device symbols; only @gpu and @cpu are used, so the
 // injected topology covers just those two.
 // LST: module attributes {
-// LST-SAME: stream.topology = #hal.device.topology<links = [(@gpu -> @cpu = {transparent_access = true}), (@cpu -> @gpu = {transparent_access = true})]>
+// LST-SAME: stream.topology = #hal.device.topology<links = [(@gpu -> @cpu = {}), (@cpu -> @gpu = {transparent_access = true})]>
 // LST-LABEL: util.func public @model
 // LST: flow.dispatch @model_dispatch_0::
 // LST-SAME: stream.affinity = #hal.device.affinity<@gpu>

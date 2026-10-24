@@ -66,9 +66,6 @@ SUMMARY=$OUT/summary.txt
 # 컴파일 타깃 목록(쉼표 구분)에서 플래그를 만든다. 장치별 값은 scripts/onnx/options.py 와 같다.
 # vulkan 이 있으면 --iree-vulkan-target=gfx1150 을 반드시 붙인다
 # (빠지면 에러 없이 vp_android_baseline_2022 로 떨어진다).
-# --iree-hal-external-resources-mappable: lead 가 CPU 가 아닌 케이스(lead 기본값 0 = amdxdna 등)에서
-# 툴링이 GPU 출력을 lead 로 옮길 때 host map 이 필요하다(없으면 PERMISSION_DENIED).
-# options.py 는 CPU 를 lead 로 고정해서 이 플래그가 필요 없다.
 compile_flags() {
   local targets=$1 f="" d
   IFS=, read -ra devs <<<"$targets"
@@ -77,7 +74,7 @@ compile_flags() {
     case $d in
       local)   f+=" --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-cpu=host" ;;
       amdxdna) f+=" --iree-amdaie-target-device=npu4 --iree-amd-aie-peano-install-dir=$PEANO" ;;
-      vulkan)  f+=" --iree-vulkan-target=gfx1150 --iree-hal-external-resources-mappable=true" ;;
+      vulkan)  f+=" --iree-vulkan-target=gfx1150" ;;
     esac
   done
   echo "$f"

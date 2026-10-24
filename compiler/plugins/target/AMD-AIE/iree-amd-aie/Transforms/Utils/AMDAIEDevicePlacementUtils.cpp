@@ -68,14 +68,16 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
   //    row must be false.
   if (srcBackend == "llvm-cpu" && dstBackend == "vulkan-spirv")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
-  //  - vulkan-spirv -> llvm-cpu is true. The Vulkan allocator imports a host
-  //    pointer (HOST_ALLOCATION via VK_EXT_external_memory_host), and the
-  //    shared buffer bridge (resolve_buffer_ref in
-  //    vulkan/direct_command_buffer.cc, used by dispatch/copy/fill/update)
-  //    maps a local-task/heap buffer for its host pointer and imports it.
-  //    Verified: cg_topo with lead=0 (CPU-owned buffer read by the GPU) -> 2.
+  //  - vulkan-spirv -> llvm-cpu is false. The shared buffer bridge
+  //    (resolve_buffer_ref in vulkan/direct_command_buffer.cc) imports a
+  //    local-task buffer by its host pointer when the command is recorded,
+  //    but a queue-ordered (transient) CPU allocation has no memory until its
+  //    alloca executes, so the import fails ("transient buffer has not been
+  //    committed"). Already allocated host buffers do import, but the owner
+  //    choice cannot tell the two apart, so a buffer shared by the two must
+  //    be GPU-owned. Set back to true once the bridge imports at execution.
   if (srcBackend == "vulkan-spirv" && dstBackend == "llvm-cpu")
-    return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
+    return {/*unifiedMemory=*/false, /*transparentAccess=*/false};
 
   // ---- GPU <-> NPU --------------------------------------------------------
   //  - vulkan-spirv -> amd-aie is true. The amdxdna allocator exports a BO as
