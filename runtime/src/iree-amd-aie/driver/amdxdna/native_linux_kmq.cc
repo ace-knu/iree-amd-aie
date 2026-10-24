@@ -600,19 +600,11 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
   ert_packet* packet = command_packet(command);
   packet->state = ERT_CMD_STATE_NEW;
   shim_xdna::bo* exec_bo = command->kernel->get_exec_buf_bo();
-  int64_t t0 = iree_time_now();
-  fprintf(stderr, "[T] submit begin t=%.3fms\n", t0 / 1e6); fflush(stderr);
   if (const int err = queue->hwq->issue_command(exec_bo)) {
     return iree_hal_amdxdna_status_from_errno(
         err, "amdxdna native command submit failed");
   }
-  int64_t t1 = iree_time_now();
   const int rc = queue->hwq->wait_command(exec_bo, 0);
-  int64_t t2 = iree_time_now();
-  fprintf(stderr, "[T] submit '%.*s' issue=%.3fms wait=%.3fms\n",
-          static_cast<int>(label.size), label.data,
-          (t1 - t0) / 1e6, (t2 - t1) / 1e6);
-  fflush(stderr);
   if (rc < 0) {
     return iree_hal_amdxdna_status_from_errno(
         rc, "amdxdna native command wait failed");

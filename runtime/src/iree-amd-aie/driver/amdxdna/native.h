@@ -130,7 +130,6 @@ iree_device_size_t iree_hal_amdxdna_native_buffer_size(
 iree_status_t iree_hal_amdxdna_native_buffer_export_fd(
     iree_hal_amdxdna_native_buffer_t* buffer, int* out_fd);
 
-    
 iree_status_t iree_hal_amdxdna_native_context_open_cu(
     iree_hal_amdxdna_native_context_t* context, iree_string_view_t kernel_name,
     iree_hal_amdxdna_native_cu_index_t* out_cu_index);

@@ -5,8 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree-amd-aie/driver/amdxdna/allocator.h"
-#include <unistd.h>
-#include <cinttypes>
 
 #include <memory>
 
@@ -110,22 +108,16 @@ iree_hal_amdxdna_allocator_query_buffer_compatibility(
   return compatibility;
 }
 
-    
 static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
     iree_hal_allocator_t* base_allocator,
     const iree_hal_buffer_params_t* params, iree_device_size_t allocation_size,
     iree_hal_buffer_t** out_buffer) {
-  fprintf(stderr, "[T] %s t=%.3fms\n", __func__, iree_time_now() / 1e6); fflush(stderr);
   IREE_TRACE_ZONE_BEGIN(z0);
 
   iree_hal_amdxdna_allocator* allocator = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
       base_allocator, iree_hal_amdxdna_allocator_vtable,
       iree_hal_amdxdna_allocator);
   iree_hal_buffer_params_t compat_params = *params;
-  fprintf(stderr, "[DBG] amdxdna alloc req_usage=0x%x type=0x%x size=%" PRIu64 "\n",
-          (unsigned)params->usage, (unsigned)params->type,
-          (uint64_t)allocation_size);
-  fflush(stderr);
   iree_hal_buffer_compatibility_t compatibility =
       iree_hal_amdxdna_allocator_query_buffer_compatibility(
           base_allocator, &compat_params, &allocation_size);
@@ -165,21 +157,6 @@ static iree_status_t iree_hal_amdxdna_allocator_allocate_buffer(
         &allocator->statistics, compat_params.type, allocation_size));
     native_buffer.release();
     *out_buffer = buffer;
-    if (getenv("IREE_AMDXDNA_TEST_EXPORT")) {
-      iree_hal_external_buffer_t ext;
-      iree_status_t s = iree_hal_amdxdna_allocator_export_buffer(
-          base_allocator, buffer, IREE_HAL_EXTERNAL_BUFFER_TYPE_OPAQUE_FD,
-          IREE_HAL_EXTERNAL_BUFFER_FLAG_NONE, &ext);
-      if (iree_status_is_ok(s)) {
-        fprintf(stderr, "[DBG] export_fd ok fd=%d size=%" PRIu64 "\n",
-                ext.handle.opaque_fd.fd, (uint64_t)ext.size);
-        close(ext.handle.opaque_fd.fd);
-      } else {
-        fprintf(stderr, "[DBG] export_fd FAILED\n");
-        iree_status_ignore(s);
-      }
-      fflush(stderr);
-    }
   } else {
     iree_hal_buffer_release(buffer);
   }
