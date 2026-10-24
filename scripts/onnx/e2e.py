@@ -22,8 +22,9 @@ def main():
     args = ap.parse_args()
 
     selected = {name: getattr(args, name) for name in options.user_options()}
-    outdir = args.outdir or compile_.default_outdir(args.onnx.stem, selected)
-    compile_.compile_model(args.onnx, selected, outdir, args.extra_flags)
+    outdir = args.outdir or compile_.default_outdir(args.onnx.stem, args.devices,
+                                                    selected)
+    compile_.compile_model(args.onnx, args.devices, selected, outdir, args.extra_flags)
     config, result, report = run.run_model(outdir, args.inputs, args.runs, args.warmup,
                                            args.verbose)
     run.print_summary(config, result, args.runs, report)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile an ONNX model for amd-aie (NPU + CPU).
+"""Compile an ONNX model for amd-aie (NPU + CPU, optionally GPU).
 
 Runs inside the dev container. Imports the ONNX file to MLIR, then runs
 iree-compile with the flags from options.py for the selected options. Writes
@@ -9,9 +9,9 @@ into the output directory:
   model.vmfb       compiled module
   compile.log      iree-compile output
   compile_cmd.sh   the exact commands, to reproduce by hand
-  config.json      model, entry function, selected options, the compile and
-                   run flags of the model and of its accuracy reference,
-                   commit, times
+  config.json      model, entry function, devices, selected options, the
+                   compile and run flags of the model and of its accuracy
+                   reference, commit, times
 
 run.py reads config.json, so a directory produced here can be run as is.
 """
@@ -31,9 +31,24 @@ REPO = Path(__file__).resolve().parents[2]
 IREE_COMPILE = REPO / "build" / "tools" / "iree-compile"
 
 
+def device_list(value):
+    devices = value.split(",")
+    for d in devices:
+        if d not in options.DEVICES:
+            raise argparse.ArgumentTypeError(
+                f"unknown device '{d}' (known: {', '.join(options.DEVICES)})")
+    if len(set(devices)) != len(devices):
+        raise argparse.ArgumentTypeError(f"device listed twice: {value}")
+    return devices
+
+
 def add_compile_args(ap):
-    """Adds one --<option> argument per user option in options.py, plus
-    --extra-flag and --outdir."""
+    """Adds --devices, one --<option> argument per user option in options.py,
+    plus --extra-flag and --outdir."""
+    ap.add_argument("--devices", type=device_list, default=options.DEFAULT_DEVICES,
+                    help="comma-separated devices from options.py, the first is "
+                         "the default (lead) device; default: "
+                         + ",".join(options.DEFAULT_DEVICES))
     for name, choices in options.user_options().items():
         ap.add_argument(f"--{name}", choices=choices,
                         default=options.DEFAULTS[name],
@@ -46,8 +61,11 @@ def add_compile_args(ap):
                     help="default: build/onnx/<model>-<options>")
 
 
-def default_outdir(model, selected):
-    label = "-".join([model] + [f"{k}_{v}" for k, v in selected.items()])
+def default_outdir(model, devices, selected):
+    parts = [model]
+    if devices != options.DEFAULT_DEVICES:
+        parts.append("devices_" + "+".join(devices))
+    label = "-".join(parts + [f"{k}_{v}" for k, v in selected.items()])
     return REPO / "build" / "onnx" / label
 
 
@@ -80,23 +98,25 @@ def build_vmfb(mlir, flags, vmfb, log):
     return run_step(compile_cmd(mlir, flags, vmfb), log)
 
 
-def device_flags(selected, extra_flags, device):
-    """Returns the compile and run flags of `selected` on the device group
-    `device` of options.py."""
-    return {"compile": options.compile_flags(selected, device) + extra_flags,
-            "run": options.run_flags(device)}
+def device_flags(selected, extra_flags, devices):
+    """Returns the compile and run flags of `selected` on `devices`."""
+    return {"compile": options.compile_flags(selected, devices) + extra_flags,
+            "run": options.run_flags(devices)}
 
 
-def compile_model(onnx, selected, outdir, extra_flags):
+def compile_model(onnx, devices, selected, outdir, extra_flags):
     """Imports and compiles `onnx`; returns the config dict written to
     outdir/config.json. The config also holds the flags of the accuracy
-    reference (same options on "reference_device", numeric f32), which
+    reference (same options on options.REFERENCE_DEVICES, numeric f32), which
     run.py compiles when it needs it."""
+    error = options.check(selected, devices)
+    if error:
+        sys.exit(error)
     outdir.mkdir(parents=True, exist_ok=True)
     mlir, vmfb = outdir / "model.mlir", outdir / "model.vmfb"
-    device = device_flags(selected, extra_flags, "device")
+    device = device_flags(selected, extra_flags, devices)
     reference = device_flags({**selected, "numeric": "f32"}, extra_flags,
-                             "reference_device")
+                             options.REFERENCE_DEVICES)
     import_cmd = [sys.executable, "-m", "iree.compiler.tools.import_onnx",
                   str(onnx), "-o", str(mlir)]
     (outdir / "compile_cmd.sh").write_text(
@@ -112,6 +132,7 @@ def compile_model(onnx, selected, outdir, extra_flags):
         "model": onnx.stem,
         "onnx": str(onnx.resolve()),
         "function": entry_function(mlir),
+        "devices": devices,
         "options": selected,
         "extra_flags": extra_flags,
         "device": device,
@@ -132,8 +153,8 @@ def main():
     args = ap.parse_args()
 
     selected = {name: getattr(args, name) for name in options.user_options()}
-    outdir = args.outdir or default_outdir(args.onnx.stem, selected)
-    config = compile_model(args.onnx, selected, outdir, args.extra_flags)
+    outdir = args.outdir or default_outdir(args.onnx.stem, args.devices, selected)
+    config = compile_model(args.onnx, args.devices, selected, outdir, args.extra_flags)
     print(f"compile {config['compile_s']:.1f} s (import {config['import_s']:.1f} s)"
           f" -> {outdir / 'model.vmfb'}")
 

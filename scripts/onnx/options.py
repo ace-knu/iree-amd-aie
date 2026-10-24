@@ -1,54 +1,60 @@
 """iree-compile options for running an ONNX model on amd-aie, grouped by function.
 
-The two device groups hold `compile` flags (iree-compile) and `run` flags
-(iree-run-module); exactly one of them is used per compile. Every other group
-holds either fixed `flags` (always passed) or user options, each a map of
-choice -> flags. To add, remove or change an option, edit this file only. A
-flag that only works around a current gap is marked with a `# workaround:`
-comment; remove it once the gap is fixed.
+DEVICES holds, per device, the `compile` flags (iree-compile) that declare it
+and the `run` flags (iree-run-module) that open it; `{symbol}` is filled with
+the device symbol (the name with '-' as '_'). A model is placed on the devices
+picked with --devices, in that order: the first is the default (lead) device.
+Every OPTIONS group holds either fixed `flags` (always passed) or user options,
+each a map of choice -> flags. To add, remove or change a device or an option,
+edit this file only. A flag that only works around a current gap is marked with
+a `# workaround:` comment; remove it once the gap is fixed.
 """
 
 import os
 
 PEANO_INSTALL_DIR = os.environ.get("PEANO_INSTALL_DIR", "/workspace/llvm-aie")
 
-DEVICE_GROUPS = ("device", "reference_device")
-
-OPTIONS = {
-    # Devices the model is placed on: the iree-compile flags that declare them
-    # and the iree-run-module flags that open them. Keep the two lists in sync.
-    "device": {
+# Device names are <driver>-<target>, so another NPU or GPU gets its own entry.
+DEVICES = {
+    "amdxdna-npu4": {
         "compile": [
-            "--iree-hal-target-device=npu=amdxdna",
-            "--iree-hal-target-device=cpu=local",
-            "--iree-hal-local-target-device-backends=llvm-cpu",
-            "--iree-llvmcpu-target-cpu=host",
-            "--iree-hal-default-device=npu",
-        ],
-        "run": [
-            "--device=amdxdna",
-            "--device=local-task",
-        ],
-    },
-    # Device the accuracy reference runs on, in place of "device". The
-    # reference uses the same options otherwise, with numeric f32.
-    "reference_device": {
-        "compile": [
-            "--iree-hal-target-device=local",
-            "--iree-hal-local-target-device-backends=llvm-cpu",
-            "--iree-llvmcpu-target-cpu=host",
-        ],
-        "run": [
-            "--device=local-task",
-        ],
-    },
-    # NPU generation and core compiler.
-    "backend": {
-        "flags": [
+            "--iree-hal-target-device={symbol}=amdxdna",
             "--iree-amdaie-target-device=npu4",
             f"--iree-amd-aie-peano-install-dir={PEANO_INSTALL_DIR}",
         ],
+        "run": [
+            "--device=amdxdna",
+        ],
     },
+    "vulkan-gfx1150": {
+        "compile": [
+            "--iree-hal-target-device={symbol}=vulkan",
+            # Required: without it iree-compile silently targets a generic
+            # baseline instead of gfx1150.
+            "--iree-vulkan-target=gfx1150",
+        ],
+        "run": [
+            "--device=vulkan",
+        ],
+    },
+    "local-host": {
+        "compile": [
+            "--iree-hal-target-device={symbol}=local",
+            "--iree-hal-local-target-device-backends=llvm-cpu",
+            "--iree-llvmcpu-target-cpu=host",
+        ],
+        "run": [
+            "--device=local-task",
+        ],
+    },
+}
+
+# Devices of a model by default, and of its accuracy reference (which uses the
+# same options otherwise, with numeric f32).
+DEFAULT_DEVICES = ["amdxdna-npu4", "local-host"]
+REFERENCE_DEVICES = ["local-host"]
+
+OPTIONS = {
     # Model-level transforms before dispatch formation.
     "graph": {
         "flags": [
@@ -109,23 +115,36 @@ DEFAULTS = {
 def user_options():
     """Returns {option name: [choices]} over all groups."""
     return {name: list(choices)
-            for group_name, group in OPTIONS.items() if group_name not in DEVICE_GROUPS
+            for group in OPTIONS.values()
             for name, choices in group.items() if name != "flags"}
 
 
-def compile_flags(selected, device="device"):
+def check(selected, devices):
+    """Returns an error message for an unsupported combination, else None."""
+    # workaround: bf16 contractions fail to compile for the GPU; use f32.
+    if selected.get("numeric") == "bf16" and any(d.startswith("vulkan-") for d in devices):
+        return "--numeric bf16 is not supported with a vulkan device; use f32"
+    return None
+
+
+def device_symbol(device):
+    return device.replace("-", "_")
+
+
+def compile_flags(selected, devices):
     """Returns the iree-compile flags for `selected` ({option name: choice})
-    on the device group `device`, in group order."""
+    on `devices` (names in DEVICES; the first is the default device)."""
     flags = []
-    for group_name, group in OPTIONS.items():
-        if group_name in DEVICE_GROUPS:
-            flags += group["compile"] if group_name == device else []
-            continue
+    for device in devices:
+        flags += [f.format(symbol=device_symbol(device))
+                  for f in DEVICES[device]["compile"]]
+    flags.append(f"--iree-hal-default-device={device_symbol(devices[0])}")
+    for group in OPTIONS.values():
         for name, value in group.items():
             flags += value if name == "flags" else value[selected[name]]
     return flags
 
 
-def run_flags(device="device"):
-    """Returns the iree-run-module flags of the device group `device`."""
-    return OPTIONS[device]["run"]
+def run_flags(devices):
+    """Returns the iree-run-module flags that open `devices`, in order."""
+    return [f for device in devices for f in DEVICES[device]["run"]]

@@ -2,7 +2,7 @@
 """Run a model compiled by compile.py on amd-aie and check it.
 
 Runs inside the dev container. Reads config.json and model.vmfb from the
-compile output directory, runs the module on the NPU (+ CPU) and prints one
+compile output directory, runs the module on its devices and prints one
 summary line: compile time, run time, accuracy.
 
 Inputs: the --input .npy files, or (by default) fixed-seed random inputs of the
@@ -127,7 +127,10 @@ def trace_run(config, vmfb, inputs, outdir):
     log = outdir / "trace.log"
     run_module(vmfb, config["function"], config["device"]["run"], inputs, [], log,
                tools=TRACE_BUILD / "tools")
-    return dispatch_times.format_report(*dispatch_times.parse(log))
+    report = dispatch_times.format_report(*dispatch_times.parse(log))
+    if any(d.startswith("vulkan-") for d in config.get("devices", [])):
+        report += "\n(GPU dispatch time is not traced; it is included in host)"
+    return report
 
 
 def compare(got, ref):
