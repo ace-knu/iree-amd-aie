@@ -136,11 +136,7 @@ artifacts/
 /models/*/*.npy
 /models/vgg16/*.onnx
 
-# local scratch
-.bash_history
-.gitconfig
-build-*.log
-models/_backup/
-models/**/dump*/
-models/**/*.log
-models/**/*.vmfb
+# The dev container uses HOME=/workspace (the repo root), so shell and git
+# config files land here.
+/.bash_history
+/.gitconfig
