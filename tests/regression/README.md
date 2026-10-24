@@ -2,11 +2,13 @@
 
 CPU(local-task) + NPU(amdxdna) + GPU(vulkan, gfx1150) 3장치 작업의 회귀 테스트다. 스크립트와 모델은 여기서만 관리한다(v9부터 `tests/regression/`, v6~v8은 `docs/regression/`). 3장치 관련 변경(배치, 버퍼 소유, BRIDGE, HAL 드라이버)이 있을 때 ctest와 MLP/VGG e2e에 더해 돌린다.
 
+문서와 스크립트 주석 안의 `docs/2026-…` 경로는 로컬 세션 기록이다(팀 git에 없음).
+
 ## 구성
 | 파일 | 내용 |
 |---|---|
 | `run_regression.sh` | 회귀 스크립트. 케이스마다 `.mlir`을 새로 컴파일하고(vmfb 재사용 안 함) `iree-run-module`로 실행한 뒤, 첫 출력 텐서의 첫 원소를 기대값과 비교한다 |
-| `models/*.mlir` | 회귀 입력 모델 13개 (아래 표) |
+| `models/*.mlir` | 회귀 입력 모델 14개 (아래 표) |
 | `models/src/export_mlp_2layer_const.py` | `mlp_2layer_const*.mlir`을 만든 ONNX export 스크립트(출처 보존용. 스크립트가 읽지는 않음) |
 | `input_device_expected.md` | 케이스별 `--input_device` 기대값 표 (`--input_device` 자동화의 비교 기준. `docs/2026-09-29/1_…/04_…`에서 작성) |
 

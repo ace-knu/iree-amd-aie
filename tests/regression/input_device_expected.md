@@ -1,5 +1,7 @@
 # --input_device 기대값 표 (회귀 v8, 26케이스)
 
+v8(26케이스) 시점의 설계 기준표다. 아래의 "2장치(l,v) 케이스는 `--input_device`를 쓰지 않는다" 항목은 "v8 갱신" 절이 대체하고, `placed` 지표는 v9에서 없어졌다. v9에서 추가된 `fc_matvec_lv`는 README 케이스 표를 본다.
+
 `--input_device` 자동화의 비교 기준이다. 자동화한 뒤에는 각 케이스에서 툴링이 고른 장치가 이 표의 "현재 `--input_device`" 열과 같아야 하고, `--input_device` 없이 PASS해야 한다.
 작성: `docs/2026-09-29/1_구조전환_offset회귀_input_device준비/04_input_device_자동화_설계` (생성 스크립트 `input_device_table.py`, 입력 = v7 회귀의 `<key>.stream.mlir`).
 

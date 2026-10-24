@@ -24,7 +24,7 @@
 #                     auto: --input_device 를 빼고 실행한다 (iree-run-module 이 컴파일러의
 #                     reflection amdaie.input_devices 로 배치). lead 등 나머지 인자는 같다.
 #
-# 산출물($REG_OUT): <key>.vmfb, <key>.compile.log, <case>.stdout, <case>.stderr,
+# 산출물($REG_OUT): <key>.vmfb, <key>.compile.log, <case>.cmd, <case>.stdout, <case>.stderr,
 #                   summary.txt. 기본 위치는 build/ 아래다(git 추적 안 함).
 
 set -u -o pipefail
@@ -58,7 +58,7 @@ if [[ $INPUT_MODE == both ]]; then
   tail -1 "$OUT/summary.txt"
   exit $rc_all
 fi
-PEANO=/workspace/llvm-aie
+PEANO=${PEANO_INSTALL_DIR:-/workspace/llvm-aie}
 
 mkdir -p "$OUT" || exit 2
 SUMMARY=$OUT/summary.txt
