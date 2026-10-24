@@ -1,3 +1,9 @@
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 // Resolves #hal.device.optimal<[...]> allocation affinities to a single owner
 // device using the module's stream.topology table, so the runtime
 // hal.allocator.select does not have to pick (and no device name is needed).
