@@ -1,7 +1,7 @@
 # ONNX model scripts
 
-Compile an ONNX model for amd-aie (NPU + CPU), run it on the NPU and check it
-against a CPU reference. One set of options for everyone, kept in
+Compile an ONNX model for amd-aie (CPU + NPU, optionally GPU), run it and check
+it against a CPU reference. One set of options for everyone, kept in
 [`options.py`](options.py).
 
 | Script | Does |
@@ -28,18 +28,30 @@ after `source /opt/venv/bin/activate` and
 python3 scripts/onnx/e2e.py models/mlp_2layer/mlp_2layer.onnx
 ```
 
+`--devices` picks the devices (default `local-host,amdxdna-npu4`). `local-host`
+must come first: the CPU runs the host code and is the default and lead device.
+The accelerators after it take contraction/conv dispatches round-robin in the
+listed order. The GPU supports `--numeric f32` only.
+
+```bash
+./scripts/docker/run-onnx.sh e2e models/vgg16/vgg16-12.onnx --devices local-host,amdxdna-npu4,vulkan-gfx1150
+```
+
 Prerequisites: the build (`scripts/build/configure.sh`, `scripts/build/build.sh`)
 and, for large models such as VGG, the host settings in
 [`models/vgg16/README.md`](../../models/vgg16/README.md) section 2.
 
 ## Options
 
-`options.py` groups the iree-compile flags by function:
+`DEVICES` in `options.py` holds, per device (`<driver>-<target>`), the
+`compile` flags that declare it and the `run` flags that open it.
+`DEFAULT_DEVICES` and `REFERENCE_DEVICES` (llvm-cpu only, for the accuracy
+reference) list the devices used without `--devices`.
+
+`OPTIONS` groups the other iree-compile flags by function:
 
 | Group | Holds |
 |---|---|
-| `device` | `compile` flags that declare the devices, `run` flags that open them |
-| `reference_device` | the same pair for the accuracy reference (llvm-cpu only) |
 | `backend` | NPU generation, core compiler (Peano) |
 | `graph` | model-level transforms before dispatch formation |
 | `dispatch` | how ops are grouped into dispatches |
@@ -54,19 +66,21 @@ passed. A flag that only works around a current gap is marked `# workaround:`;
 remove it once the gap is fixed. To add, remove or change an option, edit
 `options.py` only: each user option becomes a `--<name>` argument by itself.
 
-To target other devices (e.g. CPU + GPU), fill `device.compile` and
-`device.run` as a matching pair. `--extra-flag=<flag>` (repeatable) passes one
-more flag to iree-compile without editing the file.
+To add a device, add a `DEVICES` entry with its `compile` and `run` flags.
+`--extra-flag=<flag>` (repeatable) passes one more flag to iree-compile without
+editing the file, e.g. an experimental `--iree-amdaie-placement-map=...` (see
+[`docs/device_placement.md`](../../docs/device_placement.md)).
 
 ## Output
 
-`build/onnx/<model>-<option>_<choice>...` unless `--outdir` is given:
+`build/onnx/<model>-<option>_<choice>...` unless `--outdir` is given
+(`<model>-devices_<a>+<b>...-...` when `--devices` is not the default):
 
 | File | Content |
 |---|---|
 | `model.mlir`, `model.vmfb` | imported model, compiled module |
 | `compile_cmd.sh` | import and compile commands, to reproduce by hand |
-| `config.json` | options, compile/run flags of the model and its reference, commit, times |
+| `config.json` | devices, options, compile/run flags of the model and its reference, commit, times |
 | `result.json` | run times, inputs, accuracy per output |
 | `*.log` | tool output of each step; `trace.log` with `--verbose` |
 
