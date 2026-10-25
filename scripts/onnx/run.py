@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run a model compiled by compile.py on amd-aie and check it.
 
-Runs inside the dev container. Reads config.json and model.vmfb from the
-compile output directory, runs the module on its devices and prints one
-summary line: compile time, run time, accuracy.
+Runs inside the dev container or the deploy image. Reads config.json and
+model.vmfb from the compile output directory, runs the module on its devices
+and prints one summary line: compile time, run time, accuracy.
 
 Inputs: the --input .npy files, or (by default) fixed-seed random inputs of the
 ONNX input shapes. They are passed to iree-run-module WITHOUT a shape prefix
@@ -13,7 +13,7 @@ the 128-byte npy header, yielding garbage.
 Accuracy reference: the same imported model compiled with the reference flags
 that compile.py wrote to config.json (same options on llvm-cpu, numeric f32),
 run on the same inputs. The reference module is cached per model and flags
-under build/onnx/ref/, its outputs per input set.
+under $ONNX_OUT/ref/ (build/onnx/ref/), its outputs per input set.
 
 Run time: wall time of iree-run-module (module load + execution), the median
 of --runs runs after --warmup runs. Writes result.json next to config.json.
@@ -21,7 +21,8 @@ of --runs runs after --warmup runs. Writes result.json next to config.json.
 --verbose: one more run with the console-tracing iree-run-module of
 build-trace/, then per-dispatch times (see dispatch_times.py). It fails when
 that tool is missing or older than the main one, so the traced runtime does
-not differ from the main one; scripts/build/build.sh builds both.
+not differ from the main one; scripts/build/build.sh builds both. The deploy
+image has no traced runtime, so --verbose works only in the dev container.
 """
 
 import argparse
@@ -39,9 +40,9 @@ import compile as compile_
 import dispatch_times
 
 REPO = Path(__file__).resolve().parents[2]
-TOOLS = REPO / "build" / "tools"
+TOOLS = compile_.TOOLS
 TRACE_BUILD = REPO / "build-trace"
-REF_ROOT = REPO / "build" / "onnx" / "ref"
+REF_ROOT = compile_.OUT_ROOT / "ref"
 
 
 def add_run_args(ap):
@@ -113,7 +114,8 @@ def check_trace_build():
     """Exits unless build-trace/ has an iree-run-module built along with the
     main one. scripts/build/build.sh links the main one first, so a traced
     one that is older was not rebuilt after a runtime change."""
-    how = "run scripts/build/configure.sh and scripts/build/build.sh"
+    how = ("run scripts/build/configure.sh and scripts/build/build.sh "
+           "(the deploy image has no traced runtime)")
     tool, main = TRACE_BUILD / "tools" / "iree-run-module", TOOLS / "iree-run-module"
     if not tool.is_file():
         sys.exit(f"--verbose needs {tool}; {how}")

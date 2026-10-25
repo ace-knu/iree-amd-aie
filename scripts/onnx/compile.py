@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Compile an ONNX model for amd-aie (NPU + CPU, optionally GPU).
 
-Runs inside the dev container. Imports the ONNX file to MLIR, then runs
-iree-compile with the flags from options.py for the selected options. Writes
-into the output directory:
+Runs inside the dev container or the deploy image. Imports the ONNX file to
+MLIR, then runs iree-compile with the flags from options.py for the selected
+options. Writes into the output directory:
 
   model.mlir       imported model
   model.vmfb       compiled module
@@ -18,6 +18,7 @@ run.py reads config.json, so a directory produced here can be run as is.
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -28,7 +29,10 @@ from pathlib import Path
 import options
 
 REPO = Path(__file__).resolve().parents[2]
-IREE_COMPILE = REPO / "build" / "tools" / "iree-compile"
+# The deploy image has no repo around the scripts; it sets these two.
+TOOLS = Path(os.environ.get("IREE_TOOLS", REPO / "build" / "tools"))
+OUT_ROOT = Path(os.environ.get("ONNX_OUT", REPO / "build" / "onnx"))
+IREE_COMPILE = TOOLS / "iree-compile"
 
 
 def device_list(value):
@@ -58,7 +62,7 @@ def add_compile_args(ap):
                          "as --extra-flag=<flag> (a separate value that starts "
                          "with '-' is read as an option)")
     ap.add_argument("--outdir", type=Path,
-                    help="default: build/onnx/<model>-<options>")
+                    help="default: $ONNX_OUT (build/onnx)/<model>-<options>")
 
 
 def default_outdir(model, devices, selected):
@@ -66,7 +70,7 @@ def default_outdir(model, devices, selected):
     if devices != options.DEFAULT_DEVICES:
         parts.append("devices_" + "+".join(devices))
     label = "-".join(parts + [f"{k}_{v}" for k, v in selected.items()])
-    return REPO / "build" / "onnx" / label
+    return OUT_ROOT / label
 
 
 def run_step(cmd, log):
@@ -104,6 +108,17 @@ def device_flags(selected, extra_flags, devices):
             "run": options.run_flags(devices)}
 
 
+def repo_commit():
+    """Returns the short commit of the repo, or $IREE_AMD_AIE_COMMIT where the
+    scripts are not in a git checkout (the deploy image)."""
+    try:
+        commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:
+        commit = ""
+    return commit or os.environ.get("IREE_AMD_AIE_COMMIT", "")
+
+
 def compile_model(onnx, devices, selected, outdir, extra_flags):
     """Imports and compiles `onnx`; returns the config dict written to
     outdir/config.json. The config also holds the flags of the accuracy
@@ -126,8 +141,7 @@ def compile_model(onnx, devices, selected, outdir, extra_flags):
 
     import_s = run_step(import_cmd, outdir / "import.log")
     compile_s = build_vmfb(mlir, device["compile"], vmfb, outdir / "compile.log")
-    commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-                            capture_output=True, text=True).stdout.strip()
+    commit = repo_commit()
     config = {
         "model": onnx.stem,
         "onnx": str(onnx.resolve()),
