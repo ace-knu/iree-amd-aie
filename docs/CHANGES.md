@@ -3,7 +3,157 @@
 git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러그인·IREE 서브모듈)를 고치는 세션은 끝날 때 이 파일을 갱신한다(CLAUDE.md 1-4의 4, 3-1-2).
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
-- 주제별 명세: `docs/2026-10-20/1_변경장부_명세_커밋준비/02_구현_명세/` (아래 "명세" 열의 S1~S10)
+- 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S10. S6·S10은 dev 통합 때 삭제)
+- **dev 통합(2026-10-25) 후 상태는 바로 아래 절을 본다.** 0~6절은 10/20 스냅숏이다.
+
+## dev 통합 후 상태 (2026-10-25, 브랜치 `3devices-integration`)
+
+0~6절은 2026-10-20 시점 3devices 작업 트리의 스냅숏이다(행 내용은 그대로 두고, 4·5·6절의 상태 칸에만 통합 결과를 덧붙였다). 통합 이후의 상태는 이 절이 기준이다.
+
+### 기준과 원칙
+
+| 저장소 | 브랜치 | 구성 |
+|---|---|---|
+| 플러그인 `ace-knu/iree-amd-aie` | `3devices-integration` | dev `45c18ae7` + `origin/3devices-f32` 병합(`c1c4d937`) + 정리 커밋 |
+| IREE 서브모듈 `ace-knu/iree` | `amd-aie-flow-hook` | dev가 쓰던 `cd1fa2a1e` + 3devices 서브모듈 `54f0fb464` 병합(`ebfa2a629`) + 정리 커밋 |
+
+- dev가 우선이다. 겹치는 부분은 dev 구현을 남기고, 불필요하거나 디버그용인 것은 지웠다.
+- 통합 후 dev는 CPU + NPU + GPU를 정식으로 지원한다. 3devices-f32 대비 빠진 것은 아래 "장부 ID별 처리"의 의도적 제거뿐이다(라인 단위 대조와 이 장부 217행 대조에서 누락 0건, S8-1).
+
+### dev 기준으로 본 변경
+
+dev와 3devices-f32가 같은 파일을 고친 곳은 세 군데뿐이다(`AIETarget.h`, amdxdna `direct_command_buffer.cc`, IREE 서브모듈 포인터. 서브모듈 안에서는 겹치는 파일이 없다). 나머지 겹침은 기능 단위다. dev에 이미 있던 기능을 3devices가 다른 방식으로 확장했거나, 3devices 작업 트리의 우회를 dev가 먼저 정식으로 고친 경우다.
+
+#### 1. 겹친 부분: dev 기능을 어떻게 바꿨나
+
+처리: **dev** = dev 것을 남기고 3devices 쪽을 지움, **합침** = 두 쪽을 함께 고려해 고침, **dev 확장** = dev 구조에 3devices 기능을 얹음.
+
+| 기능 | dev (통합 전) | 3devices-f32 | 통합 후 | 처리 | 커밋 |
+|---|---|---|---|---|---|
+| 연산 배정 (`AMDAIEAssignDeviceAffinities`) | contraction/conv는 첫 accelerator(NPU) 하나에, 나머지는 CPU에. host만 있는 모듈도 배정 | accelerator 사이 round-robin, vulkan-spirv는 `TEMP` accelerator, respect-marks(디버그), placement-map(실험), accelerator가 없으면 early return | round-robin, vulkan-spirv 정식 accelerator, placement-map은 실험용(기본 꺼짐). respect-marks와 early return은 제거 | 합침 | `4a798514`, `e7060e40`, `131799d7` |
+| 링크 표 (`linkFlags`) | CPU → NPU true, NPU → CPU false | CPU ↔ GPU, GPU ↔ NPU 4행 추가(GPU → CPU true) | dev의 2행은 그대로. GPU 4행을 넣되 GPU → CPU는 false로 바꿈(아래 3절) | 합침 | `e3d86485` |
+| 플러그인 pass 등록 (`PluginRegistration`) | Flow 단계에 배정 + pad | stream 단계 hook에 ResolveBufferOwner, AnnotateInputDevices. 배정에 옵션 전달 | 둘 다 | 합침 | 병합 `c1c4d937` |
+| 컴파일 옵션 (`AIETarget.h`) | ukernel 기본 컴파일러를 peano로 | `respect-affinity-marks`, `placement-map` | dev 변경 + `placement-map` | 합침 | `e7060e40` |
+| amdxdna dispatch (`direct_command_buffer.cc`) | tracing 메시지(dispatch 이름) | stderr 로그, hwctx 캐시(`IREE_AMDXDNA_CACHE_HWCTX`) | dev 그대로. 3devices 변경은 모두 빠져 dev 대비 diff 0 | dev | `06aa6260` |
+| 실행 시 진단 | `build-trace/` console tracing(`--verbose`) | `[T]`·`[DBG]`·`[BR]` stderr 로그, `IREE_VULKAN_BR_DUMP`, `TEST_EXPORT` | dev 방식만. GPU 로그가 필요하면 tracing으로 넣음 | dev | `06aa6260`, fork `effaf17b4` |
+| ONNX 실행 스크립트 (`scripts/onnx/`) | 장치 고정(CPU + NPU), `--numeric`, `--ukernel`, `--verbose` | 스크립트 없이 손으로 쓴 컴파일·실행 명령(W14~W21) | `--devices`(`local-host`, `amdxdna-npu4`, `vulkan-gfx1150`), CPU가 첫 장치가 아니면 오류, GPU + bf16이면 오류, `--verbose`에 GPU 시간 안내 | dev 확장 | `d8e98aec`, `50f8aaa9` |
+| 빌드와 컨테이너 | `configure.sh`, Dockerfile, `run-*.sh`(NPU만 전달) | GPU용 HOME·ccache를 따로 씀(`.gitignore` 항목) | dev 스크립트에 Vulkan driver/backend, Vulkan 런타임, render 노드 전달 추가. 3devices의 개인 항목 제거 | dev 확장 | `270fcda3`, `5e2cca69` |
+| NPU f32 | f32 pad(`b492865a`), DMA 반복(`990bcab2`)으로 해결 | 작업 트리 우회 W07, W22, W23, W27 | dev | dev | — |
+| peano unroll | `-unroll-full-max-count=0` (`XCLBinGen.cpp`) | `-unroll-threshold=0` (W13) | dev | dev | — |
+| ukernel bf16 반올림 | `cff1e56e`(반올림 모드 저장·복원 포함) | `set_rnd` 우회(O04, K1)와 S10 명세 | dev. S10 명세 삭제 | dev | `fbf075ab` |
+| `mlp_2layer` 가중치 | 상수 가중치 | 런타임 가중치(Pp09~11) | dev | dev | — |
+| IREE 서브모듈 | `cd1fa2a1e`(console tracing 시작 시각) | `54f0fb464`(3장치 커밋 8개) | 병합. 겹치는 파일 없음 | 합침 | fork `ebfa2a629` |
+
+#### 2. 추가된 부분: 3devices-f32에만 있던 것
+
+dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·`TEMP` 표식만 정리했다.
+
+| 영역 | 추가된 기능 | 위치 |
+|---|---|---|
+| 컴파일러: 버퍼 소유 | `AMDAIEResolveBufferOwner`: 여러 장치가 쓰는 버퍼의 `#hal.device.optimal` 후보 중 소유자 하나를 링크 표로 고름 | 플러그인 `Transforms/`, stream 단계 hook |
+| 컴파일러: 입력 장치 기록 | `AMDAIEAnnotateInputDevices`: 각 입력을 둘 장치를 reflection(`amdaie.input_devices`)에 기록. 툴링이 `--input_device` 없이 입력을 배치 | 플러그인 `Transforms/`, lit `annotate_input_devices.mlir` |
+| 컴파일러: 배치 실험 | `--iree-amdaie-placement-map`: dispatch 번호·이름 규칙으로 장치 지정, 배정 표를 stderr에 출력 | 플러그인, lit `assign_device_affinities_placement_map.mlir` |
+| 컴파일러: IREE | stream 단계 plugin hook(`PluginAPI`, `Pipelines.cpp`). `ElideAsyncCopies`가 링크 방향을 보고 transfer를 지울지 판정(S1) | fork |
+| 런타임: amdxdna | `export_buffer`(BO를 dma-buf fd로 내보냄), 할당 버퍼에 `placement.device` 기록, `EXPORTABLE` 호환성 | amdxdna driver, `allocator_test` |
+| 런타임: Vulkan | BRIDGE: dispatch·copy·fill·update가 다른 장치 버퍼를 만나면 기록 시점에 import(NPU BO는 dma-buf, CPU 버퍼는 host allocation). 다른 장치 semaphore는 host에서 기다리고 signal. external memory fd 확장 활성화, host-visible 메모리 영구 매핑 | fork `vulkan/` |
+| 런타임: HAL | heap 버퍼를 export할 때 DISCARD로 map하지 않음(debug build의 0xCD 덮어쓰기 방지) | fork `allocator_heap.c` |
+| 툴링 | `iree-run-module`이 입력을 장치별로 옮김(`--input_device` 또는 reflection), lead 장치 | fork `run_module.c`, `context_util.c` |
+| 테스트 | 3장치 회귀 26케이스(+ 통합 중 `fc_matvec_lv` 추가로 27) | `tests/regression/` |
+| 문서 | 명세 S1~S5, S7~S9, 이 장부 | `docs/specs/`, `docs/CHANGES.md` |
+
+#### 3. 통합 중에 생긴 문제와 처리
+
+두 브랜치를 합치거나 검증하면서 새로 드러난 것이다. 어느 브랜치에도 해결책이 없어서 새로 고쳤다.
+
+| 문제 | 원인 | 처리 | 커밋 |
+|---|---|---|---|
+| host만 있는 모듈의 lit 실패 | 3devices의 early return이 dev의 host-only 배정을 건너뜀 | early return 제거 | `4a798514` |
+| CPU + NPU + GPU에서 `PERMISSION_DENIED` (W20 플래그가 있어야 동작) | GPU가 쓴 버퍼를 다른 장치가 host map하는데 Vulkan 버퍼에 mapping usage가 없음 | host-visible + coherent 메모리에 `MAPPING \| MAPPING_PERSISTENT`. W20 플래그 제거 | fork `8122a888b` |
+| CPU와 GPU가 같이 쓰는 transient 버퍼: "transient buffer has not been committed" (W12) | GPU → CPU true라 CPU가 소유자가 될 수 있는데, BRIDGE는 기록 시점에 import하므로 아직 메모리가 없는 transient 버퍼를 못 가져옴 | GPU → CPU를 false로. 공유 버퍼는 GPU가 소유하고 어떤 lead로도 동작 | `e3d86485` |
+| lead 장치가 정해지지 않음 | 3devices는 `--device` 순서에 따라 lead가 바뀜 | CPU(`local-host`)를 첫 장치로 고정. lead이자 기본 장치. `--iree-amdaie-stack-size=2048`(W21)도 불필요해져 제거 | `50f8aaa9` |
+| GPU의 FC·matvec 결과가 정확히 2배 (W08) | SPIR-V `SubgroupReduce`가 subgroup 크기(32)를 실행 파일에 기록하지 않아 RADV가 64로 실행 | `KernelConfig.cpp`가 subgroup 크기를 넘김. 회귀 `fc_matvec_lv` 추가. FC도 GPU에 둘 수 있음 | fork `f1a30ce2c`, `fb26853c` |
+| GPU bf16 matmul 실패 | 미해결 | GPU는 f32만. `options.py`가 오류를 냄 | `d8e98aec` |
+| opaque-fd(dma-buf) import 메모리 누수 | import한 VkDeviceMemory와 NPU BO 참조를 해제하지 않음(20회 실행에 import 40 / 해제 0) | import 메모리를 소유하는 release, 실패 경로의 fd·메모리 정리 | fork `64d222702` |
+| BRIDGE dispatch의 원본 버퍼 수명 | import한 버퍼만 보관하고 원본(host 포인터 alias 대상)은 보관하지 않음 | 원본 binding도 resource set에 보관 | fork `a2b0dfd18` |
+| `TEMP` dispatch 메모리 타입(`base_buffer.c`) | heap 보고에만 쓰이고 할당에는 영향이 없음을 확인 | upstream으로 되돌림 | fork `b006be8fc` |
+| msync 검사 `#if 0` | 켜면 CPU 버퍼 import가 막혀 회귀 10건 실패(heap 할당이 anonymous mmap이라 msync가 성공) | 꺼 둔 채로 이유를 주석에 남김 | fork `b006be8fc` |
+
+### 장치 구성과 동작
+
+- **장치**: `scripts/onnx/options.py`의 `--devices`로 고른다. 이름은 `<driver>-<target>`이다: `local-host`(llvm-cpu, `target-cpu=host`), `amdxdna-npu4`, `vulkan-gfx1150`. 기본값은 `local-host,amdxdna-npu4`다.
+- **CPU는 필수이고 첫 장치다**: host 코드를 실행하는 장치이므로 lead(툴링이 입력을 할당하고 출력을 받는 장치)이자 기본 장치(`--iree-hal-default-device`)다. 첫 장치가 `local-host`가 아니면 `options.py`가 오류를 낸다.
+- **배정**(`AMDAIEAssignDeviceAffinities`): contraction/conv dispatch는 accelerator(amd-aie, vulkan-spirv)에 선언 순서대로 round-robin하고, 나머지는 첫 host에 둔다. `--iree-amdaie-placement-map`은 실험용 수단이고 기본값은 비어 있다. 모델별 맵은 커밋하지 않는다.
+- **버퍼 소유**(`AMDAIEResolveBufferOwner`): 링크 표(`AMDAIEDevicePlacementUtils.cpp` `linkFlags`)만으로 정한다. 공유 버퍼의 소유자 X는 다른 모든 사용자 Y에 대해 (Y→X) transparent일 때만 될 수 있다. lead는 소유를 정하지 않는다.
+
+| 링크 (src → dst, "src가 dst 메모리에 직접 접근") | 값 | 근거 |
+|---|---|---|
+| CPU → NPU | true | amdxdna BO는 host 메모리 |
+| NPU → CPU | false | amdxdna에 `import_buffer`가 없음 |
+| CPU → GPU | true | 이 장비(UMA)의 Vulkan dispatch 메모리는 host-visible. 외장 GPU라면 false로 바꿔야 함 |
+| GPU → CPU | false | BRIDGE가 기록 시점에 import하는데, queue 순서 할당(transient)은 그때 아직 메모리가 없음. 공유 버퍼는 GPU가 소유 |
+| GPU → NPU | true | amdxdna가 dma-buf를 export하고 Vulkan이 import |
+| NPU → GPU | false | amdxdna에 import가 없고 Vulkan은 export하지 않음 |
+
+- **수치 형식**: GPU는 f32만 쓴다(GPU에 `--numeric bf16`을 주면 `options.py`가 오류를 낸다, `# workaround:`). 기준값은 llvm-cpu f32다.
+- **빌드와 컨테이너**: `build/`(Vulkan driver + vulkan-spirv backend)와 `build-trace/`(Vulkan driver)를 켰다. dev·deploy 이미지에 Vulkan 런타임이 들어 있고, docker 스크립트가 render 노드와 그 gid를 넘긴다(`270fcda3`).
+- **회귀**: `tests/regression/`(v9, 27케이스). PASS = 컴파일 rc + 실행 rc + 기대값. 3장치 관련 변경 때만 ctest와 MLP/VGG e2e에 더해 돌린다.
+
+### 장부 ID별 처리
+
+위 내용을 0~6절의 장부 ID로 다시 묶은 표다.
+
+| 묶음 | 장부 ID | 통합 후 | 커밋 |
+|---|---|---|---|
+| `[T]`·`[DBG]`·`[BR]` 로그 | D1~D3, Pp·Pi 로그 덩어리, I32 | 제거. 이후 GPU 로그가 필요하면 dev의 `build-trace` 방식으로 넣는다 | `06aa6260`, fork `effaf17b4` |
+| 잔재 전역·include | D4, D5 | 제거 | fork `14973745c` |
+| 환경 변수 스위치 | D9, W30, W31·W32 | 제거(`CACHE_HWCTX`, `TEST_EXPORT`, `IREE_VULKAN_BR_DUMP`) | `06aa6260`, fork `effaf17b4` |
+| respect-marks | O02·O03·O06~O08·O10·O14의 해당 부분, N04, K3, S6 | 제거(옵션, lit, 명세) | `e7060e40` |
+| vulkan-spirv 역할 `TEMP` | D6(플러그인) | 정식 Accelerator | `e7060e40` |
+| dispatch 메모리 타입 `TEMP` | D6(vulkan `base_buffer.c`), Pi10 | upstream으로 복원. 실제 할당이 아니라 heap 보고에만 쓰여 없어도 회귀·VGG·MLP가 그대로임을 확인 | fork `b006be8fc` |
+| msync 검사 `#if 0` | D7, Pi30 | 유지하고 이유를 주석으로 남김. 켜면 CPU 버퍼를 GPU로 import하는 회귀 10건이 실패함 | fork `b006be8fc` |
+| 무조건 `MAPPING` | D8, Pi25 | 대체: host-visible + coherent 메모리에 `MAPPING \| MAPPING_PERSISTENT`(CPU dispatch는 scoped, 툴링·BRIDGE는 persistent로 map) | fork `8122a888b` |
+| GPU → CPU 링크, CPU↔GPU 동률 | O17, W12 | 링크를 false로 바꿔 동률을 없앰(공유 버퍼는 GPU 소유). 어떤 lead로도 동작 | `e3d86485` |
+| `--iree-hal-external-resources-mappable` | W20 | 불필요해져 제거 | `e3d86485` |
+| `--iree-amdaie-stack-size=2048` | W21 | 불필요(CPU lead에서 확인), 제거 | `50f8aaa9` |
+| FC(M=1)가 GPU에서 2배 | W08, W29 | 해결: SPIR-V `SubgroupReduce`가 subgroup 크기를 기록하지 않아 RADV가 64로 실행하던 것을 고침. 회귀 `fc_matvec_lv` 추가 | fork `f1a30ce2c`, `fb26853c` |
+| 배정 맵 | W01~W06, W09, W10, K2 | 맵은 커밋하지 않음(기본은 round-robin, 맵은 실험 도구) | — |
+| NPU f32 우회 | W07, W22, W23, W27 | dev 수정으로 대체: f32 pad `b492865a`, DMA 반복 `990bcab2`. W23의 N=1000·N-split f32는 VGG f32 e2e(corr 1.0)로 확인 | — |
+| `-unroll-threshold=0` | W13 | dev의 `-unroll-full-max-count=0`(`XCLBinGen.cpp`) | — |
+| ukernel `set_rnd` | O04, K1, S10 | dev `cff1e56e`(반올림 모드 저장·복원 포함). S10 명세 삭제 | `fbf075ab` |
+| `mlp_2layer` 런타임 가중치 | Pp09~11 | dev 버전(상수 가중치) 유지 | — |
+| 회귀 | N09의 `docs/regression/`, W28, D2·D3의 판정 의존 | `tests/regression/`(v9)로 이동. 로그 판정·지표 열·stream 컴파일 지표 제거, `IREE_BUILD=/workspace/build`, 출력 `build/regression/` | `a3b2c714`, `f8fca56e` |
+| host-only early return | (3devices `3853fbfa` 계열) | 제거(host만 있는 모듈도 다시 배정) | `4a798514` |
+| 실험 모델 | `models/chain_nn`, `models/mlp_parallel`, N07 | 삭제(chain2는 회귀 모델과 같음) | `3f677c95` |
+| `.gitignore` 개인 항목 | — | 컨테이너 HOME 파일만 루트 기준으로 남김 | `5e2cca69` |
+
+유지한 것: D10(placement-map stderr 표, 플래그를 줄 때만), D11(`EXPERIMENT` 표식), W11·K4(`accelIdx = 0`, round-robin 시작점), W14~W17(VGG 레시피 플래그, `options.py`), W19(회귀 수동 모드), amdxdna export·`placement.device`·allocator_test(O18~O24, S2), `AMDAIEAnnotateInputDevices`와 입력 자동 배치(S5), `AMDAIEResolveBufferOwner`와 stream hook(S8), `ElideAsyncCopies` 양방향 판정(S1), Vulkan BRIDGE와 영구 매핑(S3·S4·S9).
+
+### 검증 (S8-3, repo `d0c9960e` / fork `32dad7667`)
+
+- ctest amd-aie 223/223, SPIR-V lit(`ctest -R SPIRV`) 65/65, 회귀 27/27(수동·자동) 2회.
+- CPU+NPU: MLP·VGG의 bf16(ukernel all), f32(all), f32(none) 출력과 CPU-only 기준값이 dev(`45c18ae7`)와 바이트 단위로 같다. VGG bf16 배정은 92 dispatch(npu 23 / cpu 69)이고 dispatch별 장치까지 같다. VGG bf16 실행 2.13 s.
+- GPU 조합(f32): CPU+GPU MLP 0.03 s / VGG 0.37 s, CPU+NPU+GPU MLP 0.14 s / VGG 14.19 s, CPU+GPU+NPU VGG 14.16 s. 모두 corr 1.0, VGG top-1 일치.
+- 오류 확인: GPU + bf16, CPU가 첫 장치가 아닌 경우 모두 rc 1.
+
+### 알려진 제한
+
+| 항목 | 내용 |
+|---|---|
+| W11 | NPU 3입력 dispatch의 `no producer DMA channel available`. 원인 미규명, round-robin 순서로 피하고 있음 |
+| GPU bf16 | GPU bf16 matmul이 실패해 GPU는 f32만 씀 |
+| `--verbose` GPU 시간 | GPU dispatch 시간은 따로 잡히지 않고 host 시간에 들어감 |
+| 링크 표 전제 | CPU → GPU true는 host-visible dispatch 메모리(UMA) 전제. GPU → CPU는 BRIDGE가 실행 시점에 import하게 되면 true로 되돌릴 수 있음 |
+| semaphore BRIDGE | 외부 signal semaphore는 submit당 16개까지(넘으면 버림), fence 실패 시 외부 semaphore를 fail 처리하지 않음 |
+| dispatch BRIDGE | binding이 9개 이상이면 BRIDGE 없이 오류(의도) |
+| opaque-fd import | `external_memory_dma_buf`가 없으면 OPAQUE_FD 형식으로 질의(spec 위반, 이 장비는 dma_buf 있음) |
+| 툴링 device group | 전역 device group을 release하지 않음(프로세스당 한 번) |
+| amdxdna `export_buffer` | 입력 버퍼가 amdxdna 버퍼인지 검사하지 않음 |
+| `ElideAsyncCopies` | 양쪽 방향 중 하나라도 transparent면 transfer를 지움(S1). upstream 동작과 다름 |
+
+### 남은 일
+
+- SPIR-V subgroup 크기 수정(`f1a30ce2c`)을 upstream(iree-org/iree)에 PR로 보내고, 반영되면 fork 커밋을 뺀다. `ElideAsyncCopies` 변경(S1)도 같은 메모에 적는다.
+- 미룬 것: 날짜별 문서 재배치, hwctx 재사용 최적화, `--verbose`의 GPU 시간, 장치별 수치 형식, GPU bf16.
 
 ## 0. 기준
 
@@ -111,12 +261,12 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | N01 | `compiler/…/Transforms/AMDAIEAnnotateInputDevices.cpp` | 우리, 9/29 세션2 챕터02 | 입력 장치 reflection 기록 패스 | 9/29 세션1 챕터04(설계), 세션2 챕터02(구현) | S5 |
 | N02 | `compiler/…/Transforms/AMDAIEResolveBufferOwner.cpp` | **전임자**(9/28 기준선 사본과 바이트 동일, 확인함 `cmp`) | 소유자 결정 패스 | `docs/2026-09-28/01_인수인계_코드현황_파악/README.md` 3-2, `03_소유자결정_topology_검증보강/` | S8 |
 | N03 | `compiler/…/Transforms/test/annotate_input_devices.mlir` | 우리, 9/29 | lit | 9/29 세션2 챕터02 | S5 |
-| N04 | `compiler/…/Transforms/test/assign_device_affinities_respect_marks.mlir` | 우리, 10/1 | lit | 10/1 세션2 챕터02 | S6 |
+| N04 | `compiler/…/Transforms/test/assign_device_affinities_respect_marks.mlir` | 우리, 10/1 | lit | 10/1 세션2 챕터02 | S6 → 삭제(`e7060e40`) |
 | N05 | `compiler/…/Transforms/test/assign_device_affinities_placement_map.mlir` | 우리, 10/2 | lit | 10/2 세션2 챕터02 | S7 |
 | N06 | `scripts/lock/{check-containers,host-load,lock-common,status,with-npu-lock}.sh` | **팀**(`origin/bert-onnx` 커밋 `49514d9c` 계열에서 `git show`로 꺼냄, 9/29) | 공용 NPU·빌드 잠금 | `docs/2026-09-29/3_VGG16_2장치재현_3장치/03_…`, CLAUDE.md 0 "공용 잠금" | 커밋 대상 아님(팀 브랜치에 이미 있음) |
-| N07 | `models/mlp_parallel/debug_out/` (12페이즈 덤프 + vmfb, 9/1) | 전임자 임시 산출물 | 디버그 덤프 | 9/28 01 3-1 | 커밋 제외 |
+| N07 | `models/mlp_parallel/debug_out/` (12페이즈 덤프 + vmfb, 9/1) | 전임자 임시 산출물 | 디버그 덤프 | 9/28 01 3-1 | 커밋 제외 → 폴더째 삭제(`3f677c95`) |
 | N08 | `third_party/iree/runtime/src/iree/hal/drivers/vulkan/{access,, memory_type,, memory_types.dispatch_idx, type, type,, usage,}` (0바이트 6개, 8/27 21:04) | **출처 불명**(전임자 시기). 이름이 C 코드 조각이라 셸 리다이렉트 실수로 생긴 파일로 **추정** | 없음 | 9/28 01 `untracked_files.txt` | 커밋 제외 |
-| N09 | `docs/` 아래 날짜 폴더(9/28~10/20), `docs/regression/`, `docs/CHANGES.md` | 우리 | 작업 문서·회귀 스크립트 | — | 커밋 여부는 챕터 04 결정 |
+| N09 | `docs/` 아래 날짜 폴더(9/28~10/20), `docs/regression/`, `docs/CHANGES.md` | 우리 | 작업 문서·회귀 스크립트 | — | 커밋 여부는 챕터 04 결정 → 회귀는 `tests/regression/`(`a3b2c714`), 날짜 폴더는 커밋 안 함 |
 
 ## 3. 전임자 변경 — 덩어리별 (HEAD → 9/28 기준선)
 
@@ -258,17 +408,17 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 | 묶음 | 위치 | 출처 | 기본 동작 | 의존하는 곳 | 비고 |
 |---|---|---|---|---|---|
-| D1 `[T]` 타이밍 로그 30줄 | amdxdna `allocator.cc`, `buffer.cc`, `device.cc`, `direct_command_buffer.cc`, `native_linux_kmq.cc` | 전임자 | 항상 stderr | 없음(확인함: 회귀 스크립트 grep 0) | 9/28 01 3-4 B |
-| D2 `[DBG]` 로그 21줄 | amdxdna 위 파일들, IREE `buffer.c`, `command_buffer_validation.c`, vulkan `base_buffer.c`·`native_buffer.cc`·`native_semaphore.cc`·`vulkan_device.cc`, `modules/hal/module.c`, `tooling/function_util.c` | 전임자 | 항상 stderr | **회귀 스크립트가 `module.c`의 `[DBG] alloc_select` 로그로 lead 선택을 판정**(`docs/regression/run_regression.sh:154`) | 지우면 회귀 판정이 깨진다 |
-| D3 `[BR]` 로그 19줄 | vulkan `direct_command_buffer.cc`(BRIDGE import 결과 5, dispatch 바인딩 4), `direct_command_queue.cc` 3, `completion_watcher.cc` 1, `native_allocator.cc` 1(+주석 1), amdxdna `direct_command_buffer.cc` 1, `run_module.c` 2 | 전임자 15 + 우리 4(I07의 3줄은 전임자 로그를 옮긴 것, I16 1줄, I31 1줄, I32는 전임자 줄 수정) | 항상 stderr. dispatch 바인딩 값 덤프(map)는 `IREE_VULKAN_BR_DUMP=1`일 때만(I15) | 회귀 스크립트가 `[BR] input[i]`(placed 열, `:174`)와 `[BR] amdxdna copy`(xdna_copy 지표, `:283`)를 읽음 | 지우면 회귀 지표가 깨진다 |
-| D4 `g_last_bindings[8]` 전역 | vulkan `direct_command_buffer.cc`, `direct_command_queue.cc` extern | 전임자 | 쓰기만, 읽는 곳 없음(9/28 확인), 스레드 안전 아님 | 없음 | 잔재 |
-| D5 `#include <execinfo.h>` | vulkan `native_allocator.cc:1` | 전임자 | 쓰는 곳 없음 | 없음 | 잔재 |
-| D6 `TEMP: experiment` | 플러그인 `AMDAIEDevicePlacementUtils.cpp:24`(vulkan-spirv → Accelerator, **HEAD에 이미 커밋됨**), vulkan `base_buffer.c:140`(HOST_VISIBLE 우선) | 전임자 | **동작** | GPU 배정 전제, CPU→GPU HOST_VISIBLE 표의 전제 | 9/28 01 3-4 A |
-| D7 `#if 0 &&` msync 검사 끔 | vulkan `native_allocator.cc:666` | 전임자 | **동작**(host ptr import 전 검사 생략) | GPU→CPU host ptr import | 9/28 01 3-5 부채 |
-| D8 무조건 `MAPPING` | vulkan `native_allocator.cc:203-207` | 전임자 | **동작** | CPU가 GPU 버퍼를 host-map | UMA 전제, 외장 GPU에선 성립 안 함 |
-| D9 환경 변수 스위치 | `IREE_AMDXDNA_TEST_EXPORT`(allocator.cc:168, 테스트 훅), `IREE_AMDXDNA_CACHE_HWCTX`(direct_command_buffer.cc:1008, hwctx 캐시 opt-in), `IREE_VULKAN_BR_DUMP`(vulkan direct_command_buffer.cc:1046, 우리) | 전임자 2 + 우리 1 | 기본 꺼짐 | 없음 | — |
-| D10 `[amdaie placement-map]` stderr 요약 | `AMDAIEAssignDeviceAffinities.cpp:558-566` | 우리(10/2) | **`--iree-amdaie-placement-map`을 줄 때만** | 실험 기록 | 실험 옵션의 출력이라 디버그로 분류하지 않음(챕터 04에서 판단) |
-| D11 `EXPERIMENT` 표식 5곳 | `run_module.c`(`--input_device`), `context_util.c/.h`(device group 전역) | 전임자 | **동작** | 회귀 수동 모드, 입력 자동 배치(S5) | 9/28 01 3-4 A |
+| D1 `[T]` 타이밍 로그 30줄 | amdxdna `allocator.cc`, `buffer.cc`, `device.cc`, `direct_command_buffer.cc`, `native_linux_kmq.cc` | 전임자 | 항상 stderr | 없음(확인함: 회귀 스크립트 grep 0) | 9/28 01 3-4 B **통합 후**: 제거(`06aa6260`) |
+| D2 `[DBG]` 로그 21줄 | amdxdna 위 파일들, IREE `buffer.c`, `command_buffer_validation.c`, vulkan `base_buffer.c`·`native_buffer.cc`·`native_semaphore.cc`·`vulkan_device.cc`, `modules/hal/module.c`, `tooling/function_util.c` | 전임자 | 항상 stderr | **회귀 스크립트가 `module.c`의 `[DBG] alloc_select` 로그로 lead 선택을 판정**(`docs/regression/run_regression.sh:154`) | 지우면 회귀 판정이 깨진다 **통합 후**: 제거(`06aa6260`, fork `effaf17b4`). 회귀는 이제 로그를 읽지 않음 |
+| D3 `[BR]` 로그 19줄 | vulkan `direct_command_buffer.cc`(BRIDGE import 결과 5, dispatch 바인딩 4), `direct_command_queue.cc` 3, `completion_watcher.cc` 1, `native_allocator.cc` 1(+주석 1), amdxdna `direct_command_buffer.cc` 1, `run_module.c` 2 | 전임자 15 + 우리 4(I07의 3줄은 전임자 로그를 옮긴 것, I16 1줄, I31 1줄, I32는 전임자 줄 수정) | 항상 stderr. dispatch 바인딩 값 덤프(map)는 `IREE_VULKAN_BR_DUMP=1`일 때만(I15) | 회귀 스크립트가 `[BR] input[i]`(placed 열, `:174`)와 `[BR] amdxdna copy`(xdna_copy 지표, `:283`)를 읽음 | 지우면 회귀 지표가 깨진다 **통합 후**: 제거(fork `effaf17b4`). 회귀는 이제 로그를 읽지 않음 |
+| D4 `g_last_bindings[8]` 전역 | vulkan `direct_command_buffer.cc`, `direct_command_queue.cc` extern | 전임자 | 쓰기만, 읽는 곳 없음(9/28 확인), 스레드 안전 아님 | 없음 | 잔재 **통합 후**: 제거(fork `14973745c`) |
+| D5 `#include <execinfo.h>` | vulkan `native_allocator.cc:1` | 전임자 | 쓰는 곳 없음 | 없음 | 잔재 **통합 후**: 제거(fork `14973745c`) |
+| D6 `TEMP: experiment` | 플러그인 `AMDAIEDevicePlacementUtils.cpp:24`(vulkan-spirv → Accelerator, **HEAD에 이미 커밋됨**), vulkan `base_buffer.c:140`(HOST_VISIBLE 우선) | 전임자 | **동작** | GPU 배정 전제, CPU→GPU HOST_VISIBLE 표의 전제 | 9/28 01 3-4 A **통합 후**: 플러그인은 정식 Accelerator(`e7060e40`), `base_buffer.c`는 upstream 복원(fork `b006be8fc`) |
+| D7 `#if 0 &&` msync 검사 끔 | vulkan `native_allocator.cc:666` | 전임자 | **동작**(host ptr import 전 검사 생략) | GPU→CPU host ptr import | 9/28 01 3-5 부채 **통합 후**: 유지 + 이유 주석(fork `b006be8fc`) |
+| D8 무조건 `MAPPING` | vulkan `native_allocator.cc:203-207` | 전임자 | **동작** | CPU가 GPU 버퍼를 host-map | UMA 전제, 외장 GPU에선 성립 안 함 **통합 후**: 대체: `MAPPING \| MAPPING_PERSISTENT`(fork `8122a888b`) |
+| D9 환경 변수 스위치 | `IREE_AMDXDNA_TEST_EXPORT`(allocator.cc:168, 테스트 훅), `IREE_AMDXDNA_CACHE_HWCTX`(direct_command_buffer.cc:1008, hwctx 캐시 opt-in), `IREE_VULKAN_BR_DUMP`(vulkan direct_command_buffer.cc:1046, 우리) | 전임자 2 + 우리 1 | 기본 꺼짐 | 없음 | — **통합 후**: 제거(`06aa6260`, fork `effaf17b4`) |
+| D10 `[amdaie placement-map]` stderr 요약 | `AMDAIEAssignDeviceAffinities.cpp:558-566` | 우리(10/2) | **`--iree-amdaie-placement-map`을 줄 때만** | 실험 기록 | 실험 옵션의 출력이라 디버그로 분류하지 않음(챕터 04에서 판단) **통합 후**: 유지 |
+| D11 `EXPERIMENT` 표식 5곳 | `run_module.c`(`--input_device`), `context_util.c/.h`(device group 전역) | 전임자 | **동작** | 회귀 수동 모드, 입력 자동 배치(S5) | 9/28 01 3-4 A **통합 후**: 유지 |
 
 ## 5. 코드가 아닌 우회 (배정 맵, 플래그, IR 편집, 설정 주입, 배정으로 피하기)
 
@@ -276,40 +426,41 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 | ID | 우회 | 종류 | 피하는 것 | 원인 규명 | 없앨 계획 | 상태 | CLAUDE.md(1-3·3-2) |
 |---|---|---|---|---|---|---|---|
-| W01 | 맵 NPU1/GPU15/CPU43 (`docs/2026-10-02/2_…/03_…/*.map`) | 맵 | NPU f32 코드젠 실패 | 표면만 | 3-2 없앨 계획 1~3 | 안 씀(FC GPU 2배) | L305, L311-313 |
-| W02 | 맵 t4 1/12/46 (`docs/2026-10-02/3_…/01b_…/map_t4_fc_cpu.txt`) | 맵 | NPU f32 실패 + GPU M=1 2배 | GPU 쪽 규명 | 3-2 L311-313, L325 | 데모 | L321, L325 |
-| W03 | 맵 NPU10/GPU3 | 맵 | — | — | — | 안 씀(실행 실패) | L321 |
-| W04 | **맵 NPU9/GPU4/CPU46** (`docs/2026-10-18/2_…/02c_…/…npu9_gpu4.map`) | 맵 | d6 반복 392, conv5 ②, FC ③, GPU 2배 | 반복 392 이유는 규명, **멈춤 기전 미확인**, ②③ 설계 수준 미규명 | L311·L312, L325 | **씀**(10/20 세마포어 시험, 커밋 후 시험 목록) | L152, L154, L321 |
-| W05·W06 | 맵 NPU13·NPU16 (`docs/2026-10-18/4_…/03_…/*.map`) | 맵 | 편집 IR(W22·W23)용 | W22와 같음 | L311-313 | 데모 | L321 |
-| W07 | NPU가 f32로 못 하는 dispatch를 배정으로 피함 | 배정 | ①②③ + DMA 반복 | 표면만 → **챕터 03** | L311-313 | 씀 | L143, L275, L154 |
-| W08 | FC(M=1)를 GPU에 안 보냄 | 배정 | SPIR-V SubgroupReduce subgroup 크기 미기록 | **규명** | L325(서브모듈 수정, 일정 미정) | 씀 | L325 |
-| W09 | d6(conv1_2)를 GPU로 | 배정 | 제어 코드 반복 392 > 256 | 392 이유 규명, 멈춤 기전 미확인 | L312 | 씀 | L147, L152 |
-| W10 | 반복 ≤ 256 규칙 | 배정(규칙) | 256 초과 펼침 멈춤 | **미확인**(fc6 782 반례) | L312, L152 "추가 조사" | 씀 | L152, L321 |
-| W11 | NPU 3입력 dispatch를 라운드로빈 순서로 피함(전임자) | 배정 | `no producer DMA channel available` | **미규명** | **없음**("고치려 하지 말 것") | **기본**(회귀 기준선) | L244, L296 |
-| W12 | lead 기본값(0) 유지 → CPU↔GPU 동률은 GPU 소유 | 런타임 선택 | BRIDGE 기록 시점 transient export | 코드 경로 규명 | **없음**(수정 방향만) | **기본** | L324, L151 질문 3 |
-| W13 | `-unroll-threshold=0` | 플래그 | ① soft-float 펼침 코드 16 KB 초과 | 규명 | L313(벡터화 후 뺌) | 씀 | L146, L314-319 |
+| W01 | 맵 NPU1/GPU15/CPU43 (`docs/2026-10-02/2_…/03_…/*.map`) | 맵 | NPU f32 코드젠 실패 | 표면만 | 3-2 없앨 계획 1~3 | 안 씀(FC GPU 2배) → 통합 후: 커밋 안 함(맵은 실험 도구) | L305, L311-313 |
+| W02 | 맵 t4 1/12/46 (`docs/2026-10-02/3_…/01b_…/map_t4_fc_cpu.txt`) | 맵 | NPU f32 실패 + GPU M=1 2배 | GPU 쪽 규명 | 3-2 L311-313, L325 | 데모 → 통합 후: 커밋 안 함 | L321, L325 |
+| W03 | 맵 NPU10/GPU3 | 맵 | — | — | — | 안 씀(실행 실패) → 통합 후: 커밋 안 함 | L321 |
+| W04 | **맵 NPU9/GPU4/CPU46** (`docs/2026-10-18/2_…/02c_…/…npu9_gpu4.map`) | 맵 | d6 반복 392, conv5 ②, FC ③, GPU 2배 | 반복 392 이유는 규명, **멈춤 기전 미확인**, ②③ 설계 수준 미규명 | L311·L312, L325 | **씀**(10/20 세마포어 시험, 커밋 후 시험 목록) → 통합 후: 커밋 안 함 | L152, L154, L321 |
+| W05·W06 | 맵 NPU13·NPU16 (`docs/2026-10-18/4_…/03_…/*.map`) | 맵 | 편집 IR(W22·W23)용 | W22와 같음 | L311-313 | 데모 → 통합 후: 커밋 안 함 | L321 |
+| W07 | NPU가 f32로 못 하는 dispatch를 배정으로 피함 | 배정 | ①②③ + DMA 반복 | 표면만 → **챕터 03** | L311-313 | 씀 → 통합 후: dev 수정으로 대체(`b492865a`, `990bcab2`) | L143, L275, L154 |
+| W08 | FC(M=1)를 GPU에 안 보냄 | 배정 | SPIR-V SubgroupReduce subgroup 크기 미기록 | **규명** | L325(서브모듈 수정, 일정 미정) | 씀 → 통합 후: **해결**(fork `f1a30ce2c`) | L325 |
+| W09 | d6(conv1_2)를 GPU로 | 배정 | 제어 코드 반복 392 > 256 | 392 이유 규명, 멈춤 기전 미확인 | L312 | 씀 → 통합 후: 커밋 안 함 | L147, L152 |
+| W10 | 반복 ≤ 256 규칙 | 배정(규칙) | 256 초과 펼침 멈춤 | **미확인**(fc6 782 반례) | L312, L152 "추가 조사" | 씀 → 통합 후: 커밋 안 함 | L152, L321 |
+| W11 | NPU 3입력 dispatch를 라운드로빈 순서로 피함(전임자) | 배정 | `no producer DMA channel available` | **미규명** | **없음**("고치려 하지 말 것") | **기본**(회귀 기준선) → 통합 후: 유지(원인 미규명) | L244, L296 |
+| W12 | lead 기본값(0) 유지 → CPU↔GPU 동률은 GPU 소유 | 런타임 선택 | BRIDGE 기록 시점 transient export | 코드 경로 규명 | **없음**(수정 방향만) | **기본** → 통합 후: **해결**(GPU→CPU false, `e3d86485`) | L324, L151 질문 3 |
+| W13 | `-unroll-threshold=0` | 플래그 | ① soft-float 펼침 코드 16 KB 초과 | 규명 | L313(벡터화 후 뺌) | 씀 → 통합 후: dev `-unroll-full-max-count=0`으로 대체 | L146, L314-319 |
 | W14 | dedup off | 플래그 | 정적 offset만 지원하는 `address_patch` | 규명 | **없음**(팀 백엔드 제약) | 씀(VGG) | L298 |
 | W15 | no-fuse-into-contraction | 플래그 | 융합 contraction tile 불가(팀 기록) | 팀 기록뿐 | **없음** | 씀(VGG) | L298 |
 | W16 | vectorization off | 플래그 | aievec bf16/f32 미지원 | 규명(10/19 세션1) | **명시 없음**(벡터화 작업 연계 추정) | 씀(VGG) | L298 |
 | W17 | im2col·channels-last·detach | 플래그(레시피) | NPU conv 경로 | 팀 기록 | 없음(레시피) | 씀(VGG) | L298 |
 | W18 | `--device_lead_allocator=2` | 플래그 | Vulkan map SIGSEGV | 근본 수정됨 | — | 안 씀 | L324 |
 | W19 | `--input_device` 수동 | 플래그 | 자동 배치 전 수단 | — | 없음(비교용) | **기본**(회귀 수동 모드) | L70 |
-| W20 | `--iree-hal-external-resources-mappable=true` | 플래그(F3) | **docs에 이유 없음** | **미규명** | 없음 | **기본** | L57-65 |
-| W21 | `--iree-amdaie-stack-size=2048` | 플래그(F3) | stack 부족(일반론) | 3장치 필요성 미확인 | 없음 | **기본** | L57-65 |
-| W22 | conv5 M 196→224 패딩 IR 편집 | IR 편집 | ② 팀 pad가 f32 건너뜀 | 표면만 → **챕터 03** | L311(1) | 데모(vmfb만) | L145, L154 |
-| W23 | FC M 1→32 `linalg.generic` 패딩, fc6 N 512×8 분할, fc8 N 1000→1024 | IR 편집 | ③ M=1 pack, N 1000 `ConvertToDma` 실패, 팀 N-split f32 건너뜀 | 표면만 | L311(1) | 데모 | L145, L154 |
+| W20 | `--iree-hal-external-resources-mappable=true` | 플래그(F3) | **docs에 이유 없음** | **미규명** | 없음 | **기본** → 통합 후: **제거**(불필요, `e3d86485`) | L57-65 |
+| W21 | `--iree-amdaie-stack-size=2048` | 플래그(F3) | stack 부족(일반론) | 3장치 필요성 미확인 | 없음 | **기본** → 통합 후: **제거**(불필요, `50f8aaa9`) | L57-65 |
+| W22 | conv5 M 196→224 패딩 IR 편집 | IR 편집 | ② 팀 pad가 f32 건너뜀 | 표면만 → **챕터 03** | L311(1) | 데모(vmfb만) → 통합 후: dev 수정으로 대체(`b492865a`) | L145, L154 |
+| W23 | FC M 1→32 `linalg.generic` 패딩, fc6 N 512×8 분할, fc8 N 1000→1024 | IR 편집 | ③ M=1 pack, N 1000 `ConvertToDma` 실패, 팀 N-split f32 건너뜀 | 표면만 | L311(1) | 데모 → 통합 후: dev 수정으로 대체, VGG f32 e2e로 확인 | L145, L154 |
 | W24 | FC 패딩 v1(`tensor.pad`) | IR 편집 | — | 0 splat CSE 실패(규명) | — | 폐기 | — |
 | W25·W26 | 단독 손 패딩 모델 8개, conv1_2 M 2분할 | IR 편집 | 검증용 | — | — | 안 씀 | L321 |
-| W27 | conv1_2 1단계 타일 M 256 executable 치환(`--iree-hal-substitute-executable-source`) | 설정 주입 | 반복 392 | 392 이유 규명, 멈춤 미확인 | L312(타일 ≤ 256) | 데모 | L147, L152 |
-| W28 | `REG_OUT=/home/mkchoi/iree-work/regression/…` | 환경 변수 | `REG_ROOT` 기본 `/tmp` | 규명 | 제안만(미승인) | **기본** | L55 |
-| W29 | `RADV_PERFTEST=cswave32` | 환경 변수 | GPU 2배 | 효과 없음 | — | 안 씀 | L325 |
-| W30 | `IREE_VULKAN_BR_DUMP=1` | 환경 변수(우리 코드) | 디버그 map 충돌 | 근본 수정됨 | 챕터 04 "빼야 할 것" | 기본 꺼짐 | L250, L323 |
-| W31·W32 | `IREE_AMDXDNA_CACHE_HWCTX`, `IREE_AMDXDNA_TEST_EXPORT` | 환경 변수(전임자) | hwctx 캐시 opt-in, export 테스트 | 전임자 주석뿐 | 없음 | 안 씀 | — |
+| W27 | conv1_2 1단계 타일 M 256 executable 치환(`--iree-hal-substitute-executable-source`) | 설정 주입 | 반복 392 | 392 이유 규명, 멈춤 미확인 | L312(타일 ≤ 256) | 데모 → 통합 후: dev 수정으로 대체(`990bcab2`) | L147, L152 |
+| W28 | `REG_OUT=/home/mkchoi/iree-work/regression/…` | 환경 변수 | `REG_ROOT` 기본 `/tmp` | 규명 | 제안만(미승인) | **기본** → 통합 후: `REG_ROOT` 기본 `build/regression`으로 대체(`a3b2c714`) | L55 |
+| W29 | `RADV_PERFTEST=cswave32` | 환경 변수 | GPU 2배 | 효과 없음 | — | 안 씀 → 통합 후: 안 씀(W08 해결) | L325 |
+| W30 | `IREE_VULKAN_BR_DUMP=1` | 환경 변수(우리 코드) | 디버그 map 충돌 | 근본 수정됨 | 챕터 04 "빼야 할 것" | 기본 꺼짐 → 통합 후: **제거**(fork `effaf17b4`) | L250, L323 |
+| W31·W32 | `IREE_AMDXDNA_CACHE_HWCTX`, `IREE_AMDXDNA_TEST_EXPORT` | 환경 변수(전임자) | hwctx 캐시 opt-in, export 테스트 | 전임자 주석뿐 | 없음 | 안 씀 → 통합 후: **제거**(`06aa6260`) | — |
 
-코드이지만 우회 수단인 것: K1 ukernel `set_rnd`(O04, 팀 반영 전, 규민 상의), K2 `--iree-amdaie-placement-map`(W01~W06의 통로, S7), K3 `--iree-amdaie-respect-affinity-marks`(디버그, S6), K4 `accelIdx = 0`(전임자, W11의 바탕).
+코드이지만 우회 수단인 것: K1 ukernel `set_rnd`(O04, 팀 반영 전, 규민 상의), K2 `--iree-amdaie-placement-map`(W01~W06의 통로, S7), K3 `--iree-amdaie-respect-affinity-marks`(디버그, S6), K4 `accelIdx = 0`(전임자, W11의 바탕). **통합 후**: K1은 dev `cff1e56e`, K2는 실험 옵션으로 유지, K3는 삭제(`e7060e40`), K4는 유지(round-robin 시작점).
 
 - **원인 미규명 우회**: W10(DMA 멈춤 기전) / W07·W22·W23(f32 패딩 설계 수준·배수 → 챕터 03에서 조사) / W23의 N 1000 실패 / W11 NPU 3입력 / W20 mappable / W21 stack-size / W15 no-fuse
 - **없앨 계획이 없는 우회**: W11, W12, W14, W15, W16, W17, W19, W20, W21, W31·W32, K4
+- **통합 후**: 위 두 목록에서 W08·W12는 해결, W20·W21·W31·W32는 제거, W07·W22·W23은 dev 수정으로 대체됐다. 남은 원인 미규명 우회는 W10(맵을 안 쓰므로 지금은 해당 없음), W11, W15다.
 
 ## 6. 커밋 계획 대응 (2026-10-20 세션 1 챕터 04, 승인 대기)
 
@@ -324,7 +475,7 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | K07 S6 / K09 S7 | O01b~O03, O06~O08, O10, O13, O14, N04 / O05~O09, N05 |
 | K08 S8 주석 | O17 |
 | K10 / K11 S4 | I15, I16 / I18, I19, I21~I24 |
-| K12 S10(보류 추천) | O04 |
+| K12 S10(보류 추천) | O04 → dev `cff1e56e`로 대체, S10 삭제 |
 | 제외 | N06(lock 스크립트), N07(덤프), N08(빈 파일 6개), Pp09~11(모델, 추천), Pi25(U3, 추천) |
 
 ## 7. 갱신 이력
@@ -333,3 +484,4 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 |---|---|---|
 | 2026-10-20 | 세션 1 챕터 01 | 첫 판(9/28 기준선 대비 우리 56덩어리, 전임자 108덩어리, 새 파일 9묶음, 디버그 11묶음, 우회 목록) |
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |
+| 2026-10-25 | dev 통합 S9 | "dev 통합 후 상태" 절 추가, 명세 경로를 `docs/specs/`로, 4·5·6절 상태 칸과 N04·N07·N09에 통합 결과를 덧붙임 |
