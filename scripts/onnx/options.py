@@ -2,7 +2,7 @@
 
 DEVICES holds, per device, the `compile` flags (iree-compile) that declare it
 and the `run` flags (iree-run-module) that open it; `{symbol}` is filled with
-the device symbol (the name with '-' as '_'). A model is placed on the devices
+the device symbol (`d<index>_` + the name with '-' as '_'). A model is placed on the devices
 picked with --devices, in that order. The CPU (local-host) comes first: it
 runs the host code and is the default (lead) device; the accelerators after it
 take contraction/conv dispatches round-robin in the listed order.
@@ -132,18 +132,21 @@ def check(selected, devices):
     return None
 
 
-def device_symbol(device):
-    return device.replace("-", "_")
+def device_symbol(index, device):
+    # iree-compile orders named devices by symbol name, and the placement
+    # round-robin follows that order, so the index prefix keeps it equal to the
+    # --devices order (a single digit: at most 10 devices).
+    return f"d{index}_" + device.replace("-", "_")
 
 
 def compile_flags(selected, devices):
     """Returns the iree-compile flags for `selected` ({option name: choice})
     on `devices` (names in DEVICES; the first is the default device)."""
     flags = []
-    for device in devices:
-        flags += [f.format(symbol=device_symbol(device))
+    for index, device in enumerate(devices):
+        flags += [f.format(symbol=device_symbol(index, device))
                   for f in DEVICES[device]["compile"]]
-    flags.append(f"--iree-hal-default-device={device_symbol(devices[0])}")
+    flags.append(f"--iree-hal-default-device={device_symbol(0, devices[0])}")
     for group in OPTIONS.values():
         for name, value in group.items():
             flags += value if name == "flags" else value[selected[name]]

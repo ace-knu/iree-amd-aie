@@ -71,6 +71,7 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 | CPU + NPU + GPU에서 `PERMISSION_DENIED` (W20 플래그가 있어야 동작) | GPU가 쓴 버퍼를 다른 장치가 host map하는데 Vulkan 버퍼에 mapping usage가 없음 | host-visible + coherent 메모리에 `MAPPING \| MAPPING_PERSISTENT`. W20 플래그 제거 | fork `8122a888b` |
 | CPU와 GPU가 같이 쓰는 transient 버퍼: "transient buffer has not been committed" (W12) | GPU → CPU true라 CPU가 소유자가 될 수 있는데, BRIDGE는 기록 시점에 import하므로 아직 메모리가 없는 transient 버퍼를 못 가져옴 | GPU → CPU를 false로. 공유 버퍼는 GPU가 소유하고 어떤 lead로도 동작 | `e3d86485` |
 | lead 장치가 정해지지 않음 | 3devices는 `--device` 순서에 따라 lead가 바뀜 | CPU(`local-host`)를 첫 장치로 고정. lead이자 기본 장치. `--iree-amdaie-stack-size=2048`(W21)도 불필요해져 제거 | `50f8aaa9` |
+| `--devices`의 accelerator 순서가 무시됨 | iree-compile은 이름 붙인 장치(`name=driver`)를 `DictionaryAttr`에 넣어 이름순으로 정렬하므로, round-robin이 늘 `amdxdna_npu4`부터 시작함(CPU+NPU+GPU와 CPU+GPU+NPU의 IR이 같았음) | `options.py`가 장치 symbol에 `d<순번>_`을 붙여 이름순을 `--devices` 순서와 맞춤 | `options.py` |
 | GPU의 FC·matvec 결과가 정확히 2배 (W08) | SPIR-V `SubgroupReduce`가 subgroup 크기(32)를 실행 파일에 기록하지 않아 RADV가 64로 실행 | `KernelConfig.cpp`가 subgroup 크기를 넘김. 회귀 `fc_matvec_lv` 추가. FC도 GPU에 둘 수 있음 | fork `f1a30ce2c`, `fb26853c` |
 | GPU bf16 matmul 실패 | 미해결 | GPU는 f32만. `options.py`가 오류를 냄 | `d8e98aec` |
 | opaque-fd(dma-buf) import 메모리 누수 | import한 VkDeviceMemory와 NPU BO 참조를 해제하지 않음(20회 실행에 import 40 / 해제 0) | import 메모리를 소유하는 release, 실패 경로의 fd·메모리 정리 | fork `64d222702` |
@@ -82,7 +83,7 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 
 - **장치**: `scripts/onnx/options.py`의 `--devices`로 고른다. 이름은 `<driver>-<target>`이다: `local-host`(llvm-cpu, `target-cpu=host`), `amdxdna-npu4`, `vulkan-gfx1150`. 기본값은 `local-host,amdxdna-npu4`다.
 - **CPU는 필수이고 첫 장치다**: host 코드를 실행하는 장치이므로 lead(툴링이 입력을 할당하고 출력을 받는 장치)이자 기본 장치(`--iree-hal-default-device`)다. 첫 장치가 `local-host`가 아니면 `options.py`가 오류를 낸다.
-- **배정**(`AMDAIEAssignDeviceAffinities`): contraction/conv dispatch는 accelerator(amd-aie, vulkan-spirv)에 선언 순서대로 round-robin하고, 나머지는 첫 host에 둔다. `--iree-amdaie-placement-map`은 실험용 수단이고 기본값은 비어 있다. 모델별 맵은 커밋하지 않는다.
+- **배정**(`AMDAIEAssignDeviceAffinities`): contraction/conv dispatch는 accelerator(amd-aie, vulkan-spirv)에 `--devices` 순서대로 round-robin하고, 나머지는 첫 host에 둔다. `--iree-amdaie-placement-map`은 실험용 수단이고 기본값은 비어 있다. 모델별 맵은 커밋하지 않는다.
 - **버퍼 소유**(`AMDAIEResolveBufferOwner`): 링크 표(`AMDAIEDevicePlacementUtils.cpp` `linkFlags`)만으로 정한다. 공유 버퍼의 소유자 X는 다른 모든 사용자 Y에 대해 (Y→X) transparent일 때만 될 수 있다. lead는 소유를 정하지 않는다.
 
 | 링크 (src → dst, "src가 dst 메모리에 직접 접근") | 값 | 근거 |

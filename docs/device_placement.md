@@ -50,6 +50,9 @@ CPU + NPU, CPU + GPU, CPU + NPU + GPU 구성을 지원한다(3devices-f32 통합
 2. **조건** — `host ≥ 1` 필수(가속기는 선택). 단일 host 구성도 동작.
 3. **정책(round-robin)** — contraction/conv dispatch는 가속기에 선언 순서대로 번갈아 배정한다
    (`accelerators[accelIdx++ % N]`, `accelIdx`는 0에서 시작). 그 외는 `hosts.front()`. 가속기가 없으면 contraction도 host로.
+   선언 순서는 모듈 안 device global의 순서다. 이름 없는 `--iree-hal-target-device=<driver>`는 플래그 순서를 따르지만,
+   이름 붙인 `<name>=<driver>`는 iree-compile이 이름순으로 정렬한다. 그래서 `scripts/onnx/options.py`는 symbol에
+   `d<순번>_`을 붙여(`d0_local_host`, `d1_amdxdna_npu4`, ...) `--devices` 순서를 유지한다.
 4. **placement-map(실험)** — `--iree-amdaie-placement-map`이 비어 있지 않으면 규칙에 맞는 dispatch를 그 장치에 고정한다.
    맞는 규칙이 없는 dispatch는 3의 정책을 따른다(아래 "placement-map" 참고).
 5. **topology** — 실제 배정된 device만 mesh하고 링크 플래그는 테이블에서 조회한다. 이 패스는 두 번 돈다: preprocessing에서는

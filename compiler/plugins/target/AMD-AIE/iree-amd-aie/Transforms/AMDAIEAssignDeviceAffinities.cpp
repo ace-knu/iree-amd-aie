@@ -24,7 +24,9 @@
 //
 // Requires at least one host device (accelerators are optional).
 // Contraction/conv dispatches go round-robin across the accelerators in
-// declaration order; everything else goes to the first host (see policy TODO).
+// declaration order (the module order of the device globals; iree-compile
+// sorts named target devices by name); everything else goes to the first host
+// (see policy TODO).
 
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
