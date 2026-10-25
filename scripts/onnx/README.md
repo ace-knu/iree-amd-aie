@@ -67,6 +67,14 @@ remove it once the gap is fixed. To add, remove or change an option, edit
 `options.py` only: each user option becomes a `--<name>` argument by itself.
 
 To add a device, add a `DEVICES` entry with its `compile` and `run` flags.
+In the deploy image, through `./scripts/docker/run-deploy.sh` (the current
+directory is mounted at `/work`; outputs go to `onnx/` in it). The image has
+the same scripts; `--verbose` is not available there (no traced runtime):
+
+```bash
+./scripts/docker/run-deploy.sh e2e vgg16-12.onnx --numeric bf16
+```
+
 `--extra-flag=<flag>` (repeatable) passes one more flag to iree-compile without
 editing the file, e.g. an experimental `--iree-amdaie-placement-map=...` (see
 [`docs/device_placement.md`](../../docs/device_placement.md)).
@@ -74,7 +82,10 @@ editing the file, e.g. an experimental `--iree-amdaie-placement-map=...` (see
 ## Output
 
 `build/onnx/<model>-<option>_<choice>...` unless `--outdir` is given
-(`<model>-devices_<a>+<b>...-...` when `--devices` is not the default):
+(`<model>-devices_<a>+<b>...-...` when `--devices` is not the default).
+The environment can move the paths; the deploy image sets them:
+`ONNX_OUT` for `build/onnx`, `IREE_TOOLS` for `build/tools`, and
+`IREE_AMD_AIE_COMMIT` for the commit when there is no git checkout.
 
 | File | Content |
 |---|---|

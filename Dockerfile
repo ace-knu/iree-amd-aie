@@ -86,7 +86,7 @@ RUN cd /src/iree-amd-aie && cmake -B /build -S third_party/iree -G Ninja \
       -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
       -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
  && cmake --build /build -j "${BUILD_JOBS}" \
-      --target iree-compile iree-run-module IREECompilerPythonModules \
+      --target iree-compile iree-run-module iree-lld IREECompilerPythonModules \
  && cp -rL /build/compiler/bindings/python /opt/iree-python   # self-contained (deref symlinks)
 
 # ============================================================
@@ -114,13 +114,23 @@ RUN /opt/venv/bin/pip install --no-cache-dir onnx sympy \
 # Native tools + Peano
 COPY --from=builder /build/tools/iree-compile      /opt/iree-amd-aie/bin/iree-compile
 COPY --from=builder /build/tools/iree-run-module   /opt/iree-amd-aie/bin/iree-run-module
+# iree-lld: the linker of llvm-cpu (CPU) code, found next to iree-compile
+COPY --from=builder /build/tools/iree-lld          /opt/iree-amd-aie/bin/iree-lld
 COPY --from=builder /build/lib/libIREECompiler.so  /opt/iree-amd-aie/lib/libIREECompiler.so
 COPY --from=builder /src/iree-amd-aie/llvm-aie     /opt/llvm-aie
 # Version-matched python compiler package (provides import_onnx + fx_importer)
 COPY --from=builder /opt/iree-python               /opt/iree-python
+# The ONNX run scripts (scripts/onnx/README.md), the same as in the dev container
+COPY --from=builder /src/iree-amd-aie/scripts/onnx /opt/iree-amd-aie/scripts/onnx
 
 ENV PATH="/opt/venv/bin:/opt/iree-amd-aie/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/opt/iree-amd-aie/lib"
 ENV PEANO_INSTALL_DIR="/opt/llvm-aie"
 ENV PYTHONPATH="/opt/iree-python"
+# For scripts/onnx: tools, output root (run-deploy.sh mounts the host directory at
+# /work) and the commit recorded in config.json (there is no git checkout here).
+ARG IREE_AMD_AIE_COMMIT
+ENV IREE_TOOLS="/opt/iree-amd-aie/bin" ONNX_OUT="/work/onnx" \
+    IREE_AMD_AIE_COMMIT="${IREE_AMD_AIE_COMMIT}"
+WORKDIR /work
 # NPU 실행: docker run --device=/dev/accel/accelN (호스트 KMD 준비는 HOST_PREREQUISITES.md)

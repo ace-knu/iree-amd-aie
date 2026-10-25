@@ -177,24 +177,29 @@ ctest --test-dir build -R amd-aie --output-on-failure   # (선택) 테스트
 ```
 참고: 배포할 커밋 SHA는 fork에 push된 커밋이어야 한다 (`git ls-remote https://github.com/ace-knu/iree-amd-aie.git dev` 로 확인).
 
-### 3-2. 이미지 실행 (받는 측) — 모델 컴파일 + NPU 실행
+### 3-2. 이미지 실행 (받는 측) — 모델 컴파일 + 실행
+dev와 같은 ONNX 스크립트(`scripts/onnx`)가 이미지에 들어 있다. 받는 측이 repo를 함께 받았다면
+`run-deploy.sh`가 NPU·GPU 장치를 넘기고 현재 디렉터리를 `/work`로 mount한다 (출력은 `./onnx/`).
 ```bash
-# 전달받은 이미지 로드
+./scripts/docker/load-deploy.sh iree-amd-aie-deploy.tar.gz   # 전달받은 이미지 로드
+cd <모델이 있는 디렉터리>
+<repo>/scripts/docker/run-deploy.sh e2e vgg16-12.onnx --numeric bf16
+<repo>/scripts/docker/run-deploy.sh e2e vgg16-12.onnx --numeric f32 --devices local-host,amdxdna-npu4,vulkan-gfx1150
+<repo>/scripts/docker/run-deploy.sh            # 인자 없으면 bash
+```
+옵션·출력·요약 줄은 [`scripts/onnx/README.md`](../../scripts/onnx/README.md)와 같다. `--verbose`(dispatch별
+시간)는 trace 런타임이 없어 deploy 이미지에서는 쓸 수 없다.
+
+repo 없이 raw `docker run`으로 쓸 때 (root로 실행되어 `/work`에 생기는 파일은 root 소유):
+```bash
 gunzip -c iree-amd-aie-deploy.tar.gz | docker load
-
-NPU=$(ls /dev/accel/ | head -1)
-# --ulimit memlock=-1: 대용량 모델 큰 BO의 memlock 제한 회피 (run-deploy.sh는 이미 적용)
-docker run --rm -it --device=/dev/accel/$NPU --ulimit memlock=-1 iree-amd-aie:deploy bash
-
-# 컨테이너 안: 모델 → MLIR → NPU
-python3 -m iree.compiler.tools.import_onnx model.onnx -o model.mlir   # PyTorch는 fx_importer
-iree-compile --iree-hal-target-backends=amd-aie --iree-amdaie-target-device=npu4 \
-  --iree-amd-aie-peano-install-dir="$PEANO_INSTALL_DIR" --iree-amdaie-stack-size=2048 \
-  model.mlir -o model.vmfb
-iree-run-module --device=amdxdna --module=model.vmfb --function=main --input="1x3x224x224xf32=1"
+NPU=$(ls /dev/accel/ | head -1); GPU=$(ls /dev/dri/renderD* | head -1)
+# --ulimit memlock=-1: 대용량 모델 큰 BO의 memlock 제한 회피
+docker run --rm -it --device=/dev/accel/$NPU --ulimit memlock=-1 --device=$GPU \
+  -v "$PWD:/work" iree-amd-aie:deploy \
+  python3 /opt/iree-amd-aie/scripts/onnx/e2e.py vgg16-12.onnx --numeric bf16
 ```
 참고:
-- 위 로드·실행은 raw 명령이다 — 받는 측이 repo를 함께 받았다면 `./scripts/docker/load-deploy.sh` ·
-  `./scripts/docker/run-deploy.sh`로 대체할 수 있다.
-- import/compile/run 상세(타깃 디바이스, 함수·입력, stack-size)는 2-4를 참고한다.
+- 실행하는 iree-compile 명령은 출력 디렉터리의 `compile_cmd.sh`에 그대로 남는다.
+- import/compile/run 상세(타깃 디바이스, 함수·입력)는 2-4를 참고한다.
 - 배포 이미지는 `PATH`·`PYTHONPATH`·`PEANO_INSTALL_DIR`가 이미 설정돼 있어 2-4의 `source`/`export` 단계는 필요 없다.
