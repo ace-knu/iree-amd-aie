@@ -30,7 +30,7 @@ flowchart LR
 - topology가 없으면 무동작.
 
 ### 2-2. 역할·링크 표 (`AMDAIEDevicePlacementUtils.cpp`)
-- `deviceRole(backend)`: `llvm-cpu` → Host, `amd-aie` → Accelerator, `vulkan-spirv` → Accelerator(`// TEMP: experiment`, **HEAD에 이미 커밋됨**), 그 외 Unknown.
+- `deviceRole(backend)`: `llvm-cpu` → Host, `amd-aie` → Accelerator, `vulkan-spirv` → Accelerator(10/20 시점에는 `// TEMP: experiment` 표식. dev 통합 때 표식을 떼고 정식 역할로 둠, `e7060e40`), 그 외 Unknown.
 - `linkFlags(src, dst)` = `(src → dst)`의 `{unified_memory, transparent_access}`. "src가 dst 메모리를 복사 없이 읽는다".
 
 | src → dst | transparent | 근거(주석) |
@@ -38,7 +38,7 @@ flowchart LR
 | CPU → NPU | true | amdxdna BO는 host-local·device-visible, CPU가 host-map |
 | NPU → CPU | **false** | amdxdna HAL allocator에 `import_buffer` 없음(드라이버 소프트웨어 한계, 커널 드라이버는 dma-buf·userptr 지원) |
 | CPU → GPU | true | Vulkan dispatch 메모리가 DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT(이 플랫폼). 외장 GPU면 false여야 함 |
-| GPU → CPU | true | host 포인터 import + BRIDGE(S3). (O17: 옛 TODO를 "검증됨 cg_topo lead=0"으로 교체) |
+| GPU → CPU | true | host 포인터 import + BRIDGE(S3). (O17: 옛 TODO를 "검증됨 cg_topo lead=0"으로 교체) → 통합 후: **false**. BRIDGE가 기록 시점에 import해서 아직 메모리가 없는 transient CPU 버퍼를 못 가져오므로, CPU·GPU 공유 버퍼는 GPU가 소유(`e3d86485`) |
 | GPU → NPU | true | amdxdna dma-buf export → Vulkan import(S9) |
 | NPU → GPU | **false** | amdxdna import 없음, Vulkan export 없음 |
 | 그 외 | false·false | 보수적 기본값(복사) |
@@ -66,7 +66,7 @@ flowchart LR
 - 패스 본문은 장치 이름을 보지 않는다(topology만).
 - 표는 **백엔드 이름 문자열**(`llvm-cpu`, `amd-aie`, `vulkan-spirv`)을 키로 쓴다. "표가 유일한 진실 원천" 설계라 이름이 이 한 곳에만 모여 있다. 다만 다음 두 전제가 깔려 있다.
   - **플랫폼 전제**: CPU→GPU true는 UMA(890M) 전제다. 외장 GPU에서는 성립하지 않는다(주석 NOTE).
-  - **TEMP**: `vulkan-spirv`를 Accelerator로 둔 것이 TEMP 표식이다. 로드맵 3단계(device-capability 표에 GPU 정식 편입)에서 다룬다.
+  - **vulkan-spirv 역할**: 10/20 시점에는 Accelerator로 둔 것이 TEMP 표식이었다. dev 통합 때 정식 Accelerator로 바꿨다(`e7060e40`).
 - `accelIdx` 시작값은 정책 상수다. 라운드로빈 자체가 선언 순서 × dispatch 순서에 의존하고, NPU 3입력 문제 회피가 이 우연에 기대고 있다(CLAUDE.md 3절, 우회 W11).
 
 ## 6. 검증 근거 (우리가 한 것)
