@@ -76,6 +76,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/IRMapping.h"
 
 #define DEBUG_TYPE "iree-amdaie-pad-contraction-dispatches"
 
@@ -90,6 +91,10 @@ static int64_t roundUpToMultiple(int64_t value, int64_t multiple) {
 /// Tile multiples a matmul's M, N, K must be padded up to on a given target.
 struct PaddingMultiples {
   int64_t m, n, k;
+  // K multiple for a matmul whose bias is folded into K (see
+  // `matchFoldablePostAddBias`): one K tile per core row for pack-peel, the
+  // whole GEMV K tile for a GEMV.
+  int64_t kBiasFold;
 };
 
 /// Resolves the amd-aie executable target a dispatch is pinned to via its
@@ -148,7 +153,11 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
             ? *numRows * *numCols * kGemvNPerCoreMultiple
             : 1,
         /*k=*/useMatvec ? kMatvecUKernelK
-                        : getPackPeelReductionTile(/*kPackScaleL1=*/1)};
+                        : getPackPeelReductionTile(/*kPackScaleL1=*/1),
+        // K+1 is never a multiple of the GEMV K tile, and the matvec ukernel
+        // drops to a 64 tile unless K is (KernelDispatch), so a folded K is
+        // aligned to the full tile.
+        /*kBiasFold=*/kGemvKTile};
   }
   AMDAIEDeviceModel deviceModel = getDeviceModel(*device);
   FailureOr<std::array<uint32_t, 3>> instr =
@@ -196,7 +205,8 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   return PaddingMultiples{
       /*m=*/*numRows * perCore * (*instr)[0],
       /*n=*/*numCols * perCore * (*instr)[1],
-      /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
+      /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1),
+      /*kBiasFold=*/getPackPeelReductionTile(/*kPackScaleL1=*/1) * *numRows};
 }
 
 /// A matmul (`[empty -> fill | load] -> matmul -> [elementwise consumer(s)]
@@ -250,6 +260,17 @@ struct MatmulInfo {
                                                   // a recognized single
                                                   // elementwise consumer of it)
   BlockArgument outArg;  // the output binding (null under the same condition)
+  // Post-add bias form: the store's value is a two-input elementwise op whose
+  // payload adds a bias binding onto the matmul result (`addf(mm, bias)`, then
+  // possibly a ReLU and a truncation), as a matmul + bias from an ONNX Gemm
+  // arrives once the add is fused into the dispatch. Set only for that shape
+  // (see `matchPostAddBiasConsumer`); `store`/`outArg` stay null for it, since
+  // the output cannot be grown through a two-input consumer until the bias is
+  // folded away.
+  linalg::GenericOp biasAddConsumer;
+  arith::AddFOp biasAdd;
+  IREE::TensorExt::DispatchTensorLoadOp biasLoad;
+  BlockArgument biasArg;
 };
 
 /// Returns the func of a dispatch's single entry point, or null.
@@ -303,6 +324,62 @@ static bool isShapePreservingUnaryMapOf(linalg::GenericOp generic,
     if (map != identity) return false;
   for (utils::IteratorType it : generic.getIteratorTypesArray())
     if (it != utils::IteratorType::parallel) return false;
+  return true;
+}
+
+/// Matches `generic` as a post-add bias consumer of `matmulResult`: a
+/// two-input, all-parallel 2-D elementwise op with an identity output map,
+/// reading `matmulResult` through the identity map and a bias from a
+/// full-tensor binding load through either `(d0, d1) -> (d1)` (a 1-D bias) or
+/// the identity map (a [1, N] bias; `matchFoldablePostAddBias` checks the
+/// leading 1), whose payload adds the two with an `arith.addf` that is the only
+/// use of both. What follows the add in the payload (a ReLU, a truncation) is
+/// left as is: it only sees the sum. The matmul value must not be used
+/// anywhere else in the payload either: after the fold it already includes the
+/// bias, so such a use would silently see a different value.
+static bool matchPostAddBiasConsumer(linalg::GenericOp generic,
+                                     Value matmulResult, MatmulInfo &info) {
+  if (!generic || generic.getNumDpsInputs() != 2 ||
+      generic.getNumDpsInits() != 1 || generic->getNumResults() != 1 ||
+      generic.getNumLoops() != 2)
+    return false;
+  for (utils::IteratorType it : generic.getIteratorTypesArray())
+    if (it != utils::IteratorType::parallel) return false;
+  MLIRContext *ctx = generic.getContext();
+  AffineMap identity = AffineMap::getMultiDimIdentityMap(2, ctx);
+  if (generic.getMatchingIndexingMap(generic.getDpsInitOperand(0)) != identity)
+    return false;
+  OpOperand *mmOperand = nullptr, *biasOperand = nullptr;
+  for (OpOperand *operand : generic.getDpsInputOperands()) {
+    if (operand->get() == matmulResult)
+      mmOperand = operand;
+    else
+      biasOperand = operand;
+  }
+  if (!mmOperand || !biasOperand) return false;
+  if (generic.getMatchingIndexingMap(mmOperand) != identity) return false;
+  AffineMap biasMap = generic.getMatchingIndexingMap(biasOperand);
+  if (biasMap != identity &&
+      biasMap != AffineMap::get(2, 0, {getAffineDimExpr(1, ctx)}, ctx))
+    return false;
+  auto biasLoad = getFullTensorLoad(biasOperand->get());
+  if (!biasLoad) return false;
+  auto biasArg = dyn_cast<BlockArgument>(biasLoad.getSource());
+  if (!biasArg) return false;
+
+  Block &body = generic.getRegion().front();
+  Value mmIn = body.getArgument(mmOperand->getOperandNumber());
+  Value biasIn = body.getArgument(biasOperand->getOperandNumber());
+  if (!biasIn.hasOneUse() || !mmIn.hasOneUse()) return false;
+  auto add = dyn_cast<arith::AddFOp>(*biasIn.getUsers().begin());
+  if (!add) return false;
+  if (!((add.getLhs() == mmIn && add.getRhs() == biasIn) ||
+        (add.getLhs() == biasIn && add.getRhs() == mmIn)))
+    return false;
+  info.biasAddConsumer = generic;
+  info.biasAdd = add;
+  info.biasLoad = biasLoad;
+  info.biasArg = biasArg;
   return true;
 }
 
@@ -376,9 +453,16 @@ static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
       outArg = arg;
     }
   }
-  return MatmulInfo{matmul,      lhsLoad,      rhsLoad,       lhsArg,
-                    rhsArg,      fill,         empty,         accLoad,
-                    accArg,      elementwiseConsumer, resolvedStore, outArg};
+  MatmulInfo info{matmul,      lhsLoad,      rhsLoad,       lhsArg,
+                  rhsArg,      fill,         empty,         accLoad,
+                  accArg,      elementwiseConsumer, resolvedStore, outArg};
+  // A bias added after a zero-initialized matmul (see
+  // `matchPostAddBiasConsumer`). Recorded only; `store`/`outArg` stay null.
+  if (fill && !resolvedStore && isa<BlockArgument>(store.getTarget()))
+    (void)matchPostAddBiasConsumer(
+        storedValue.getDefiningOp<linalg::GenericOp>(), matmul.getResult(0),
+        info);
+  return info;
 }
 
 /// Grows executable binding `arg` and its full-tensor `load` to `newShape`
@@ -584,6 +668,54 @@ static Value createBiasOnesPad(OpBuilder &b, Location loc,
       /*nofold=*/false, loc, b);
 }
 
+/// Same result as `createBiasOnesPad`, for a dispatch that has no linalg op of
+/// its own: one zero `tensor.pad` up to `dstType`, then an elementwise
+/// `linalg.generic` over the padded tensor that writes 1.0 at K index `k` of
+/// the real rows and passes every other element through.
+///
+/// `createBiasOnesPad`'s two chained pads only compile on the CPU backend as
+/// consumers of a linalg root (the im2col generic, when the producer dispatch
+/// is grown). In a dispatch that is just `load -> pad -> pad -> store` they
+/// fail `iree-codegen-concretize-pad-result-shape`, whatever the shape (seen
+/// with VGG16's FC inputs, 1x25088 -> 32x25216, and with 32x576 -> 32x608). A
+/// single pad there compiles, and here it is the producer of the generic,
+/// which is the dispatch's one root.
+static Value createBiasOnesPadByGeneric(OpBuilder &b, Location loc,
+                                        RankedTensorType dstType, Value src,
+                                        unsigned kDim) {
+  auto srcType = cast<RankedTensorType>(src.getType());
+  assert(srcType.getRank() == 2 && kDim < 2 && "bias-fold LHS is 2-D");
+  Type elemType = srcType.getElementType();
+  unsigned mDim = 1 - kDim;
+  int64_t k = srcType.getDimSize(kDim);
+  int64_t m = srcType.getDimSize(mDim);
+  Value padded = tensor::createPadHighOp(
+      dstType, src, b.create<arith::ConstantOp>(loc, b.getZeroAttr(elemType)),
+      /*nofold=*/false, loc, b);
+  Value init = b.create<tensor::EmptyOp>(loc, dstType.getShape(), elemType);
+  AffineMap identity = AffineMap::getMultiDimIdentityMap(2, b.getContext());
+  auto generic = b.create<linalg::GenericOp>(
+      loc, TypeRange{dstType}, ValueRange{padded}, ValueRange{init},
+      ArrayRef<AffineMap>{identity, identity},
+      ArrayRef<utils::IteratorType>{utils::IteratorType::parallel,
+                                    utils::IteratorType::parallel},
+      [&](OpBuilder &nb, Location nloc, ValueRange args) {
+        Value kIdx = nb.create<linalg::IndexOp>(nloc, kDim);
+        Value mIdx = nb.create<linalg::IndexOp>(nloc, mDim);
+        Value isBiasCol = nb.create<arith::CmpIOp>(
+            nloc, arith::CmpIPredicate::eq, kIdx,
+            nb.create<arith::ConstantIndexOp>(nloc, k));
+        Value isRealRow = nb.create<arith::CmpIOp>(
+            nloc, arith::CmpIPredicate::ult, mIdx,
+            nb.create<arith::ConstantIndexOp>(nloc, m));
+        Value isOne = nb.create<arith::AndIOp>(nloc, isBiasCol, isRealRow);
+        Value one = nb.create<arith::ConstantOp>(nloc, nb.getOneAttr(elemType));
+        Value out = nb.create<arith::SelectOp>(nloc, isOne, one, args[0]);
+        nb.create<linalg::YieldOp>(nloc, out);
+      });
+  return generic.getResult(0);
+}
+
 /// Creates a `flow.executable` + `flow.dispatch` that pads `v` up to
 /// `dstShape` (high padding via `tensor.pad`), placed on `hostAffinity`. Returns
 /// the padded value, or `v` unchanged if `dstShape` already matches. A dispatch
@@ -596,9 +728,9 @@ static Value createBiasOnesPad(OpBuilder &b, Location loc,
 /// `onesKDim`, when set, marks `v` as the LHS of a contraction whose bias has
 /// been folded into K (see the "Accumulator-bias K-column fold" section) and
 /// names its K dim: the padding then carries the ones the fold contracts
-/// against (see `createBiasOnesPad`) instead of being all zero. Requires a
-/// float element type, which is the bias fold's own precondition and is
-/// checked before it decides to fold.
+/// against (see `createBiasOnesPadByGeneric`) instead of being all zero.
+/// Requires a float element type, which is the bias fold's own precondition and
+/// is checked before it decides to fold.
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
                                    Value v, ArrayRef<int64_t> dstShape,
                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
@@ -627,7 +759,7 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
   Value padded =
       onesKDim
-          ? createBiasOnesPad(fb, loc, dstType, loaded, *onesKDim)
+          ? createBiasOnesPadByGeneric(fb, loc, dstType, loaded, *onesKDim)
           : tensor::createPadHighOp(
                 dstType, loaded,
                 fb.create<arith::ConstantOp>(
@@ -758,6 +890,14 @@ static Value growProducerDispatchToPadded(
   auto storedType = dyn_cast<RankedTensorType>(store.getValue().getType());
   if (!storedType || storedType.getElementType() != elemType) return {};
   if (storedType.getShape() != outType.asRankedTensorType().getShape())
+    return {};
+  // The ones column takes two chained pads (see `createBiasOnesPad`), which
+  // the CPU backend only compiles as consumers of a linalg root. A producer
+  // without one -- e.g. the crop dispatch that slices the previous FC layer's
+  // padded result, `extract_slice` then store -- fails CPU codegen with both
+  // pads attached (one pad alone compiles), so it keeps a separate padding
+  // dispatch.
+  if (onesKDim && !store.getValue().getDefiningOp<linalg::LinalgOp>())
     return {};
 
   // The reshape this absorbs has to be expressible as a collapse of the
@@ -930,6 +1070,14 @@ static Value createPaddingDispatchOrConstant(
 // column is written by the K-padding dispatch that has to run anyway (K+1 is
 // never tile-divisible, so the LHS is padded either way), and the bias row is
 // folded into a compile-time constant, so the fold is free.
+//
+// A matmul + bias (an ONNX Gemm, e.g. VGG16's FC layers) is folded here the
+// same way. Its bias arrives after the matmul instead, as an `addf` in the
+// fused elementwise consumer (`matmul outs(fill 0) -> generic(addf(mm, bias),
+// relu, truncf)`); `removePostAddBias` drops the add and the bias binding, and
+// the rest is the fold above. Folding it here rather than in Preprocessing
+// keeps both folds in one place and lets the fused ReLU and bf16 truncation
+// stay in the NPU dispatch.
 //===----------------------------------------------------------------------===//
 
 /// Returns the `DenseElementsAttr` behind `v` when `v` is a compile-time
@@ -1192,6 +1340,99 @@ static void replaceAccWithZeroFill(IRRewriter &rewriter, MatmulInfo &info,
   info.empty = emptyOp;
 }
 
+/// Post-add counterpart of `matchFoldableBias`: returns the constant bias a
+/// matmul + bias consumer (see `matchPostAddBiasConsumer`) adds, when the
+/// weight is a constant this pass can rewrite at compile time and the bias is a
+/// constant holding one value per output column -- a 1-D [N] tensor, or [1, N]
+/// read through the identity map, which only arises with M == 1 (VGG16's FC
+/// layers). Null otherwise. The fold is applied only to an executable with a
+/// single caller, see `runOnOperation`.
+static DenseElementsAttr matchFoldablePostAddBias(
+    IREE::Flow::DispatchOp dispatch, const MatmulInfo &info) {
+  if (!info.biasAddConsumer) return {};
+  Value lhs = dispatch.getArguments()[info.lhsArg.getArgNumber()];
+  Value rhs = dispatch.getArguments()[info.rhsArg.getArgNumber()];
+  if (!isa<FloatType>(getElementTypeOrSelf(lhs.getType())) ||
+      !isa<FloatType>(getElementTypeOrSelf(rhs.getType())))
+    return {};
+  IREE::Util::GlobalOp weightGlobal;
+  DenseElementsAttr weightAttr;
+  if (!matchConstantWeight(rhs, weightGlobal, weightAttr)) return {};
+  DenseElementsAttr biasAttr = matchConstantAttr(
+      dispatch.getArguments()[info.biasArg.getArgNumber()]);
+  if (!biasAttr) return {};
+  auto biasType = dyn_cast<RankedTensorType>(biasAttr.getType());
+  if (!biasType || !isa<FloatType>(biasType.getElementType())) return {};
+  linalg::MatmulOp matmul = info.matmul;
+  unsigned rhsNPos =
+      operandDimForLoop(matmul.getIndexingMapsArray()[1], /*N=*/1);
+  int64_t n = cast<RankedTensorType>(rhs.getType()).getShape()[rhsNPos];
+  // [N], or [1, N]: either way one value per output column, in order.
+  bool perColumn =
+      (biasType.getRank() == 1 && biasType.getDimSize(0) == n) ||
+      (biasType.getRank() == 2 && biasType.getDimSize(0) == 1 &&
+       biasType.getDimSize(1) == n);
+  if (!perColumn) return {};
+  return biasAttr;
+}
+
+/// Removes the post-add bias from the executable: the bias consumer is rebuilt
+/// with the matmul result as its only input and the bias `addf` dropped from
+/// its payload (its uses now read the matmul result), the bias load and
+/// binding are erased, and a consumer left with nothing to do (a payload that
+/// just yields the matmul value, as for a bias add without a ReLU) is removed
+/// so the matmul result is stored directly. `info` is re-read from `func`
+/// afterwards, so the padding that follows sees the ordinary two-operand form,
+/// with the consumer (if any) as a unary elementwise op. The caller must erase
+/// the corresponding host operand.
+static LogicalResult removePostAddBias(IRRewriter &rewriter, MatmulInfo &info,
+                                       func::FuncOp func) {
+  linalg::GenericOp oldConsumer = info.biasAddConsumer;
+  Value matmulResult = info.matmul.getResult(0);
+  Location loc = oldConsumer.getLoc();
+  Block &oldBody = oldConsumer.getRegion().front();
+  unsigned mmInput = oldConsumer.getDpsInputOperand(0)->get() == matmulResult
+                         ? 0
+                         : 1;
+  Value oldInit = oldConsumer.getDpsInits()[0];
+
+  AffineMap identity =
+      AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
+  rewriter.setInsertionPoint(oldConsumer);
+  auto newConsumer = rewriter.create<linalg::GenericOp>(
+      loc, oldConsumer->getResultTypes(), ValueRange{matmulResult},
+      ValueRange{oldInit}, ArrayRef<AffineMap>{identity, identity},
+      oldConsumer.getIteratorTypesArray());
+  Block *newBody = rewriter.createBlock(&newConsumer.getRegion(), {},
+                                        {oldBody.getArgument(mmInput).getType(),
+                                         oldBody.getArgument(2).getType()},
+                                        {loc, loc});
+  IRMapping mapping;
+  mapping.map(oldBody.getArgument(mmInput), newBody->getArgument(0));
+  mapping.map(oldBody.getArgument(2), newBody->getArgument(1));
+  mapping.map(info.biasAdd.getResult(), newBody->getArgument(0));
+  rewriter.setInsertionPointToStart(newBody);
+  for (Operation &op : oldBody)
+    if (&op != info.biasAdd.getOperation()) rewriter.clone(op, mapping);
+  rewriter.replaceOp(oldConsumer, newConsumer->getResults());
+
+  auto yield = cast<linalg::YieldOp>(newBody->getTerminator());
+  if (llvm::hasSingleElement(*newBody) &&
+      yield.getOperand(0) == newBody->getArgument(0) &&
+      newConsumer.getResult(0).getType() == matmulResult.getType())
+    rewriter.replaceOp(newConsumer, matmulResult);
+
+  unsigned biasArgNo = info.biasArg.getArgNumber();
+  rewriter.eraseOp(info.biasLoad);
+  (void)func.eraseArgument(biasArgNo);
+  // The consumer is now unary (or gone), which `getMatmulInfo` resolves the
+  // store through; anything else means the rewrite above went wrong.
+  std::optional<MatmulInfo> reread = getMatmulInfo(func);
+  if (!reread || !reread->store) return failure();
+  info = *reread;
+  return success();
+}
+
 /// Creates a `flow.executable` + `flow.dispatch` that crops `v` down to
 /// `dstShape` (low corner via `tensor.extract_slice`), placed on `hostAffinity`.
 /// Returns the cropped value, or `v` unchanged if `dstShape` already matches.
@@ -1346,12 +1587,25 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // when this is the executable's only caller (see `numCallers`). Null in
     // the ordinary two-operand case (`info->fill` set), which is every
     // dispatch when the pre-im2col convolution fold is left on.
+    //
+    // The post-add form (`matchFoldablePostAddBias`) is the same fold for a
+    // matmul + bias whose add was fused in after the matmul, which is how an
+    // ONNX Gemm (VGG16's FC layers) arrives. Either way the bias operand goes
+    // away and the bias becomes row `k` of the weight.
     DenseElementsAttr biasAttr;
-    int64_t accArgNo = -1;
-    if (info->accArg) {
-      accArgNo = info->accArg.getArgNumber();
-      if (numCallers.lookup(func.getOperation()) == 1)
+    int64_t biasOperandNo = -1;
+    bool postAddBias = false;
+    if (numCallers.lookup(func.getOperation()) == 1) {
+      if (info->accArg) {
         biasAttr = matchFoldableBias(dispatch, *info, module);
+        if (biasAttr) biasOperandNo = info->accArg.getArgNumber();
+      } else if (info->biasAddConsumer) {
+        biasAttr = matchFoldablePostAddBias(dispatch, *info);
+        if (biasAttr) {
+          biasOperandNo = info->biasArg.getArgNumber();
+          postAddBias = true;
+        }
+      }
     }
 
     int64_t mPad = roundUpToMultiple(m, mult->m);
@@ -1359,7 +1613,19 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // The bias lives at K index `k`, so the contraction's logical K grows by
     // one before rounding. K+1 is never a tile multiple, so a folded operand
     // is always padded -- which is precisely what makes the ones column free.
-    int64_t kPad = roundUpToMultiple(biasAttr ? k + 1 : k, mult->k);
+    //
+    // A matmul's fold aligns K to `kBiasFold`: under pack-peel a whole K tile
+    // per core row (k * numRows, 128 on npu4) instead of one K tile. That is the K VGG16's FC layers have
+    // always been folded to, in Preprocessing before this pass took over (FC1
+    // 25088 -> 25216). The narrower multiple is not known to be safe there: an
+    // isolated FC1-shaped transpose_b matmul hung at K = 25120 and ran at
+    // 25088 and 25216. Convolutions keep the plain K tile, which is what they
+    // were verified with (and widening it for them hangs, see
+    // `getPaddingMultiples`).
+    // Under the GEMV pipeline (M == 1, how VGG16's FC layers now lower) it is
+    // the GEMV K tile instead.
+    int64_t kMultiple = postAddBias ? mult->kBiasFold : mult->k;
+    int64_t kPad = roundUpToMultiple(biasAttr ? k + 1 : k, kMultiple);
     if (mPad == m && nPad == n && kPad == k) continue;  // already divisible
     // Any output dim (M outer and/or N inner) may be padded; the grown result is
     // cropped back on the host by a single extract_slice dispatch.
@@ -1375,7 +1641,9 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // conservative behavior as before for that harder case. K-only padding
     // (padOut == false) never touches the matmul's output at all, so it
     // remains safe and is handled below regardless of store/outArg.
-    if (padOut && (!info->store || !info->outArg)) continue;
+    // A post-add bias consumer is made unary by the fold itself (see
+    // `removePostAddBias`), before the output is grown.
+    if (padOut && !postAddBias && (!info->store || !info->outArg)) continue;
 
     // Padded operand shapes placed at each operand's own M/N/K dim positions, so
     // the RHS layout (plain [K,N] or transpose_b [N,K]) is preserved.
@@ -1393,7 +1661,14 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       // Before growing anything: turn the bias binding into a zero fill, so
       // the padding below sees the ordinary two-operand form (and `padOut`
       // takes `growMatmulInit`'s fill path).
-      if (biasAttr) replaceAccWithZeroFill(rewriter, *info, func);
+      if (postAddBias) {
+        if (failed(removePostAddBias(rewriter, *info, func))) {
+          dispatch.emitError("failed to fold the bias of a matmul + bias");
+          return signalPassFailure();
+        }
+      } else if (biasAttr) {
+        replaceAccWithZeroFill(rewriter, *info, func);
+      }
       growBinding(rewriter, info->lhsArg, info->lhsLoad, lhsPad);
       growBinding(rewriter, info->rhsArg, info->rhsLoad, rhsPad);
       if (padOut) {
@@ -1454,7 +1729,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
     // Drop the bias operand last, so the assignments above still address the
     // original operand positions.
-    if (biasAttr) dispatch.getArgumentsMutable().erase(accArgNo);
+    if (biasAttr) dispatch.getArgumentsMutable().erase(biasOperandNo);
 
     // Grow this caller's result to [mPad, nPad] and crop it back to [m, n] on
     // the host with an extract_slice dispatch (handles the inner N dim too).
