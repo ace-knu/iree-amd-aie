@@ -517,3 +517,31 @@ func.func @generic_matmul_bf16bf16f32_odd_m(%arg0 : tensor<4x7x8x8xbf16>, %arg1 
 //      CHECK: func @generic_matmul_bf16bf16f32_odd_m
 //      CHECK:  linalg.generic
 //  CHECK-NOT:  iree_codegen.ukernel.generic
+
+// -----
+
+// The GEMV pipeline's tile is an unpacked 2-D matmul, which no matmul ukernel
+// takes. Its zero fill is lowered when it is a whole number of 16-lane vectors
+// (1x32) and not otherwise (1x26).
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
+module {
+  func.func @gemv_tile_bf16(%arg0: tensor<1x256xbf16>, %arg1: tensor<32x256xbf16>,
+      %arg2: tensor<1x32xf32>) -> tensor<1x32xf32> attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+    %cst = arith.constant 0.0 : f32
+    %0 = linalg.fill ins(%cst : f32) outs(%arg2 : tensor<1x32xf32>) -> tensor<1x32xf32>
+    %1 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>]
+        ins(%arg0, %arg1 : tensor<1x256xbf16>, tensor<32x256xbf16>) outs(%0 : tensor<1x32xf32>) -> tensor<1x32xf32>
+    return %1 : tensor<1x32xf32>
+  }
+  func.func @gemv_tile_fill_partial_vector(%arg0: tensor<1x26xf32>) -> tensor<1x26xf32> attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+    %cst = arith.constant 0.0 : f32
+    %0 = linalg.fill ins(%cst : f32) outs(%arg0 : tensor<1x26xf32>) -> tensor<1x26xf32>
+    return %0 : tensor<1x26xf32>
+  }
+}
+// CHECK-LABEL: func @gemv_tile_bf16(
+//       CHECK:   iree_codegen.ukernel.generic "zero_fill_f32_1x32"
+//       CHECK:   linalg.matmul
+// CHECK-LABEL: func @gemv_tile_fill_partial_vector(
+//       CHECK:   linalg.fill
+//   CHECK-NOT:   iree_codegen.ukernel.generic

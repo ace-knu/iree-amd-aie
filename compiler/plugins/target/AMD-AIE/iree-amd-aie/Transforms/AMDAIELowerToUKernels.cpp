@@ -118,6 +118,14 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
   Type lhsElemType = lhsType.getElementType();
   Type rhsElemType = rhsType.getElementType();
   Type outElemType = outType.getElementType();
+  // The matmul ukernels take packed tiles. An unpacked 2-D tile (the GEMV
+  // pipeline's) is left to the non-ukernel path.
+  if (!llvm::all_of(TypeRange{lhsType, rhsType, outType}, [](Type type) {
+        int64_t rank = cast<ShapedType>(type).getRank();
+        return rank == 4 || rank == 6;
+      })) {
+    return rewriter.notifyMatchFailure(op, "operands are not packed tiles");
+  }
 
   // Tiling for M x K x N as well as the corresponding inner tiling intrinsics
   // r x s x t.
@@ -200,6 +208,11 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
     // Tiling for M x N as well as the corresponding inner tiling intrinsics r x
     // t.
     std::tie(M, N, r, t) = getTilingInfo(outType);
+  }
+  // The zero_fill ukernels store whole 16-lane vectors.
+  if ((M * N) % 16 != 0) {
+    return rewriter.notifyMatchFailure(
+        op, "fill is not a whole number of vectors");
   }
 
   std::string elemTypeAndSize = typeToString(outElemType) + "_" +

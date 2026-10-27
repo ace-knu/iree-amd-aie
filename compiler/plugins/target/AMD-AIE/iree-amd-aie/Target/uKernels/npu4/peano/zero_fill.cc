@@ -6,9 +6,9 @@
 
 template <int M, int N, int r, int u>
 void zero_fill_vectorized(v16int32 *__restrict pC, unsigned offsetC) {
-  static_assert(M * N / r / u > 0);
+  static_assert(M * N % r == 0);
   v16int32 zeros = broadcast_zero_to_v16int32();
-#pragma clang loop unroll_count(M *N / r / u)
+#pragma clang loop unroll_count(M *N / r >= u ? M *N / r / u : 1)
   for (unsigned i = offsetC / r; i < offsetC / r + M * N / r; i++) {
     pC[i] = zeros;
   }
@@ -16,9 +16,9 @@ void zero_fill_vectorized(v16int32 *__restrict pC, unsigned offsetC) {
 
 template <int M, int N, int r, int u>
 void zero_fill_vectorized(v16float *__restrict pC, unsigned offsetC) {
-  static_assert(M * N / r / u > 0);
+  static_assert(M * N % r == 0);
   v16float zeros = broadcast_zero_to_v16float();
-#pragma clang loop unroll_count(M *N / r / u)
+#pragma clang loop unroll_count(M *N / r >= u ? M *N / r / u : 1)
   for (unsigned i = offsetC / r; i < offsetC / r + M * N / r; i++) {
     pC[i] = zeros;
   }
