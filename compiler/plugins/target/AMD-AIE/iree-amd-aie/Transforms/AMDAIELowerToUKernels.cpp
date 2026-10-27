@@ -177,6 +177,71 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatmulDAGForUKernel(
       genericMicroKernelOp.getOperation());
 }
 
+/// Matches the GEMV pipeline's tile, a `(1 x K) x (N x K)^T -> (1 x N)`
+/// linalg.matmul on unpacked 2-D operands, and converts it into a call to the
+/// matvec ukernel, which adds the products to the output.
+static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatvecDAGForUKernel(
+    RewriterBase &rewriter, Operation *op, const std::string &ukernelName,
+    const std::string &ukernelObjectName) {
+  auto matmulOp = dyn_cast<linalg::MatmulOp>(op);
+  if (!matmulOp) return rewriter.notifyMatchFailure(op, "is not a matmul");
+  MLIRContext *context = op->getContext();
+  AffineExpr m, n, k;
+  bindDims(context, m, n, k);
+  using MapList = ArrayRef<ArrayRef<AffineExpr>>;
+  if (matmulOp.getIndexingMapsArray() !=
+      AffineMap::inferFromExprList(MapList{{m, k}, {n, k}, {m, n}}, context)) {
+    return rewriter.notifyMatchFailure(op, "is not a transposed B matmul");
+  }
+  Value lhs = matmulOp.getDpsInputOperand(0)->get();
+  Value rhs = matmulOp.getDpsInputOperand(1)->get();
+  Value out = matmulOp.getDpsInitOperand(0)->get();
+  auto lhsType = cast<ShapedType>(lhs.getType());
+  auto rhsType = cast<ShapedType>(rhs.getType());
+  auto outType = cast<ShapedType>(out.getType());
+  if (!lhsType.hasStaticShape() || !rhsType.hasStaticShape() ||
+      lhsType.getDimSize(0) != 1) {
+    return rewriter.notifyMatchFailure(op, "is not a static M == 1 tile");
+  }
+  int64_t N = rhsType.getDimSize(0);
+  int64_t K = rhsType.getDimSize(1);
+  // The ukernel reads K in 64-lane vectors.
+  if (K % 64 != 0) {
+    return rewriter.notifyMatchFailure(op, "K is not a multiple of 64");
+  }
+  Type lhsElemType = lhsType.getElementType();
+  Type rhsElemType = rhsType.getElementType();
+  Type outElemType = outType.getElementType();
+  std::optional<AMDAIEDevice> device =
+      getConfigAMDAIEDevice(IREE::HAL::ExecutableTargetAttr::lookup(op));
+  if (!device || !isAie2P(*device) ||
+      !hasUKernelTemplate(*device, ukernelName,
+                          {lhsElemType, rhsElemType, outElemType},
+                          /*transposeB=*/true)) {
+    return rewriter.notifyMatchFailure(
+        op, "no ukernel template for the element types");
+  }
+
+  std::string elemTypeAndSize =
+      typeToString(lhsElemType) + "_" + typeToString(rhsElemType) + "_" +
+      typeToString(outElemType) + "_1x" + std::to_string(N) + "x" +
+      std::to_string(K);
+  FnNameAndDefAttrs fn = getFnNameAndDefAttrs(
+      rewriter, ukernelName, elemTypeAndSize, ukernelObjectName,
+      {typeToString(lhsElemType), typeToString(rhsElemType),
+       typeToString(outElemType), std::to_string(N), std::to_string(K)});
+
+  // Create UKernel for AMD-AIE.
+  Location loc = matmulOp.getLoc();
+  auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
+      loc, outType, fn.name, ValueRange{lhs, rhs}, out, ValueRange{},
+      /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
+      /*strided_outer_dims=*/0);
+
+  return cast<IREE::Codegen::UKernelOpInterface>(
+      genericMicroKernelOp.getOperation());
+}
+
 static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
     RewriterBase &rewriter, Operation *op, const std::string &ukernelName,
     const std::string &ukernelObjectName) {
@@ -402,6 +467,7 @@ struct LowerToUKernelPattern : OpRewritePattern<OpType> {
 }  // namespace
 
 static constexpr char kMatmulUKernelName[] = "matmul";
+static constexpr char kMatvecUKernelName[] = "matvec";
 static constexpr char kFillUKernelName[] = "zero_fill";
 static constexpr char kTruncIUKernelName[] = "trunci";
 static constexpr char kSoftmaxUKernelName[] = "softmax";
@@ -426,6 +492,8 @@ void AMDAIELowerToUKernelsPass::runOnOperation() {
       context, allTargets, matchMatmulDAGForUKernel, kMatmulUKernelName);
   patterns.insert<LowerToUKernelPattern<linalg::MatmulOp>>(
       context, allTargets, matchMatmulDAGForUKernel, kMatmulUKernelName);
+  patterns.insert<LowerToUKernelPattern<linalg::MatmulOp>>(
+      context, allTargets, matchMatvecDAGForUKernel, kMatvecUKernelName);
   patterns.insert<LowerToUKernelPattern<linalg::FillOp>>(
       context, allTargets, matchFillDAGForUKernel, kFillUKernelName);
   patterns.insert<LowerToUKernelPattern<linalg::GenericOp>>(

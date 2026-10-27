@@ -109,6 +109,7 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
   static const UKernelTemplate kNpu4Templates[] = {
       {"matmul", {"bf16", "bf16", "f32"}, /*transposeB=*/true},
       {"matmul", {"i8", "i8", "i32"}, /*transposeB=*/false},
+      {"matvec", {"bf16", "bf16", "f32"}, /*transposeB=*/true},
       {"zero_fill", {"f32"}, /*transposeB=*/false},
       {"zero_fill", {"i32"}, /*transposeB=*/false},
       {"trunci", {"i32", "i8"}, /*transposeB=*/false},
