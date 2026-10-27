@@ -104,6 +104,18 @@ OPTIONS = {
             ],
         },
     },
+    # User choice: whether max pooling runs on the CPU or, like contractions,
+    # round-robin on the accelerators. On an accelerator each pooling is its own
+    # dispatch, which costs more than the pooling itself on the CPU.
+    "placement": {
+        "pool": {
+            "cpu": [],
+            "accel": [
+                "--iree-amdaie-accelerate-pooling",
+                "--iree-amdaie-pooling-channels-last",
+            ],
+        },
+    },
 }
 
 # Default choice of each user option.
@@ -111,6 +123,7 @@ DEFAULTS = {
     "ukernel": "all",
     "vectorize": "off",
     "numeric": "f32",
+    "pool": "cpu",
 }
 
 
@@ -129,6 +142,8 @@ def check(selected, devices):
     # workaround: bf16 contractions fail to compile for the GPU; use f32.
     if selected.get("numeric") == "bf16" and any(d.startswith("vulkan-") for d in devices):
         return "--numeric bf16 is not supported with a vulkan device; use f32"
+    if selected.get("pool") == "accel" and devices == ["local-host"]:
+        return "--pool accel needs an accelerator device"
     return None
 
 
