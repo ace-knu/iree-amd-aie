@@ -19,42 +19,55 @@ namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
 
-/// Whether the producers of `logicalObjFifo` write slices that tile its single
-/// consumer's transfer contiguously and in increasing offset order: their base
-/// offsets are `consumerOffset + i * sliceLength`. This mirrors the check in
-/// `connectionToAIE` (AMDAIELowerToAIE.cpp) that guards splitting the
-/// consumer's transfer into one BD per producer slice. Layouts that fail it,
-/// like the interleaved slices of 4-level tiling, keep the shared lock pair.
-static bool producersTileConsumerInOrder(
+/// Whether the DMA `parties` on one side of `logicalObjFifo` (its producers if
+/// `partiesAreProducers`, else its consumers) each access a slice that tiles
+/// the transfer of the single DMA `other` on the opposite side contiguously and
+/// in increasing offset order: their base offsets are
+/// `otherOffset + i * sliceLength`. This mirrors the checks in
+/// `connectionToAIE` (AMDAIELowerToAIE.cpp) that guard splitting `other`'s
+/// transfer into one BD per party slice. Layouts that fail it, like the
+/// interleaved slices of 4-level tiling, keep the shared lock pair.
+static bool partiesTileTransferInOrder(
     AMDAIE::LogicalObjectFifoFromMemrefOp logicalObjFifo,
-    ArrayRef<CopyOpInterface> producers, CopyOpInterface consumer) {
+    ArrayRef<CopyOpInterface> parties, CopyOpInterface other,
+    bool partiesAreProducers) {
   SmallVector<size_t> offsets;
-  for (CopyOpInterface producer : producers) {
-    auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(producer.getOperation());
+  for (CopyOpInterface party : parties) {
+    auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(party.getOperation());
     if (!connectionOp) return false;
     FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> dmaOp =
         connectionOp.getNpuCircularDmaCpyNdUser();
     if (failed(dmaOp)) return false;
-    std::optional<size_t> offset = dmaOp->getTargetStaticBaseOffset();
+    std::optional<size_t> offset = partiesAreProducers
+                                       ? dmaOp->getTargetStaticBaseOffset()
+                                       : dmaOp->getSourceStaticBaseOffset();
     if (!offset) return false;
     offsets.push_back(offset.value());
   }
   llvm::sort(offsets);
   offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
-  if (offsets.size() != producers.size()) return false;
+  if (offsets.size() != parties.size()) return false;
 
-  auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(consumer.getOperation());
+  auto connectionOp = dyn_cast<AMDAIE::ConnectionOp>(other.getOperation());
   if (!connectionOp) return false;
   FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> dmaOp =
       connectionOp.getNpuCircularDmaCpyNdUser();
   if (failed(dmaOp)) return false;
-  std::optional<size_t> consumerOffset = dmaOp->getSourceStaticBaseOffset();
-  if (!consumerOffset) return false;
+  // `other` reads this objFifo if the parties are its producers, else writes
+  // it.
+  std::optional<size_t> otherOffset = partiesAreProducers
+                                          ? dmaOp->getSourceStaticBaseOffset()
+                                          : dmaOp->getTargetStaticBaseOffset();
+  if (!otherOffset) return false;
   FailureOr<size_t> repetitionCount = getRepetitionCount(
       cast<LogicalObjFifoOpInterface>(logicalObjFifo.getOperation()));
   if (failed(repetitionCount)) return false;
-  SmallVector<OpFoldResult> sizes = dmaOp->getSourceMixedSizes();
-  SmallVector<OpFoldResult> strides = dmaOp->getSourceMixedStrides();
+  SmallVector<OpFoldResult> sizes = partiesAreProducers
+                                        ? dmaOp->getSourceMixedSizes()
+                                        : dmaOp->getTargetMixedSizes();
+  SmallVector<OpFoldResult> strides = partiesAreProducers
+                                          ? dmaOp->getSourceMixedStrides()
+                                          : dmaOp->getTargetMixedStrides();
   if (failed(foldRepetitionCount(logicalObjFifo.getContext(), sizes, strides,
                                  repetitionCount.value())))
     return false;
@@ -63,11 +76,11 @@ static bool producersTileConsumerInOrder(
   int64_t totalLength =
       std::accumulate(staticSizes->begin(), staticSizes->end(), int64_t{1},
                       std::multiplies<>());
-  int64_t numProducers = static_cast<int64_t>(producers.size());
-  if (totalLength % numProducers != 0) return false;
-  size_t sliceLength = static_cast<size_t>(totalLength / numProducers);
+  int64_t numParties = static_cast<int64_t>(parties.size());
+  if (totalLength % numParties != 0) return false;
+  size_t sliceLength = static_cast<size_t>(totalLength / numParties);
   for (auto [i, offset] : llvm::enumerate(offsets)) {
-    if (offset != consumerOffset.value() + i * sliceLength) return false;
+    if (offset != otherOffset.value() + i * sliceLength) return false;
   }
   return true;
 }
@@ -141,21 +154,34 @@ LogicalResult bufferize(AMDAIE::WorkgroupOp workgroupOp) {
         // one acquire and one release lock, so that split is the only way to
         // express "wait for all N".
         //
-        // The mirrored single-producer/multi-consumer case keeps the scaled
-        // single pair; it has the same weakness, but is not exercised by the
-        // workloads this was written for. So do producers whose slices don't
-        // tile the consumer's transfer contiguously (see
-        // `producersTileConsumerInOrder`).
+        // The mirrored single-producer/multi-consumer case (one DMA writing the
+        // buffers, several independent DMA consumers each reading a disjoint
+        // slice, e.g. the GEMV weight block handed out per core) has the same
+        // weakness: a consumer that has run ahead acquires the next buffer
+        // against credits meant for the other consumers and ships it before it
+        // is written. It gets one lock pair per consumer, and the producer's
+        // transfer is split into one BD per consumer slice in the same way.
+        //
+        // Parties whose slices don't tile the opposite transfer contiguously
+        // (see `partiesTileTransferInOrder`) keep the scaled single pair.
         size_t numProducers = copyLikeProducers.size();
         size_t numConsumers = copyLikeConsumers.size();
         bool lockPairPerProducer =
             numProducers > 1 && numConsumers == 1 &&
-            producersTileConsumerInOrder(logicalObjFifo, copyLikeProducers,
-                                         copyLikeConsumers[0]);
-        size_t numLockPairs = lockPairPerProducer ? numProducers : 1;
+            partiesTileTransferInOrder(logicalObjFifo, copyLikeProducers,
+                                       copyLikeConsumers[0],
+                                       /*partiesAreProducers=*/true);
+        bool lockPairPerConsumer =
+            numConsumers > 1 && numProducers == 1 &&
+            partiesTileTransferInOrder(logicalObjFifo, copyLikeConsumers,
+                                       copyLikeProducers[0],
+                                       /*partiesAreProducers=*/false);
+        size_t numLockPairs = lockPairPerProducer   ? numProducers
+                              : lockPairPerConsumer ? numConsumers
+                                                    : 1;
         int8_t consumerLockInitValue{0};
         int8_t producerLockInitValue =
-            lockPairPerProducer
+            numLockPairs > 1
                 ? depth
                 : (numProducers >= numConsumers ? numProducers * depth
                                                 : numConsumers * depth);
