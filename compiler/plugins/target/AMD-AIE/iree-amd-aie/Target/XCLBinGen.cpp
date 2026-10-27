@@ -53,6 +53,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "aie_api_headers.h"
 #include "mlir/Transforms/Passes.h"
 #include "ukernels.h"
 
@@ -711,6 +712,31 @@ FailureOr<std::string> getUkernelFileContent(StringRef fileName) {
   return failure();
 }
 
+/// Writes the headers the ukernels taken from mlir-aie's aie_kernels include
+/// (aie_api, and aie_kernels' own `aie_kernels/*.h`) under `includeDir`.
+static LogicalResult writeAieKernelHeaders(const Path &includeDir) {
+  auto writeAll = [&](const iree_file_toc_t *start, size_t size,
+                      StringRef prefix) {
+    for (const iree_file_toc_t *file = start; file < start + size; ++file) {
+      if (!StringRef(file->name).starts_with(prefix)) continue;
+      Path path = includeDir / file->name;
+      if (auto maybeErr = dumpStrToDisk(std::string(file->data, file->size),
+                                        path.string());
+          maybeErr.has_value()) {
+        llvm::errs() << "Failed to dump to disk " << path.string()
+                     << " because: " << *maybeErr;
+        return failure();
+      }
+    }
+    return success();
+  };
+  if (failed(writeAll(iree_amd_aie_aie_api_create(),
+                      iree_amd_aie_aie_api_size(), "aie_api/")))
+    return failure();
+  return writeAll(iree_amd_aie_ukernels_create(), iree_amd_aie_ukernels_size(),
+                  "aie_kernels/");
+}
+
 /// Retrieves the maximum stack size for the provided program (ELF file) using
 /// 'llvm-readelf'.
 FailureOr<uint32_t> getMaxStackSizeFromExecutable(const std::string &outputFile,
@@ -774,6 +800,7 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
   // Keep track of the ukernel object file that has been generated, so that we
   // don't need to regenerate it for every core.
   llvm::DenseMap<StringRef, Path> ukernelObjectNameToPath;
+  bool aieKernelHeadersWritten = false;
   for (auto iter : llvm::enumerate(coreOps)) {
     // Control logging verbosity: lower verbosing for all but the first core.
     bool verboseForThisIteration = verbose && (iter.index() == 0);
@@ -852,6 +879,22 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
             getUkernelInstances(deviceOp, ukernelObjectName);
         if (!instances.empty())
           extraArgs.push_back("-DUK_INSTANCES=" + instances);
+        // A ukernel taken from mlir-aie's aie_kernels is written against
+        // aie_api; compile it with the flags mlir-aie compiles those with.
+        if (StringRef(*ukernelFileContent).contains("<aie_api/aie.hpp>")) {
+          Path includeDir = tempDir / "ukernel_include";
+          if (!aieKernelHeadersWritten) {
+            if (failed(writeAieKernelHeaders(includeDir))) return failure();
+            aieKernelHeadersWritten = true;
+          }
+          extraArgs.insert(
+              extraArgs.end(),
+              {"-std=c++20", "-I" + includeDir.string(),
+               // aie_api's adf include is Vitis-only, absent from peano.
+               "--system-header-prefix=aie_api/", "-D__AIE_API_AIE_ADF_HPP__",
+               "-DNDEBUG", "-Wno-parentheses", "-Wno-attributes",
+               "-Wno-macro-redefined", "-Wno-empty-body"});
+        }
         ukernelObjectFilePath = assembleStringUsingPeano(
             /*inputFileStr=*/*ukernelFileContent,
             /*inputFileName=*/ukernelFileName,

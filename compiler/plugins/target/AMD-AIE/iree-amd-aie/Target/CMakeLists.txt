@@ -22,6 +22,8 @@ iree_c_embed_data(
     "uKernels/npu4/peano/matmul.cc"
     "uKernels/npu4/peano/trunci.cc"
     "uKernels/npu4/peano/zero_fill.cc"
+    "uKernels/aie_kernels/aie_arch.h"
+    "uKernels/aie_kernels/aie_kernel_utils.h"
   C_FILE_OUTPUT
     "ukernels.c"
   H_FILE_OUTPUT
@@ -30,6 +32,26 @@ iree_c_embed_data(
     "iree_amd_aie_ukernels"
   STRIP_PREFIX
     "${CMAKE_CURRENT_SOURCE_DIR}/uKernels/"
+  PUBLIC
+)
+
+# The aie_api headers (third_party/aie_api), for the peano ukernels taken from
+# mlir-aie's aie_kernels, which are written against aie_api.
+file(GLOB_RECURSE _AIE_API_HEADERS CONFIGURE_DEPENDS
+  "${IREE_AMD_AIE_SOURCE_DIR}/third_party/aie_api/include/aie_api/*")
+iree_c_embed_data(
+  NAME
+    AMDAIEAieApi
+  SRCS
+    ${_AIE_API_HEADERS}
+  C_FILE_OUTPUT
+    "aie_api_headers.c"
+  H_FILE_OUTPUT
+    "aie_api_headers.h"
+  IDENTIFIER
+    "iree_amd_aie_aie_api"
+  STRIP_PREFIX
+    "${IREE_AMD_AIE_SOURCE_DIR}/third_party/aie_api/include/"
   PUBLIC
 )
 
@@ -54,6 +76,7 @@ iree_cc_library(
     "XCLBinGen.cpp"
   DEPS
     ::AMDAIERT
+    ::AMDAIEAieApi
     ::AMDAIEUkernels
     iree-amd-aie::aie_runtime::iree_aie_runtime_static
     iree::target::amd-aie::Transforms
