@@ -45,7 +45,8 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int outliningLoopInCallCount, bool insertLoopAroundCoreBlock,
-    bool emitCtrlPkt, uint32_t coreStackSize, bool reprogramDmas);
+    bool emitCtrlPkt, uint32_t coreStackSize, bool reprogramDmas,
+    PoolCoreSplit poolCoreSplit, PoolColumnsPolicy poolColumnsPolicy);
 
 /// Populates passes needed to lower the IR via a Pack-Peel based approach.
 void addPackPeelBasedPassPipeline(OpPassManager &passManager,
@@ -65,6 +66,16 @@ void addConvDecomposePassPipeline(OpPassManager &passManager,
 void addGeneralCopyPassPipeline(OpPassManager &passManager,
                                 TilePassPipeline useTilePipeline,
                                 Operation *rootOp);
+
+/// Populates passes needed to lower a small-M (GEMV-like) matmul: pack-peel's
+/// loop structure with copies in place of packs. Selected per dispatch by the
+/// lowering strategy (see `kTilePipelineOverrideName`).
+void addGemvPassPipeline(OpPassManager &passManager);
+
+/// Populates passes needed to lower a 2-D max pooling with copies: block and
+/// core forall levels over the output dims, the window kept inside the core
+/// op. Selected per dispatch by the lowering strategy (`"pool"` override).
+void addPoolPassPipeline(OpPassManager &passManager);
 
 /// Populates passes needed to link HAL executables across AIE targets.
 void buildAMDAIELinkingPassPipeline(OpPassManager &passManager);
@@ -96,10 +107,19 @@ std::unique_ptr<Pass> createAMDAIEAnnotateInputDevicesPass();
 /// dispatch), inserting the padding at the Flow dispatch boundary.
 std::unique_ptr<Pass> createAMDAIEPadContractionDispatchesPass();
 
+/// Create a preprocessing pass that rewrites NCHW max pooling as NHWC max
+/// pooling wrapped in transposes (channels-last, matching the convs).
+std::unique_ptr<Pass> createAMDAIEConvertPoolingToChannelsLastPass(
+    AMDAIEConvertPoolingToChannelsLastOptions options = {});
+
 /// Create a pass that splits a large-(K,N) transpose_b NPU matmul dispatch into
 /// N-chunk sub-dispatches (weight sliced along N) concatenated on the host, to
 /// keep each weight L3->L2 shim DMA within the shim's addressing limits.
 std::unique_ptr<Pass> createAMDAIESplitLargeContractionDispatchesPass();
+
+/// Create a pass to pad NPU max pooling dispatches' OH at the Flow dispatch
+/// boundary per the target's pool column policy.
+std::unique_ptr<Pass> createAMDAIEPadPoolingDispatchesPass();
 
 /// Create a pass to assign types to `amdaie.connection` ops.
 std::unique_ptr<Pass> createAMDAIEAssignConnectionTypesPass(
@@ -269,7 +289,8 @@ std::unique_ptr<Pass> createAMDAIEFuseProducerIntoLoopPass(
 
 /// Create a pass to insert copy operations on inputs and results of the
 /// targeted operation.
-std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass();
+std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass(
+    AMDAIEInsertCopyOpsOptions options = {});
 
 /// Create pass to insert `amdaie.core` operations inside the innermost
 /// `scf.forall` operations selected for parallel execution.

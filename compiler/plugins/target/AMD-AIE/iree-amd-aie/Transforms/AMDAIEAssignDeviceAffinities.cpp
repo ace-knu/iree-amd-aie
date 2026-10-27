@@ -30,6 +30,7 @@
 
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
@@ -77,7 +78,18 @@ namespace {
 struct DeviceInfo {
   FlatSymbolRefAttr ref;
   StringRef backend;
+  // The device's (first) executable target, for per-target placement config.
+  IREE::HAL::ExecutableTargetAttr target;
 };
+
+/// The first executable target of a device global, or null.
+static IREE::HAL::ExecutableTargetAttr getDeviceExecutableTarget(
+    IREE::Util::GlobalOpInterface global) {
+  auto deviceTarget = dyn_cast_or_null<IREE::HAL::DeviceTargetAttr>(
+      global.getGlobalInitialValue());
+  if (!deviceTarget || deviceTarget.getExecutableTargets().empty()) return {};
+  return deviceTarget.getExecutableTargets().front();
+}
 
 /// Returns true if the linalg op's reduction body is a multiply-accumulate
 /// (`out + lhs * rhs`), i.e. a real contraction/convolution rather than a
@@ -101,11 +113,19 @@ static bool hasMultiplyAccumulateBody(linalg::LinalgOp linalgOp) {
 /// structurally look like convolutions but have a non-multiply-accumulate body
 /// (max/min); they are excluded via `hasMultiplyAccumulateBody` so they route
 /// to the host instead. (Contractions already imply a multiply-accumulate body,
-/// so that branch needs no extra check.)
-static bool executableIsContractionOrConv(IREE::Flow::ExecutableOp exe) {
+/// so that branch needs no extra check.) With `allowPooling` (the target's
+/// `pooling` config), a 2-D max pooling generic is admitted as well: the pool
+/// tile pipeline lowers it.
+static bool executableIsContractionOrConv(IREE::Flow::ExecutableOp exe,
+                                          bool allowPooling) {
   ModuleOp innerModule = exe.getInnerModule();
   if (!innerModule) return false;
   bool found = false;
+  // A max pooling is admitted only when the dispatch holds nothing else but
+  // its init fill: the pool pipeline has no fused-consumer support, so a
+  // pooling fused with e.g. a layout transpose (which happens when no NHWC conv
+  // follows to absorb the transpose) must stay on the host.
+  bool foundPooling = false, poolingOnly = true;
   innerModule.walk([&](linalg::LinalgOp linalgOp) {
     if (linalg::isaContractionOpInterface(linalgOp) ||
         (linalg::isaConvolutionOpInterface(linalgOp) &&
@@ -113,9 +133,14 @@ static bool executableIsContractionOrConv(IREE::Flow::ExecutableOp exe) {
       found = true;
       return WalkResult::interrupt();
     }
+    if (allowPooling && isMaxPoolingOp(linalgOp)) {
+      foundPooling = true;
+    } else if (!isa<linalg::FillOp>(linalgOp)) {
+      poolingOnly = false;
+    }
     return WalkResult::advance();
   });
-  return found;
+  return found || (foundPooling && poolingOnly);
 }
 
 //===----------------------------------------------------------------------===//
@@ -323,7 +348,7 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   for (auto global : moduleOp.getOps<IREE::Util::GlobalOpInterface>()) {
     StringRef backend = getDeviceBackend(global);
     DeviceInfo info{FlatSymbolRefAttr::get(ctx, global.getGlobalName()),
-                    backend};
+                    backend, getDeviceExecutableTarget(global)};
     switch (deviceRole(backend)) {
       case DeviceRole::Accelerator:
         accelerators.push_back(info);
@@ -350,9 +375,15 @@ void AMDAIEAssignDeviceAffinitiesPass::runOnOperation() {
   // Pin each dispatch: contraction/conv -> accelerator, everything else -> host.
   // Both are set explicitly so the affinity solver does not propagate the host
   // affinity onto accelerator work (it minimizes transfers otherwise).
+  // Pooling counts as accelerator work when an accelerator's target enables
+  // it (only amd-aie carries the `pooling` config key).
+  bool allowPooling = llvm::any_of(accelerators, [](const DeviceInfo &d) {
+    return d.target && getConfigEnablePooling(d.target);
+  });
   DenseMap<StringRef, bool> executableIsAccel;
   for (auto exe : moduleOp.getOps<IREE::Flow::ExecutableOp>())
-    executableIsAccel[exe.getSymName()] = executableIsContractionOrConv(exe);
+    executableIsAccel[exe.getSymName()] =
+        executableIsContractionOrConv(exe, allowPooling);
   unsigned accelIdx = 0;
   DenseSet<Attribute> usedRefs;
   // placement-map (experiment, default empty): only consulted inside the

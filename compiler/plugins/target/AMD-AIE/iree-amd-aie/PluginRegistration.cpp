@@ -62,6 +62,22 @@ struct AMDAIESession
           GlobalOptimization::DemoteType::BF16,
           GlobalOptimization::DemoteOperation::All));
     }
+    // Move NCHW max pooling to NHWC so it matches the channels-last convs
+    // (the upstream channels-last pass skips pooling); the transposes this
+    // inserts cancel against the conv-side ones downstream.
+    // The pool pipeline splits C over the array rows, so C is padded up to a
+    // multiple of the row count here (channels are independent under max, the
+    // extra ones are sliced off the result).
+    if (options.poolingChannelsLast) {
+      AMDAIE::AMDAIEDeviceModel deviceModel =
+          AMDAIE::getDeviceModel(options.AMDAIETargetDevice);
+      AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
+      poolOptions.channelMultiple = options.getNumRows(deviceModel);
+      poolOptions.haloSplitColumns = options.getNumCols(deviceModel);
+      poolOptions.columnsPolicy = options.poolColumnsPolicy;
+      passManager.addPass(
+          AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass(poolOptions));
+    }
     // Inject the device topology now, while both device globals still exist
     // (an unused CPU device global would otherwise be DCE'd before the Flow
     // phase). The topology's symbol references keep the CPU device global
@@ -95,6 +111,13 @@ struct AMDAIESession
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.
     passManager.addPass(AMDAIE::createAMDAIEPadContractionDispatchesPass());
+    // Likewise pad NPU max pooling dispatches' OH up to what the target's pool
+    // column policy asks for (`full`: a multiple of the column count), so the
+    // pool pipeline can spread OH over every column. Done here, not in the
+    // preprocessing, because the dispatch's init fill is already inside the
+    // dispatch and just grows in place (a fill created before dispatch
+    // formation gets hoisted out as a splat the pool pipeline cannot take).
+    passManager.addPass(AMDAIE::createAMDAIEPadPoolingDispatchesPass());
     // Split large-(K,N) transpose_b NPU matmul dispatches (padded above) into
     // N-chunk sub-dispatches so each weight's L3->L2 shim DMA stays within the
     // shim addressing limits (a single large-N weight DMA degrades and stalls).

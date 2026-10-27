@@ -6,6 +6,7 @@
 
 #include "AMDAIEUtils.h"
 
+#include <algorithm>
 #include <optional>
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
@@ -14,6 +15,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #define DEBUG_TYPE "iree-amdaie-utils"
@@ -127,6 +129,200 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
              return s == typeToString(type);
            });
   });
+}
+
+bool isGemvMExtent(int64_t m) { return m == 1; }
+
+int64_t choosePoolColumns(int64_t oh, int64_t numCols) {
+  if (oh <= 0 || numCols <= 0) return 1;
+  int64_t odd = oh;
+  while (odd % 2 == 0) odd /= 2;
+  if (odd > 1 && odd <= numCols) return odd;
+  int64_t best = 1;
+  for (int64_t d = 1; d <= std::min(oh, numCols); ++d)
+    if (oh % d == 0) best = d;
+  return best;
+}
+
+double PoolShape::bytesMoved(int64_t oh) const {
+  auto inExtent = [](int64_t t, int64_t stride, int64_t window) {
+    return (t - 1) * stride + window;
+  };
+  double in = static_cast<double>(inExtent(oh, strideH, windowH)) *
+              inExtent(ow, strideW, windowW) * c * bytesIn;
+  double out = static_cast<double>(oh) * ow * c * bytesOut;
+  return in + out;
+}
+
+PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
+                              PoolColumnsPolicy policy, const PoolShape &shape,
+                              bool allowPad, const PoolColumnCost &cost) {
+  if (oh <= 0 || numCols <= 0) return {1, oh};
+  auto roundUp = [](int64_t v, int64_t m) { return ((v + m - 1) / m) * m; };
+  switch (policy) {
+    case PoolColumnsPolicy::Odd:
+      return {choosePoolColumns(oh, numCols), oh};
+    case PoolColumnsPolicy::Max: {
+      int64_t best = 1;
+      for (int64_t d = 1; d <= std::min(oh, numCols); ++d)
+        if (oh % d == 0) best = d;
+      return {best, oh};
+    }
+    case PoolColumnsPolicy::Full: {
+      if (oh % numCols == 0) return {numCols, oh};
+      if (allowPad) return {numCols, roundUp(oh, numCols)};
+      return {choosePoolColumns(oh, numCols), oh};
+    }
+    case PoolColumnsPolicy::Cost: {
+      // Cheapest divisor of a given extent under the cost model.
+      auto bestFor = [&](int64_t extent) {
+        double bytes = shape.bytesMoved(extent);
+        int64_t bestCols = 1;
+        double bestT = cost.timeMs(1, bytes);
+        for (int64_t d = 2; d <= std::min(extent, numCols); ++d) {
+          if (extent % d != 0) continue;
+          double t = cost.timeMs(d, bytes);
+          if (t < bestT) {
+            bestT = t;
+            bestCols = d;
+          }
+        }
+        return std::make_pair(bestCols, bestT);
+      };
+      auto [cols, t] = bestFor(oh);
+      if (allowPad && oh % numCols != 0) {
+        int64_t padded = roundUp(oh, numCols);
+        auto [colsP, tP] = bestFor(padded);
+        // The padded shape also pays the host pad (input copy) and crop
+        // (output copy) dispatches.
+        tP += cost.hostPadMs(shape.bytesMoved(padded));
+        if (tP < t) return {colsP, padded};
+      }
+      return {cols, oh};
+    }
+  }
+  return {choosePoolColumns(oh, numCols), oh};
+}
+
+bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr =
+      getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");
+  return !attr || attr->getValue();
+}
+
+bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr =
+      getConfigAttr<BoolAttr>(targetAttr, "gemv_pad_n");
+  return !attr || attr->getValue();
+}
+
+int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<IntegerAttr> attr =
+      getConfigAttr<IntegerAttr>(targetAttr, "core_stack_size");
+  return attr ? attr->getInt() : 1024;
+}
+
+int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<IntegerAttr> attr =
+      getConfigAttr<IntegerAttr>(targetAttr, "gemv_n1");
+  return attr ? attr->getInt() : 32;
+}
+
+llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy) {
+  switch (policy) {
+    case PoolColumnsPolicy::Odd:
+      return "odd";
+    case PoolColumnsPolicy::Cost:
+      return "cost";
+    case PoolColumnsPolicy::Full:
+      return "full";
+    case PoolColumnsPolicy::Max:
+      return "max";
+  }
+  return "max";
+}
+
+PoolColumnsPolicy getConfigPoolColumnsPolicy(
+    IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<StringAttr> attr =
+      getConfigAttr<StringAttr>(targetAttr, "pool_columns_policy");
+  if (!attr) return PoolColumnsPolicy::Max;
+  llvm::StringRef s = attr->getValue();
+  if (s == "odd") return PoolColumnsPolicy::Odd;
+  if (s == "cost") return PoolColumnsPolicy::Cost;
+  if (s == "full") return PoolColumnsPolicy::Full;
+  return PoolColumnsPolicy::Max;
+}
+
+/// Double-buffered A (M x kTile), B (n1 x kTile) and C (M x n1) tiles.
+static int64_t gemvL1Bytes(int64_t M, int64_t n1, int64_t kTile,
+                           int64_t bytesLhs, int64_t bytesRhs,
+                           int64_t bytesOut) {
+  return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
+}
+
+int64_t gemvN1Cap(int64_t M, int64_t kTile, int64_t bytesLhs, int64_t bytesRhs,
+                  int64_t bytesOut, int64_t l1Limit, int64_t n1Max) {
+  int64_t cap = 0;
+  for (int64_t n1 = 1; n1 <= n1Max; ++n1) {
+    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
+      break;
+    cap = n1;
+  }
+  return cap;
+}
+
+FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
+                                         int64_t bytesLhs, int64_t bytesRhs,
+                                         int64_t bytesOut, int64_t numRows,
+                                         int64_t numCols, int64_t l1Limit,
+                                         int64_t n1Max) {
+  int64_t numCores = numRows * numCols;
+  GemvNTiling best{0, 0};
+  auto better = [&](int64_t n1, int64_t cores) {
+    if (cores != best.cores) return cores > best.cores;
+    if (cores == numCores) {
+      // Canonical: the largest n1 that is <= n1Max; anything above the cap
+      // only if nothing fits under it.
+      bool a = n1 <= n1Max, b = best.n1 <= n1Max;
+      if (a != b) return a;
+      return a ? n1 > best.n1 : n1 < best.n1;
+    }
+    return n1 > best.n1;
+  };
+  for (int64_t n1 = 1; n1 <= N; ++n1) {
+    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
+      break;
+    if (N % n1 != 0) continue;
+    int64_t cores = 0;
+    for (int64_t c = numCores; c >= 1; --c) {
+      if (N % (c * n1) != 0 || (c > numRows && c % numRows != 0)) continue;
+      cores = c;
+      break;
+    }
+    if (best.n1 == 0 || better(n1, cores)) best = {n1, cores};
+  }
+  if (best.n1 == 0) return failure();
+  return best;
+}
+
+int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
+                       int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
+                       int64_t numCols, int64_t l1Limit, int64_t n1Max) {
+  int64_t numCores = numRows * numCols;
+  if (N < numCores) return N;
+  int64_t cap =
+      gemvN1Cap(M, kTile, bytesLhs, bytesRhs, bytesOut, l1Limit, n1Max);
+  if (cap <= 0) return N;
+  auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+  int64_t blocks = ceilDiv(N, numCores * cap);
+  int64_t n1 = ceilDiv(N, numCores * blocks);
+  return numCores * n1 * blocks;
+}
+
+bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr = getConfigAttr<BoolAttr>(targetAttr, "pooling");
+  return attr && attr->getValue();
 }
 
 /// Utility to retrieve a constant index from an OpFoldResult.
@@ -675,6 +871,128 @@ std::optional<int64_t> getNumColumnsUsedByCores(ModuleOp moduleOp) {
 
   if (res.wasInterrupted() || !foundCoreOp) return std::nullopt;
   return (maxColumn - minColumn + 1);
+}
+
+
+/// Matches `d_o * stride + d_k` (or `d_o + d_k`) where `d_o` is a parallel
+/// loop and `d_k` a reduction loop.
+static bool matchStridedDimExpr(AffineExpr e,
+                                ArrayRef<utils::IteratorType> iters,
+                                unsigned &outDim, unsigned &winDim,
+                                int64_t &stride) {
+  auto add = dyn_cast<AffineBinaryOpExpr>(e);
+  if (!add || add.getKind() != AffineExprKind::Add) return false;
+  auto parse = [&](AffineExpr a, AffineExpr b) -> bool {
+    auto bDim = dyn_cast<AffineDimExpr>(b);
+    if (!bDim) return false;
+    unsigned aPos;
+    int64_t s = 1;
+    if (auto aDim = dyn_cast<AffineDimExpr>(a)) {
+      aPos = aDim.getPosition();
+    } else {
+      auto mul = dyn_cast<AffineBinaryOpExpr>(a);
+      if (!mul || mul.getKind() != AffineExprKind::Mul) return false;
+      auto d = dyn_cast<AffineDimExpr>(mul.getLHS());
+      auto c = dyn_cast<AffineConstantExpr>(mul.getRHS());
+      if (!d || !c) return false;
+      aPos = d.getPosition();
+      s = c.getValue();
+    }
+    unsigned bPos = bDim.getPosition();
+    bool aPar = iters[aPos] == utils::IteratorType::parallel;
+    bool bPar = iters[bPos] == utils::IteratorType::parallel;
+    if (aPar && !bPar) {
+      outDim = aPos;
+      winDim = bPos;
+      stride = s;
+      return true;
+    }
+    if (!aPar && bPar && s == 1) {
+      outDim = bPos;
+      winDim = aPos;
+      stride = 1;
+      return true;
+    }
+    return false;
+  };
+  return parse(add.getLHS(), add.getRHS()) || parse(add.getRHS(), add.getLHS());
+}
+
+FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp) {
+  if (!isa<linalg::GenericOp>(linalgOp.getOperation())) return failure();
+  if (linalgOp.getNumDpsInputs() != 2 || linalgOp.getNumDpsInits() != 1)
+    return failure();
+  if (linalgOp.getNumReductionLoops() != 2) return failure();
+  Block *body = linalgOp.getBlock();
+  if (!body || body->getNumArguments() != 3) return failure();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(body->getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1) return failure();
+  auto maxOp = yieldOp.getOperand(0).getDefiningOp<arith::MaximumFOp>();
+  if (!maxOp) return failure();
+  Value in = body->getArgument(0), out = body->getArgument(2);
+  if (!((maxOp.getLhs() == out && maxOp.getRhs() == in) ||
+        (maxOp.getLhs() == in && maxOp.getRhs() == out)))
+    return failure();
+
+  SmallVector<utils::IteratorType> iters = linalgOp.getIteratorTypesArray();
+  AffineMap inMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(0));
+  AffineMap winMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(1));
+  AffineMap outMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInitOperand(0));
+
+  // Output: identity over the parallel loops, which come first.
+  unsigned numPar = linalgOp.getNumParallelLoops();
+  if (outMap.getNumResults() != numPar) return failure();
+  for (auto [i, e] : llvm::enumerate(outMap.getResults())) {
+    auto d = dyn_cast<AffineDimExpr>(e);
+    if (!d || d.getPosition() != i || iters[i] != utils::IteratorType::parallel)
+      return failure();
+  }
+  // Window: the two reduction loops.
+  if (winMap.getNumResults() != 2) return failure();
+  SmallVector<unsigned> winDims;
+  for (AffineExpr e : winMap.getResults()) {
+    auto d = dyn_cast<AffineDimExpr>(e);
+    if (!d || iters[d.getPosition()] != utils::IteratorType::reduction)
+      return failure();
+    winDims.push_back(d.getPosition());
+  }
+  // Data input: one result per output dim, in the output's order, either the
+  // dim itself or `dim * stride + window`.
+  if (inMap.getNumResults() != numPar) return failure();
+  MaxPoolingDims dims;
+  for (auto [i, e] : llvm::enumerate(inMap.getResults())) {
+    if (auto d = dyn_cast<AffineDimExpr>(e)) {
+      if (d.getPosition() != i) return failure();
+      dims.plainDims.push_back(i);
+      continue;
+    }
+    unsigned o, k;
+    int64_t s;
+    if (!matchStridedDimExpr(e, iters, o, k, s) || o != i) return failure();
+    dims.spatialDims.push_back(o);
+    dims.windowDims.push_back(k);
+    dims.strides.push_back(s);
+  }
+  if (dims.spatialDims.size() != 2 || dims.windowDims != winDims)
+    return failure();
+  return dims;
+}
+
+bool isMaxPoolingOp(linalg::LinalgOp linalgOp) {
+  return succeeded(getMaxPoolingDims(linalgOp));
+}
+
+bool isUndefinedTensor(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (isa<tensor::EmptyOp>(def)) return true;
+    auto slice = dyn_cast<tensor::ExtractSliceOp>(def);
+    if (!slice) return false;
+    v = slice.getSource();
+  }
+  return false;
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

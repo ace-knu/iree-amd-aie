@@ -113,38 +113,41 @@ void AMDAIEFuseProducerIntoLoopPass::runOnOperation() {
   // computation op. Currently, we are limiting the producers to linalg.pack or
   // linalg.copy ops.
   for (unsigned depth = 1; depth <= fuseDepth; depth++) {
-    // Search the last compute op in the loop and its producer slices.
-    linalg::GenericOp genericOp;
+    // Search the last compute op in the loop and its producer slices. A named
+    // contraction op counts too: the GEMV pipeline feeds its matmul with copies
+    // rather than packs, so it is never generalized.
+    linalg::LinalgOp computeOp;
     scfLoopOp->walk<WalkOrder::PostOrder, ReverseIterator>(
         [&](linalg::LinalgOp op) {
-          if (isa<linalg::GenericOp>(op)) {
-            genericOp = cast<linalg::GenericOp>(op);
+          if (isa<linalg::GenericOp, linalg::ContractionOpInterface>(
+                  op.getOperation())) {
+            computeOp = op;
             return WalkResult::interrupt();
           }
           return WalkResult::advance();
         });
 
-    if (!genericOp) {
+    if (!computeOp) {
       LLVM_DEBUG(llvm::dbgs() << "----- There is no compute op.-----\n");
       return;
     }
 
-    if (targetElementwise && !isElementwise(genericOp)) {
+    if (targetElementwise && !isElementwise(computeOp)) {
       LLVM_DEBUG(llvm::dbgs()
                  << "----- The target compute op is not elementwise.-----\n");
       return;
     }
 
     // Materialize each slice of the producer in place.
-    for (Value operand : genericOp.getOperands()) {
+    for (Value operand : computeOp->getOperands()) {
       // Case where operand of a generic op is a pack/copy op which is in a
       // different block than the generic's block.
       if (isa_and_present<linalg::PackOp, linalg::CopyOp>(
               operand.getDefiningOp())) {
         Operation *parent = operand.getDefiningOp();
-        Block *genericBlock = genericOp->getBlock();
-        if (parent->getBlock() != genericBlock && parent->hasOneUse()) {
-          Operation *firstOpInBlock = &genericBlock->front();
+        Block *computeBlock = computeOp->getBlock();
+        if (parent->getBlock() != computeBlock && parent->hasOneUse()) {
+          Operation *firstOpInBlock = &computeBlock->front();
           rewriter.moveOpBefore(parent, firstOpInBlock);
           continue;
         }

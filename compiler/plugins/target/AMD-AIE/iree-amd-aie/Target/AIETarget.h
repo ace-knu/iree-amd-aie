@@ -108,7 +108,35 @@ struct AMDAIEOptions {
   }
 
   std::string enableAMDAIEUkernels{"none"};
+  // Route small-M (GEMV-like) matmuls to the GEMV tile pipeline and skip their
+  // M/N padding and N-splitting (KernelDispatch, AMDAIEPadContractionDispatches).
+  // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
+  bool enableGemvPipeline{true};
+  // Let the Flow pad pass grow a GEMV's N (host pad + crop) to the canonical
+  // layout (N=1000 -> 1024: 20 -> 32 cores). The padded weight rows are
+  // filled with 1.0, not 0: a core whose rows are all exact zeros runs its
+  // scalar bf16 loop on the fast path, finishes far ahead of the others and
+  // the GEMV pipeline deadlocks ("ert state 8"); see
+  // docs_POOL/1012_full_array_padding_design.md §8.8.
+  bool gemvPadN{true};
+  // Per-core N tile cap of the canonical GEMV layout (outputs per core per
+  // block); 32 is the fc1 tile the pipeline was measured with.
+  int64_t gemvN1{32};
+  // Preprocessing: rewrite NCHW max pooling as NHWC (channels-last) pooling
+  // wrapped in transposes, so pooling matches the NHWC convs and the transposes
+  // around each pool cancel. Stage 0 of the NPU pooling work; default off.
+  bool poolingChannelsLast{false};
+  // Place 2-D max pooling dispatches on the NPU (pool tile pipeline) instead
+  // of the host. Stage 1 of the NPU pooling work; default off.
+  bool enablePooling{false};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
+
+  // How the pool pipeline lays max pooling out on the core array (see
+  // `PoolCoreSplit`). Only matters with `--iree-amdaie-enable-pooling`.
+  PoolCoreSplit poolCoreSplit{PoolCoreSplit::SpatialChannel};
+  // How many columns the pool pipeline uses for a pooling (and whether the
+  // preprocessing pads OH to get there); see `PoolColumnsPolicy`.
+  PoolColumnsPolicy poolColumnsPolicy{PoolColumnsPolicy::Max};
   bool enableCtrlPkt{false};
 
   enum class DeviceHAL { XRT, AMDXDNA };
@@ -204,6 +232,39 @@ struct AMDAIEOptions {
         llvm::cl::desc("Enables microkernels in the amdaie backend. May be "
                        "`none`, `all`, or a comma-separated list of specific "
                        "unprefixed microkernels to enable, e.g. `matmul`."));
+
+    binder.opt<bool>(
+        "iree-amdaie-enable-gemv-pipeline", enableGemvPipeline,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Lower small-M (GEMV-like) matmuls with the GEMV tile "
+                       "pipeline instead of pack-peel (and skip their M/N "
+                       "padding and N-splitting). Default true."));
+
+    binder.opt<bool>(
+        "iree-amdaie-gemv-pad-n", gemvPadN, llvm::cl::cat(category),
+        llvm::cl::desc("Pad a GEMV's N on the host (Flow pad pass, with a "
+                       "crop) to the canonical layout so the GEMV pipeline "
+                       "uses every core. Default true."));
+
+    binder.opt<int64_t>(
+        "iree-amdaie-gemv-n1", gemvN1, llvm::cl::cat(category),
+        llvm::cl::desc("Per-core N tile cap of the canonical GEMV layout: N "
+                       "is padded to 32 * n1 * blocks with n1 <= this (and "
+                       "the L1 budget). Default 32."));
+
+    binder.opt<bool>(
+        "iree-amdaie-enable-pooling", enablePooling, llvm::cl::cat(category),
+        llvm::cl::desc("Place 2-D max pooling dispatches on the NPU and lower "
+                       "them with the copy-based pool tile pipeline. Default "
+                       "false (pooling stays on the host)."));
+
+    binder.opt<bool>(
+        "iree-amdaie-pooling-channels-last", poolingChannelsLast,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Rewrite NCHW max pooling as NHWC (channels-last) "
+                       "pooling in preprocessing, matching the channels-last "
+                       "convs so the transposes around each pool cancel. "
+                       "Default false."));
 
     /// Command line option for selecting the lowering pipeline to use to
     /// generate AIE DMA configurations, core code and control code.
@@ -349,6 +410,35 @@ struct AMDAIEOptions {
             "columns. However, some workloads (like convolution) currently "
             "ignore this flag, and use a hardcoded number of cols."));
 
+    binder.opt<PoolCoreSplit>(
+        "iree-amdaie-pool-core-split", poolCoreSplit, llvm::cl::cat(category),
+        llvm::cl::desc("How the pool pipeline spreads a max pooling over the "
+                       "core array (with --iree-amdaie-enable-pooling)"),
+        llvm::cl::values(
+            clEnumValN(PoolCoreSplit::SpatialChannel, "spatial-channel",
+                       "Columns take the leading spatial output dim (its odd "
+                       "factor, 7 for VGG-16), rows take the channel dim."),
+            clEnumValN(PoolCoreSplit::Search, "search",
+                       "Search one distributed output dim, ranked by core "
+                       "count, channel tile and L1 bytes.")));
+    binder.opt<PoolColumnsPolicy>(
+        "iree-amdaie-pool-columns-policy", poolColumnsPolicy,
+        llvm::cl::cat(category),
+        llvm::cl::desc("How many array columns a max pooling is spread over "
+                       "(with --iree-amdaie-enable-pooling)"),
+        llvm::cl::values(
+            clEnumValN(PoolColumnsPolicy::Odd, "odd",
+                       "OH's odd factor (7 for VGG-16), never pads OH."),
+            clEnumValN(PoolColumnsPolicy::Cost, "cost",
+                       "The divisor of OH (padded when cheaper) that "
+                       "minimises the per-column cost model."),
+            clEnumValN(PoolColumnsPolicy::Full, "full",
+                       "All columns; OH is padded on the host to a multiple "
+                       "of the column count."),
+            clEnumValN(PoolColumnsPolicy::Max, "max",
+                       "OH's largest divisor that fits the array (all "
+                       "columns when OH divides by the column count); "
+                       "never pads OH. The default.")));
     binder.opt<PacketFlowStrategy>(
         "iree-amdaie-packet-flow-strategy", packetFlowStrategy,
         llvm::cl::cat(category),

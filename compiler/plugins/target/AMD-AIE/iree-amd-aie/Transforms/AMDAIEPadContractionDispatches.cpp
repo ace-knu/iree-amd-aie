@@ -38,6 +38,7 @@
 // (affinity -> device global -> executable target attr), never hardcoded, so the
 // logic is portable if device placement ever moves to a later (Stream) stage.
 
+#include "iree-amd-aie/Transforms/KernelDispatch.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
@@ -68,6 +69,15 @@ static int64_t roundUpToMultiple(int64_t value, int64_t multiple) {
 /// Tile multiples a matmul's M, N, K must be padded up to on a given target.
 struct PaddingMultiples {
   int64_t m, n, k;
+  // Whether the target routes M == 1 matmuls to the GEMV pipeline (see
+  // `isGemvMExtent`), which tiles neither M nor a fixed N tile, so those need
+  // no M/N padding and no N-split.
+  bool gemvPipeline;
+  // Whether a GEMV's N may be padded so the GEMV pipeline reaches every core
+  // (`gemv_pad_n`), and what that decision needs: the core grid and the
+  // per-core memory budget KernelDispatch sizes its N tile with.
+  bool gemvPadN;
+  int64_t numRows, numCols, l1Limit, gemvN1;
 };
 
 /// Resolves the amd-aie executable target a dispatch is pinned to via its
@@ -132,9 +142,17 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
       hasUKernelTemplate(*device, "matmul",
                          {lhsElemType, rhsElemType, accElemType}, transposeB);
   int64_t perCore = useUKernel ? 2 : 1;
-  return PaddingMultiples{/*m=*/*numRows * perCore * (*instr)[0],
-                          /*n=*/*numCols * perCore * (*instr)[1],
-                          /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
+  return PaddingMultiples{
+      /*m=*/*numRows * perCore * (*instr)[0],
+      /*n=*/*numCols * perCore * (*instr)[1],
+      /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1),
+      /*gemvPipeline=*/getConfigEnableGemvPipeline(target),
+      /*gemvPadN=*/getConfigGemvPadN(target),
+      /*numRows=*/*numRows,
+      /*numCols=*/*numCols,
+      /*l1Limit=*/static_cast<int64_t>(deviceModel.getCoreTileLocalMemorySize()) -
+          getConfigCoreStackSize(target),
+      /*gemvN1=*/getConfigGemvN1(target)};
 }
 
 /// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
@@ -303,10 +321,42 @@ static IREE::HAL::DeviceAffinityAttr getHostAffinity(ModuleOp module) {
 /// (unlike `flow.tensor.update`, which only copies contiguous outer-dim
 /// sub-ranges) performs the strided placement required to pad an inner
 /// dimension. `counter` uniquifies the symbol names.
+/// `padOne` pads with 1.0 instead of 0: used for a GEMV's weight. Its padded
+/// rows only feed outputs that are cropped off, and A's padded K columns are
+/// zero, so any finite value is correct there; it must not be zero because the
+/// GEMV pipeline deadlocks when one core's rows are all exact zeros (its
+/// scalar bf16 loop takes the fast path and the core finishes far ahead of the
+/// others; the same hang reproduces with NaN rows or with a zero-row core on
+/// the unpadded 20-core shape, so it is a core-synchronisation defect of the
+/// pipeline, not of padding: docs_POOL/1012_full_array_padding_design.md
+/// §8.8).
+/// First index `i` such that no `pad_executable_i` / `crop_executable_i` /
+/// `concat_executable_i` symbol exists yet in `module`: the helper dispatch
+/// builders below number their executables from it, so the passes in this
+/// file (which run back to back on the same module) never collide.
+static int firstFreeHelperIndex(ModuleOp module) {
+  int next = 0;
+  for (Operation &op : module.getBody()->getOperations()) {
+    auto sym = dyn_cast<SymbolOpInterface>(&op);
+    if (!sym) continue;
+    StringRef name = sym.getName();
+    for (StringRef prefix :
+         {"pad_executable_", "crop_executable_", "concat_executable_"}) {
+      if (!name.consume_front(prefix)) continue;
+      int idx;
+      if (!name.getAsInteger(10, idx)) next = std::max(next, idx + 1);
+    }
+  }
+  return next;
+}
+
+/// `padValue`, when set, is the constant to pad with instead of 0 (the pooling
+/// pass passes its dispatch's init fill value, -inf for max).
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
                                    Value v, ArrayRef<int64_t> dstShape,
                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
-                                   int &counter) {
+                                   int &counter, bool padOne = false,
+                                   TypedAttr padValue = nullptr) {
   Location loc = v.getLoc();
   auto srcType = cast<RankedTensorType>(v.getType());
   if (dstShape == srcType.getShape()) return v;
@@ -324,8 +374,12 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   funcOp.setPublic();
   Block *entry = funcOp.addEntryBlock();
   OpBuilder fb = OpBuilder::atBlockBegin(entry);
-  Value zero = fb.create<arith::ConstantOp>(
-      loc, fb.getZeroAttr(srcType.getElementType()));
+  Type elemType = srcType.getElementType();
+  TypedAttr fillAttr = padValue;
+  if (!fillAttr)
+    fillAttr = padOne ? static_cast<TypedAttr>(fb.getFloatAttr(elemType, 1.0))
+                      : fb.getZeroAttr(elemType);
+  Value zero = fb.create<arith::ConstantOp>(loc, fillAttr);
   Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
   Value padded = tensor::createPadHighOp(dstType, loaded, zero,
@@ -534,7 +588,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
 
   IREE::HAL::DeviceAffinityAttr hostAffinity = getHostAffinity(module);
   if (!hostAffinity) return;  // need a host device to place the padding dispatch
-  int counter = 0;
+  int counter = firstFreeHelperIndex(module);
 
   // Executables rewritten already (shared by multiple dispatches): rewrite the
   // executable once, but pad/crop each caller's operands/result.
@@ -578,9 +632,29 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
         /*transposeB=*/rhsNPos < rhsKPos);
     if (!mult) continue;
 
-    int64_t mPad = roundUpToMultiple(m, mult->m);
-    int64_t nPad = roundUpToMultiple(n, mult->n);
+    // An M == 1 (GEMV) matmul is lowered by the GEMV pipeline (KernelDispatch,
+    // same predicate), which leaves M untiled and spreads N over the cores by
+    // whatever factor N has, so M is never padded (that removes the 32x
+    // zero-padding of the output rows). N is padded to the canonical GEMV
+    // layout (`chooseGemvNPad`: every core, n1 <= gemv_n1, fewest blocks;
+    // N=1000 -> 1024, 2144 -> 2208) when the target allows it (`gemv_pad_n`);
+    // the weight pad is a host dispatch redone every inference. K keeps its
+    // multiple: the pipeline takes any K, but a 32-aligned K keeps the DMA
+    // runs long.
+    bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
+    int64_t mPad = isGemv ? m : roundUpToMultiple(m, mult->m);
     int64_t kPad = roundUpToMultiple(k, mult->k);
+    int64_t nPad = n;
+    if (!isGemv) {
+      nPad = roundUpToMultiple(n, mult->n);
+    } else if (mult->gemvPadN) {
+      auto bytesOf = [](Type t) { return t.getIntOrFloatBitWidth() / 8; };
+      int64_t kTile = detail::findLargestFactor(kPad, kGemvKTile);
+      nPad = chooseGemvNPad(m, n, kTile, bytesOf(lhsType.getElementType()),
+                            bytesOf(rhsType.getElementType()),
+                            bytesOf(outElemType), mult->numRows, mult->numCols,
+                            mult->l1Limit, mult->gemvN1);
+    }
     if (mPad == m && nPad == n && kPad == k) continue;  // already divisible
     // Any output dim (M outer and/or N inner) may be padded; the grown result is
     // cropped back on the host by a single extract_slice dispatch.
@@ -615,9 +689,10 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     Value lhsPadded =
         createPaddingDispatch(rewriter, module, dispatch.getArguments()[lhsArgNo],
                               lhsPad, hostAffinity, counter);
-    Value rhsPadded =
-        createPaddingDispatch(rewriter, module, dispatch.getArguments()[rhsArgNo],
-                              rhsPad, hostAffinity, counter);
+    Value rhsPadded = createPaddingDispatch(
+        rewriter, module, dispatch.getArguments()[rhsArgNo], rhsPad,
+        hostAffinity, counter,
+        /*padOne=*/isGemv && isa<FloatType>(rhsType.getElementType()));
     dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
 
@@ -685,7 +760,7 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
   IRRewriter rewriter(module.getContext());
   IREE::HAL::DeviceAffinityAttr hostAffinity = getHostAffinity(module);
   if (!hostAffinity) return;  // need a host device for the concat dispatch
-  int counter = 0;
+  int counter = firstFreeHelperIndex(module);
 
   SmallVector<IREE::Flow::DispatchOp> dispatches;
   module.walk([&](IREE::Flow::DispatchOp d) { dispatches.push_back(d); });
@@ -724,6 +799,12 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
             .getElementType(),
         rhsType.getElementType(), elemType, /*transposeB=*/true);
     if (!mult) continue;
+    // M == 1 shapes take the GEMV pipeline, whose weight L3->L2 DMA is a single
+    // 2-D pattern per K step that subsumes the whole K loop into one
+    // descriptor (dense0: 65 shim DMA programmings for the merged dispatch,
+    // fewer than one of these chunks under pack-peel), so the reason to split
+    // does not apply to them.
+    if (mult->gemvPipeline && isGemvMExtent(M)) continue;
     int64_t C = chooseChunkN(N, mult->n, kNChunkMax);
     int64_t nChunks = N / C;
     if (nChunks < 2) continue;
@@ -806,10 +887,213 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
   }
 }
 
+// --- AMDAIEPadPoolingDispatches ---
+// Pads an NPU max pooling dispatch's leading spatial output dim OH up to what
+// the target's pool column policy asks for (`pool_columns_policy`: `full` ->
+// a multiple of the column count; `cost` -> when the model finds the padded
+// shape cheaper; `odd`/`max` -> never), so the pool pipeline (which puts OH on
+// the array columns) can use every column. Same shape as the contraction pass:
+// the input is padded on the host by `stride` rows per extra output row with
+// the dispatch's own fill value (-inf for max, so padded rows never win), the
+// executable's input binding/load, init (`empty`+`fill`), pooling result and
+// output binding/store grow in place, and the dispatch result is cropped back
+// on the host. The lowering strategy later sees an OH divisible by the column
+// count and, under the same policy, spreads it over all columns.
+//
+// Done at the Flow boundary rather than in the preprocessing because a fill
+// created before dispatch formation can be hoisted out of the dispatch as a
+// `flow.tensor.splat` (seen on VGG-16 pool4), which the pool pipeline cannot
+// take as an external init; here the fill is already inside the dispatch.
+
+/// A plain max pooling (`empty -> fill -> generic(max) -> store`) inside a
+/// dispatch executable, with the ops/bindings needed to grow its OH.
+struct PoolInfo {
+  linalg::GenericOp pool;
+  MaxPoolingDims dims;
+  IREE::TensorExt::DispatchTensorLoadOp inLoad;
+  BlockArgument inArg;
+  linalg::FillOp fill;
+  tensor::EmptyOp empty;
+  IREE::TensorExt::DispatchTensorStoreOp store;
+  BlockArgument outArg;
+  unsigned ohOut;  // OH's dim in the output
+  unsigned ohIn;   // OH's (strided) dim in the input
+};
+
+static std::optional<PoolInfo> getPoolInfo(func::FuncOp func) {
+  SmallVector<linalg::GenericOp> pools;
+  func.walk([&](linalg::GenericOp op) {
+    if (isMaxPoolingOp(op)) pools.push_back(op);
+  });
+  if (pools.size() != 1) return std::nullopt;
+  linalg::GenericOp pool = pools.front();
+  FailureOr<MaxPoolingDims> dims = getMaxPoolingDims(pool);
+  if (failed(dims)) return std::nullopt;
+  // Only an un-split pooling: no non-unit plain dim ahead of the spatial dims
+  // (a halo pre-split pooling carries its chunk dim there and is already
+  // column-split by the preprocessing).
+  auto outType = cast<RankedTensorType>(pool.getResult(0).getType());
+  if (!outType.hasStaticShape()) return std::nullopt;
+  unsigned ohOut = dims->spatialDims.front();
+  for (unsigned p : dims->plainDims)
+    if (p < ohOut && outType.getDimSize(p) != 1) return std::nullopt;
+  auto inLoad = getFullTensorLoad(pool.getDpsInputs()[0]);
+  if (!inLoad) return std::nullopt;
+  auto inArg = dyn_cast<BlockArgument>(inLoad.getSource());
+  if (!inArg) return std::nullopt;
+  auto fill = pool.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
+  if (!fill) return std::nullopt;
+  if (!fill.getInputs()[0].getDefiningOp<arith::ConstantOp>())
+    return std::nullopt;
+  auto empty = fill.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>();
+  if (!empty) return std::nullopt;
+  SmallVector<IREE::TensorExt::DispatchTensorStoreOp> stores;
+  func.walk(
+      [&](IREE::TensorExt::DispatchTensorStoreOp s) { stores.push_back(s); });
+  if (stores.size() != 1) return std::nullopt;
+  auto store = stores.front();
+  if (store.getValue() != pool.getResult(0)) return std::nullopt;
+  auto outArg = dyn_cast<BlockArgument>(store.getTarget());
+  if (!outArg) return std::nullopt;
+  // The input dim that OH's loop reads (`oh * stride + kh`).
+  AffineMap inMap = pool.getIndexingMapsArray()[0];
+  std::optional<unsigned> ohIn;
+  for (unsigned i = 0, e = inMap.getNumResults(); i < e; ++i) {
+    bool uses = false;
+    inMap.getResult(i).walk([&](AffineExpr e) {
+      if (auto d = dyn_cast<AffineDimExpr>(e))
+        if (d.getPosition() == ohOut) uses = true;
+    });
+    if (uses) ohIn = i;
+  }
+  if (!ohIn) return std::nullopt;
+  return PoolInfo{pool,  *dims, inLoad, inArg, fill,
+                  empty, store, outArg, ohOut, *ohIn};
+}
+
+class AMDAIEPadPoolingDispatchesPass
+    : public impl::AMDAIEPadPoolingDispatchesBase<
+          AMDAIEPadPoolingDispatchesPass> {
+ public:
+  void runOnOperation() override;
+};
+
+void AMDAIEPadPoolingDispatchesPass::runOnOperation() {
+  ModuleOp module = getOperation();
+  IRRewriter rewriter(module.getContext());
+
+  SmallVector<IREE::Flow::DispatchOp> dispatches;
+  module.walk([&](IREE::Flow::DispatchOp d) { dispatches.push_back(d); });
+
+  IREE::HAL::DeviceAffinityAttr hostAffinity = getHostAffinity(module);
+  if (!hostAffinity) return;
+  int counter = firstFreeHelperIndex(module);
+  DenseSet<Operation *> paddedExecutables;
+
+  for (IREE::Flow::DispatchOp dispatch : dispatches) {
+    IREE::HAL::ExecutableTargetAttr target = getDispatchTarget(dispatch, module);
+    if (!target) continue;
+    std::optional<int64_t> numCols = getConfigNumColumns(target);
+    if (!numCols || *numCols <= 1) continue;
+    PoolColumnsPolicy policy = getConfigPoolColumnsPolicy(target);
+    if (policy == PoolColumnsPolicy::Odd || policy == PoolColumnsPolicy::Max)
+      continue;
+
+    func::FuncOp func = getDispatchFunc(dispatch, module);
+    if (!func) continue;
+    std::optional<PoolInfo> info = getPoolInfo(func);
+    if (!info) continue;
+
+    // Read the shapes from this caller's operand / result.
+    int64_t inArgNo = info->inArg.getArgNumber();
+    auto inType =
+        cast<RankedTensorType>(dispatch.getArguments()[inArgNo].getType());
+    auto outType = cast<RankedTensorType>(dispatch.getResult(0).getType());
+    if (!inType.hasStaticShape() || !outType.hasStaticShape()) continue;
+    const MaxPoolingDims &dims = info->dims;
+    unsigned ohOut = info->ohOut, owOut = dims.spatialDims[1];
+    int64_t oh = outType.getDimSize(ohOut);
+    int64_t c = 1;
+    for (unsigned p : dims.plainDims) c *= outType.getDimSize(p);
+    auto bytesOf = [](Type t) { return t.getIntOrFloatBitWidth() / 8; };
+    // The window operand is [kh, kw] in the spatial dims' order; dilation is
+    // already folded into the generic's `oh * stride + kh` map.
+    auto winType =
+        cast<RankedTensorType>(info->pool.getDpsInputs()[1].getType());
+    PoolShape shape{/*ow=*/outType.getDimSize(owOut),
+                    /*c=*/c,
+                    /*windowH=*/winType.getDimSize(0),
+                    /*windowW=*/winType.getDimSize(1),
+                    /*strideH=*/dims.strides[0],
+                    /*strideW=*/dims.strides[1],
+                    /*bytesIn=*/bytesOf(inType.getElementType()),
+                    /*bytesOut=*/bytesOf(outType.getElementType())};
+    PoolColumns pc = choosePoolColumns(oh, *numCols, policy, shape,
+                                       /*allowPad=*/true);
+    if (pc.ohPadded <= oh) continue;
+    int64_t padRows = pc.ohPadded - oh;
+
+    SmallVector<int64_t> inPad(inType.getShape());
+    inPad[info->ohIn] += padRows * shape.strideH;
+    SmallVector<int64_t> outPad(outType.getShape());
+    outPad[ohOut] = pc.ohPadded;
+    TypedAttr padValue = cast<TypedAttr>(
+        info->fill.getInputs()[0].getDefiningOp<arith::ConstantOp>().getValue());
+
+    // Rewrite the executable once: grow the input binding/load, the init
+    // (empty + fill), the pooling result and the output binding/store.
+    if (paddedExecutables.insert(func.getOperation()).second) {
+      growBinding(rewriter, info->inArg, info->inLoad, inPad);
+      Location loc = info->fill.getLoc();
+      Type elemType = outType.getElementType();
+      rewriter.setInsertionPoint(info->empty);
+      Value newEmpty = rewriter.create<tensor::EmptyOp>(loc, outPad, elemType);
+      rewriter.setInsertionPoint(info->fill);
+      auto newFill = rewriter.create<linalg::FillOp>(
+          loc, ValueRange{info->fill.getInputs()[0]}, ValueRange{newEmpty});
+      info->pool.setDpsInitOperand(0, newFill.getResult(0));
+      info->pool.getResult(0).setType(RankedTensorType::get(outPad, elemType));
+      rewriter.eraseOp(info->fill);
+      rewriter.eraseOp(info->empty);
+      auto dtt =
+          cast<IREE::TensorExt::DispatchTensorType>(info->outArg.getType());
+      info->outArg.setType(IREE::TensorExt::DispatchTensorType::get(
+          dtt.getAccess(), RankedTensorType::get(outPad, elemType)));
+      rewriter.setInsertionPoint(info->store);
+      rewriter.create<IREE::TensorExt::DispatchTensorStoreOp>(
+          info->store.getLoc(), info->pool.getResult(0), info->outArg,
+          /*targetDynamicDims=*/ValueRange{});
+      rewriter.eraseOp(info->store);
+      SmallVector<Type> argTypes(llvm::map_range(
+          func.getArguments(), [](BlockArgument a) { return a.getType(); }));
+      func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
+    }
+
+    // Pad this caller's input on the host with the fill value, rewire, grow
+    // the result and crop it back.
+    rewriter.setInsertionPoint(dispatch);
+    Value inPadded = createPaddingDispatch(
+        rewriter, module, dispatch.getArguments()[inArgNo], inPad,
+        hostAffinity, counter, /*padOne=*/false, padValue);
+    dispatch.getArgumentsMutable().slice(inArgNo, 1).assign(inPadded);
+    Value result = dispatch.getResult(0);
+    result.setType(RankedTensorType::get(outPad, outType.getElementType()));
+    rewriter.setInsertionPointAfter(dispatch);
+    Value cropped = createCropDispatch(rewriter, module, result,
+                                       outType.getShape(), hostAffinity,
+                                       counter);
+    result.replaceAllUsesExcept(cropped, cropped.getDefiningOp());
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<Pass> createAMDAIEPadContractionDispatchesPass() {
   return std::make_unique<AMDAIEPadContractionDispatchesPass>();
+}
+
+std::unique_ptr<Pass> createAMDAIEPadPoolingDispatchesPass() {
+  return std::make_unique<AMDAIEPadPoolingDispatchesPass>();
 }
 
 std::unique_ptr<Pass> createAMDAIESplitLargeContractionDispatchesPass() {

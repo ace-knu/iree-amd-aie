@@ -20,6 +20,7 @@
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIETransactionBuilder.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree-amd-aie/schemas/pdi_executable_def_builder.h"
 #include "iree-amd-aie/schemas/xrt_executable_def_builder.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
@@ -184,6 +185,24 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // Set microkernel enabling flag.
     addConfig("ukernels",
               StringAttr::get(context, options.enableAMDAIEUkernels));
+    // Set the GEMV pipeline routing flag (read per dispatch by the Flow pad /
+    // split passes and by KernelDispatch).
+    addConfig("gemv_pipeline", BoolAttr::get(context, options.enableGemvPipeline));
+    // Whether the Flow pad pass may grow a GEMV's N to reach every core, and
+    // the core stack size it needs for the same L1 budget as KernelDispatch.
+    addConfig("gemv_pad_n", BoolAttr::get(context, options.gemvPadN));
+    addConfig("gemv_n1", IntegerAttr::get(IntegerType::get(context, 32),
+                                          options.gemvN1));
+    addConfig("core_stack_size",
+              IntegerAttr::get(IntegerType::get(context, 32),
+                               options.coreStackSize));
+    // Set the pooling placement flag (read by AMDAIEAssignDeviceAffinities).
+    addConfig("pooling", BoolAttr::get(context, options.enablePooling));
+    // The pool column policy, read per dispatch by the Flow pooling pad pass
+    // (the lowering strategy gets the same value as a pass option).
+    addConfig("pool_columns_policy",
+              StringAttr::get(context, stringifyPoolColumnsPolicy(
+                                           options.poolColumnsPolicy)));
     // Set number of rows/cols used in an AIE array.
     addConfig("num_rows",
               IntegerAttr::get(IntegerType::get(context, 32), nRows));
@@ -242,7 +261,8 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
         options.enableCoalescingLoops, options.enableCollapsingUnitDims,
         options.enableFunctionOutlining, options.callReplication,
         options.insertLoopAroundCoreBlock, options.enableCtrlPkt,
-        options.coreStackSize, options.reprogramDmas);
+        options.coreStackSize, options.reprogramDmas, options.poolCoreSplit,
+        options.poolColumnsPolicy);
   }
 
   void buildLinkingPassPipeline(OpPassManager &passManager) override {

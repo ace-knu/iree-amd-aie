@@ -33,6 +33,7 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -305,6 +306,209 @@ void addPackPeelBasedPassPipeline(OpPassManager &funcPassManager,
   // Comprehensive bufferization
   addAMDAIEBufferizePasses(funcPassManager, useTilePipeline);
   funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
+}
+
+void addGemvPassPipeline(OpPassManager &funcPassManager) {
+  // Same loop structure as pack-peel -- forall (N block) > scf.for (K) >
+  // forall (core) -- but the operands move as `linalg.copy` rather than
+  // `linalg.pack`: the scalar core code gains nothing from a packed layout, the
+  // weight then keeps its DRAM layout so each L3->L2 transfer is one 2-D DMA,
+  // and there is no pack permutation to express an untiled M with. The root
+  // config (`setRootConfigForGemvPipeline`) leaves M untiled, spreads N over
+  // every core, and streams K.
+  auto addCleanups = [&]() {
+    funcPassManager.addPass(createAMDAIECleanupPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  };
+
+  // First level tiling (N block) using scf.forall.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.hardwareMapping = HardwareMapping::Block;
+    tileFuseOptions.tilingLevel = 0;
+    tileFuseOptions.useSCFFor = false;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  addCleanups();
+
+  // First copy level (stands in for the first packing): A, B and C at the N
+  // block. C's copy writes the forall's output slice.
+  funcPassManager.addPass(createAMDAIEInsertCopyOpsPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote the matmul output to shared memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Second copy level (stands in for the second packing), added before the K
+  // loop exists so that, like pack-peel, the loop carries the whole N block of
+  // C in local memory and the cores only slice it: no C read-back per K step,
+  // which would need a third input DMA channel per core. C's copy writes back
+  // into the shared-memory tensor the way an unpack undoes a pack.
+  {
+    AMDAIEInsertCopyOpsOptions copyOptions;
+    copyOptions.useInitAsResultDest = true;
+    funcPassManager.addPass(createAMDAIEInsertCopyOpsPass(copyOptions));
+  }
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Tile the reduction dimension using scf.for.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.tilingLevel = 1;
+    tileFuseOptions.useSCFFor = true;
+    tileFuseOptions.tileElementwise = false;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  addCleanups();
+
+  // Fuse both copy levels of A/B into the K loop.
+  {
+    AMDAIEFuseProducerIntoLoopOptions fuseProducerOptions;
+    fuseProducerOptions.fuseDepth = 2;
+    fuseProducerOptions.useSCFFor = true;
+    funcPassManager.addPass(
+        createAMDAIEFuseProducerIntoLoopPass(fuseProducerOptions));
+  }
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote the first-level A/B copy results (the K-step tiles) to shared
+  // memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::PackOrCopyInput;
+    bufferizeOptions.inputDepth = 2;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Second level tiling (per-core N slice) using scf.forall.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.hardwareMapping = HardwareMapping::Core;
+    tileFuseOptions.tilingLevel = 2;
+    tileFuseOptions.useSCFFor = false;
+    tileFuseOptions.tileElementwise = false;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  addCleanups();
+
+  // Fuse the second-level copies into the core forall.
+  {
+    AMDAIEFuseProducerIntoLoopOptions fuseProducerOptions;
+    fuseProducerOptions.fuseDepth = 1;
+    fuseProducerOptions.useSCFFor = false;
+    funcPassManager.addPass(
+        createAMDAIEFuseProducerIntoLoopPass(fuseProducerOptions));
+  }
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote the matmul inputs to local memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 2;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgInput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Peel the for loop and fuse ops into the loops.
+  addPeelAndFusePasses(funcPassManager);
+
+  // Lower to UKernels (no-op with `ukernels=none`; the place a matvec kernel
+  // would plug in).
+  funcPassManager.addPass(createAMDAIELowerToUKernelsPass());
+
+  // Comprehensive bufferization.
+  addAMDAIEBufferizePasses(funcPassManager, TilePassPipeline::PackPeelPipeline);
+  funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
+}
+
+void addPoolPassPipeline(OpPassManager &funcPassManager) {
+  // The general-copy structure without a reduction loop: forall (block) >
+  // forall (core), operands moved as `linalg.copy` (L3 -> L2 -> L1). The root
+  // config (`setRootConfigForPoolPipeline`) tiles only the output dims; the
+  // 2x2 window stays inside the core op, so a level's input slice is the
+  // bounding box of the windows it needs (unit stride). The window operand is a
+  // `tensor.empty` that only sizes the reduction loops: InsertCopyOps and
+  // BufferizeToAllocation skip it, and comprehensive bufferization gives it a
+  // local allocation.
+  auto addCleanups = [&]() {
+    funcPassManager.addPass(createAMDAIECleanupPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  };
+
+  // First level tiling (block) using scf.forall.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.hardwareMapping = HardwareMapping::Block;
+    tileFuseOptions.tilingLevel = 0;
+    tileFuseOptions.useSCFFor = false;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  funcPassManager.addPass(createAMDAIEInsertCopyOpsPass());
+  addCleanups();
+
+  // Promote the block input and output to shared memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgInputOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Second level tiling (core) using scf.forall. With the spatial-channel
+  // core split the core forall is 2-D (OH, C): its first dim must land on
+  // array columns (the L2 block is split along OH across the columns'
+  // memtiles) and its second on rows, the reverse of TileAndFuse's default
+  // (first -> DimY/row), hence `swapThreadXY`. A 1-D core forall (search
+  // split) is unaffected.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.hardwareMapping = HardwareMapping::Core;
+    tileFuseOptions.tilingLevel = 1;
+    tileFuseOptions.useSCFFor = false;
+    tileFuseOptions.swapThreadXY = true;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  funcPassManager.addPass(createAMDAIEInsertCopyOpsPass());
+  addCleanups();
+
+  // Promote the core input and output to local memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 2;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgInputOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Lower to UKernels (no-op with `ukernels=none`; the place a maxpool kernel
+  // plugs in).
+  funcPassManager.addPass(createAMDAIELowerToUKernelsPass());
+
+  // Comprehensive bufferization.
+  addAMDAIEBufferizePasses(funcPassManager,
+                           TilePassPipeline::GeneralCopyPipeline);
+  funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
+
+  // The core body's `arith.maximumf` would reach peano as a scalar fmaximum
+  // intrinsic, which its aie2p backend cannot legalize ("unable to legalize
+  // instruction: G_FMAXIMUM"); expand it to cmpf + select here.
+  funcPassManager.addPass(arith::createArithExpandOpsPass());
 }
 
 void addPackPeel4LevelTilingBasedPassPipeline(OpPassManager &funcPassManager,
@@ -670,7 +874,8 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int callReplication, bool insertLoopAroundCoreBlock, bool enableCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas) {
+    uint32_t coreStackSize, bool reprogramDmas, PoolCoreSplit poolCoreSplit,
+    PoolColumnsPolicy poolColumnsPolicy) {
   OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
   {
     FunctionLikeNest funcPassManager(modulePassManager);
@@ -688,6 +893,8 @@ void buildAMDAIETransformPassPipeline(
     options.numCols = numCols;
     options.enableAMDAIEUkernels = enableAMDAIEUkernels;
     options.stackSize = coreStackSize;
+    options.poolCoreSplit = poolCoreSplit;
+    options.poolColumnsPolicy = poolColumnsPolicy;
     modulePassManager.addPass(createAMDAIELoweringStrategyPass(options));
   }
   modulePassManager.addPass(createLowerExecutableUsingTransformDialectPass());

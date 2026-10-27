@@ -119,6 +119,36 @@ def AMDAIEPadContractionDispatches :
       "mlir::iree_compiler::AMDAIE::createAMDAIEPadContractionDispatchesPass()";
 }
 
+def AMDAIEConvertPoolingToChannelsLast :
+    Pass<"iree-amdaie-convert-pooling-to-channels-last", ""> {
+  let summary = "Rewrite NCHW max pooling (`linalg.pooling_nchw_max`) as NHWC max pooling wrapped in `linalg.transpose` ops, so pooling follows the channels-last layout of the surrounding convolutions.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass()";
+  let options = [
+    Option<"channelMultiple", "channel-multiple", "int64_t", /*default=*/"1",
+      "Pad the channel dim of the NHWC pooling up to a multiple of this value (the pool pipeline splits C over the array rows, so it is the row count); the padded channels are sliced off the result. 1 disables.">,
+    Option<"haloSplitColumns", "halo-split-columns", "int64_t", /*default=*/"0",
+      "Array column count. An NHWC max pooling whose window overlaps along H (window != stride) is pre-split on the host into `choosePoolColumns(OH, columns)` row chunks (each with its halo rows duplicated) stacked on a leading dim, so the pool pipeline can spread the chunks over the columns' memtiles. 0 disables.">,
+    Option<"columnsPolicy", "columns-policy",
+      "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max",
+      "How many array columns the pool pipeline will spread OH over; must match the lowering strategy's `pool-columns-policy`.",
+      [{::llvm::cl::values(
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Odd, "odd", "OH's odd factor."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost, "cost", "Per-column cost model."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full", "All columns, padding OH."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max, "max", "OH's largest divisor that fits; never pads.")
+      )}]>,
+  ];
+}
+
+def AMDAIEPadPoolingDispatches :
+    Pass<"iree-amdaie-pad-pooling-dispatches", "ModuleOp"> {
+  let summary = "Pad an NPU max pooling dispatch's leading spatial output dim (OH) up to what the target's pool column policy asks for (`full`: a multiple of the column count; `cost`: when the model finds the padded shape cheaper), at the Flow dispatch boundary: the input grows by `stride` rows per extra output row on the host (fill value), the in-dispatch init/result/store grow, and the result is cropped back on the host.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEPadPoolingDispatchesPass()";
+}
+
 def AMDAIESplitLargeContractionDispatches :
     Pass<"iree-amdaie-split-large-contraction-dispatches", "ModuleOp"> {
   let summary = "Split a large-(K,N) transpose_b NPU matmul dispatch into N-chunk sub-dispatches (weight sliced along N) concatenated on the host, keeping each weight L3->L2 shim DMA within the shim's addressing limits.";
@@ -488,6 +518,12 @@ def AMDAIEInsertCopyOps :
       InterfacePass<"iree-amdaie-insert-copy-ops", "mlir::FunctionOpInterface"> {
   let summary = "Insert copy ops on the inputs and results of the targeted operation.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEInsertCopyOpsPass()";
+  let options = [
+    Option<"useInitAsResultDest", "use-init-as-result-dest", "bool", /*default=*/"false",
+      "Copy the result back into the tensor the init was read from, the way an "
+      "unpack undoes a pack, instead of into the enclosing forall's output slice. "
+      "Used for a second copy level added inside an existing one.">
+  ];
 }
 
 def AMDAIEInsertCores :
@@ -679,6 +715,30 @@ def AMDAIELoweringStrategy :
       "Stack size reserved in each AIE core">,
     Option<"enableAMDAIEUkernels", "enable-ukernels", "std::string", /*default=*/"",
       "Enables microkernels in the amdaie backend. May be `none`, `all`, or a comma-separated list of specific unprefixed microkernels to enable, e.g. `matmul`.">,
+    Option<"poolCoreSplit", "pool-core-split",
+      "mlir::iree_compiler::AMDAIE::PoolCoreSplit",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolCoreSplit::SpatialChannel",
+      "How the pool pipeline spreads a max pooling over the core array.",
+      [{::llvm::cl::values(
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolCoreSplit::SpatialChannel, "spatial-channel",
+                   "Columns take the leading spatial output dim (its odd factor), rows take the channel dim."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolCoreSplit::Search, "search",
+                   "Search one distributed output dim, ranked by core count, channel tile and L1 bytes.")
+      )}]>,
+    Option<"poolColumnsPolicy", "pool-columns-policy",
+      "mlir::iree_compiler::AMDAIE::PoolColumnsPolicy",
+      /*default=*/"mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max",
+      "How many array columns the pool pipeline spreads a max pooling's leading spatial output dim over.",
+      [{::llvm::cl::values(
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Odd, "odd",
+                   "OH's odd factor (else its largest divisor that fits)."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Cost, "cost",
+                   "The divisor of OH that minimises the per-column cost model."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Full, "full",
+                   "All columns (OH is padded up to a multiple of the column count by the preprocessing)."),
+        clEnumValN(mlir::iree_compiler::AMDAIE::PoolColumnsPolicy::Max, "max",
+                   "OH's largest divisor that fits the array (all columns when OH divides by the column count); never pads.")
+      )}]>,
   ];
 }
 
@@ -1008,6 +1068,8 @@ def AMDAIETileAndFuse :
       "Use default tiling level used to retrieve the configuration from lowering_config">,
     Option<"tileElementwise", "tile-elementwise", "bool", /*default=*/"true",
       "Option to whether tile and fuse the elementwise op">,
+    Option<"swapThreadXY", "swap-thread-xy", "bool", /*default=*/"false",
+      "Map the first tiled dim of a thread-level (core) forall to DimX (array column) and the second to DimY (row), instead of DimY then DimX. Only affects foralls with two or more tiled dims.">,
     Option<"hardwareMapping", "hardware-mapping",
       "mlir::iree_compiler::AMDAIE::HardwareMapping",
       /*default=*/"mlir::iree_compiler::AMDAIE::HardwareMapping::None",

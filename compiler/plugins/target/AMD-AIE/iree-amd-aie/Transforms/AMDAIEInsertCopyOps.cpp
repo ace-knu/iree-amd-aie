@@ -6,8 +6,11 @@
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -44,7 +47,11 @@ FailureOr<Value> promoteValue(IRRewriter &rewriter, Location loc, Value v,
   return copy.getResult(0);
 }
 
-LogicalResult promoteResults(IRRewriter &rewriter, Operation *op) {
+/// `initDest`, when set, is the tensor the op's init was read from before its
+/// inputs were promoted; the result is copied back into it (the copy level
+/// below already writes that tensor out to the forall's output).
+LogicalResult promoteResults(IRRewriter &rewriter, Operation *op,
+                             Value initDest = Value()) {
   OpBuilder::InsertionGuard g(rewriter);
 
   // Only a single output is supported.
@@ -58,8 +65,9 @@ LogicalResult promoteResults(IRRewriter &rewriter, Operation *op) {
 
   // Handle case where the target op is inside scf.forall and we want to use
   // block arguments as copy destinations.
-  Value outputBuffer;
-  if (auto forallOp = op->getParentOfType<scf::ForallOp>()) {
+  Value outputBuffer = initDest;
+  if (auto forallOp = op->getParentOfType<scf::ForallOp>();
+      forallOp && !outputBuffer) {
     if (forallOp.getNumResults() != 1)
       return forallOp->emitError("expected a single output");
 
@@ -70,16 +78,36 @@ LogicalResult promoteResults(IRRewriter &rewriter, Operation *op) {
     if (!blockArgType)
       return forallOp->emitError("expected ranked tensor block argument");
 
-    // Create tensor.extract_slice on block arg.
+    // Create tensor.extract_slice on block arg. The slice the result occupies
+    // is whatever the forall's terminator inserts it at: take the offsets from
+    // that `tensor.parallel_insert_slice`, so a forall over any dim (e.g. the
+    // GEMV pipeline tiles N, dim 1) lands on the right slice. Fall back to
+    // "one induction variable per leading dim" when the result is not
+    // inserted directly.
     rewriter.setInsertionPoint(op);
     SmallVector<OpFoldResult> offsets, sizes, strides;
-    for (Value iv : forallOp.getInductionVars()) offsets.push_back(iv);
-    // Pad offset with zeros if iv size is smaller than the rank.
-    for (unsigned i = numIvs; i < resultType.getRank(); ++i)
-      offsets.push_back(rewriter.getIndexAttr(0));
-    for (int64_t d : resultType.getShape())
-      sizes.push_back(rewriter.getIndexAttr(d));
-    strides.assign(resultType.getRank(), rewriter.getIndexAttr(1));
+    tensor::ParallelInsertSliceOp insertOp;
+    for (Operation &termOp : forallOp.getTerminator().getYieldingOps()) {
+      auto candidate = dyn_cast<tensor::ParallelInsertSliceOp>(termOp);
+      if (candidate && candidate.getSource() == result &&
+          candidate.getDest() == blockArg) {
+        insertOp = candidate;
+        break;
+      }
+    }
+    if (insertOp) {
+      offsets = insertOp.getMixedOffsets();
+      sizes = insertOp.getMixedSizes();
+      strides = insertOp.getMixedStrides();
+    } else {
+      for (Value iv : forallOp.getInductionVars()) offsets.push_back(iv);
+      // Pad offset with zeros if iv size is smaller than the rank.
+      for (unsigned i = numIvs; i < resultType.getRank(); ++i)
+        offsets.push_back(rewriter.getIndexAttr(0));
+      for (int64_t d : resultType.getShape())
+        sizes.push_back(rewriter.getIndexAttr(d));
+      strides.assign(resultType.getRank(), rewriter.getIndexAttr(1));
+    }
 
     outputBuffer = rewriter.create<tensor::ExtractSliceOp>(
         op->getLoc(), blockArg, offsets, sizes, strides);
@@ -108,6 +136,9 @@ LogicalResult promoteInputs(IRRewriter &rewriter, Operation *op) {
 
   // Promote the input operands.
   for (auto [i, operand] : llvm::enumerate(dstStyleOp.getDpsInputs())) {
+    // An input with no defined contents (a pooling window `tensor.empty` that
+    // only sizes the reduction loops) has nothing to move.
+    if (isUndefinedTensor(operand)) continue;
     rewriter.setInsertionPoint(op);
     FailureOr<Value> maybeReplacement = promoteValue(rewriter, loc, operand);
     if (failed(maybeReplacement))
@@ -137,6 +168,8 @@ class AMDAIEInsertCopyOpsPass
 
   AMDAIEInsertCopyOpsPass() = default;
   AMDAIEInsertCopyOpsPass(const AMDAIEInsertCopyOpsPass &pass){};
+  AMDAIEInsertCopyOpsPass(const AMDAIEInsertCopyOpsOptions &options)
+      : AMDAIEInsertCopyOpsBase(options) {}
   void runOnOperation() override;
 };
 
@@ -145,20 +178,36 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
   IRRewriter rewriter(context);
   mlir::FunctionOpInterface funcOp = getOperation();
   SmallVector<Operation *> targetOps;
+  // Named contraction ops are included for the GEMV pipeline, which moves the
+  // matmul operands with copies instead of packs (a pack would have turned the
+  // named op into a generic before this point).
   funcOp->walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
-    if (isa<linalg::SoftmaxOp>(op) || isa<linalg::GenericOp>(op))
+    if (isa<linalg::SoftmaxOp, linalg::GenericOp,
+            linalg::ContractionOpInterface>(op))
       targetOps.push_back(op);
   });
   for (Operation *targetOp : targetOps) {
+    // Captured before the init is replaced by its promoted copy.
+    Value initDest;
+    if (useInitAsResultDest) {
+      auto dstStyleOp = dyn_cast<DestinationStyleOpInterface>(targetOp);
+      if (!dstStyleOp || dstStyleOp.getNumDpsInits() != 1) {
+        targetOp->emitError("expected a destination style op with one init");
+        return signalPassFailure();
+      }
+      initDest = dstStyleOp.getDpsInits()[0];
+    }
     if (failed(promoteInputs(rewriter, targetOp))) return signalPassFailure();
-    if (failed(promoteResults(rewriter, targetOp))) return signalPassFailure();
+    if (failed(promoteResults(rewriter, targetOp, initDest)))
+      return signalPassFailure();
   }
 }
 
 }  // namespace
 
-std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass() {
-  return std::make_unique<AMDAIEInsertCopyOpsPass>();
+std::unique_ptr<Pass> createAMDAIEInsertCopyOpsPass(
+    AMDAIEInsertCopyOpsOptions options) {
+  return std::make_unique<AMDAIEInsertCopyOpsPass>(options);
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

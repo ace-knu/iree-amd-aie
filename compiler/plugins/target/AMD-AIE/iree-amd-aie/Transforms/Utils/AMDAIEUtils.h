@@ -9,6 +9,7 @@
 
 #include <array>
 
+#include "iree-amd-aie/Transforms/KernelDispatch.h"
 #include "iree-amd-aie/aie_runtime/AMDAIEEnums.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -71,6 +72,94 @@ std::array<uint32_t, 3> getScalarMatmulPackSize();
 bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
                         ArrayRef<Type> elemTypes, bool transposeB = false);
 
+/// Returns true if a 2-D matmul with `m` rows takes the GEMV pipeline instead
+/// of pack-peel. Today that is M == 1 only (a vector times a matrix). Pack-peel
+/// zero-pads any M below numRows * instr_m (32 on npu4 bf16) up to it, so
+/// 2 <= M < 32 would also profit, but the GEMV lowering's L2 split
+/// (`AMDAIESplitLogicalObjFifos`) still splits along the first non-unit dim and
+/// for M >= 2 that is M, not N: every core then writes C into one memtile and
+/// channel assignment fails. Those shapes stay on pack-peel until that is
+/// fixed. Shared by `KernelDispatch` and the Flow-phase pad/split passes so
+/// they agree on which dispatches are GEMV.
+bool isGemvMExtent(int64_t m);
+
+/// Whether small-M matmuls take the GEMV pipeline for this target
+/// (`gemv_pipeline` in the executable target config; absent means enabled).
+bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// Whether the Flow pad pass may pad a GEMV's N up to a multiple of
+/// `numRows * numCols * n1` so the GEMV pipeline reaches every core
+/// (`gemv_pad_n` in the executable target config; absent means enabled).
+bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// Bytes reserved for the stack in each core (`core_stack_size` in the
+/// executable target config; absent means 1024, the backend default).
+int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// The canonical GEMV layout: every core of the array, `n1` outputs per core
+/// with `n1 <= n1Max` (`gemv_n1` on the target, default 32: the fc1 tile the
+/// pipeline was measured with; the L1 budget may cap it lower), K streamed in
+/// `kGemvKTile` steps, and as few blocks as that allows. The Flow pad pass
+/// grows N to `cores * n1 * blocks` (`chooseGemvNPad`) and the root config
+/// picks the same `n1` back out of the padded N (`chooseGemvNTiling`), so
+/// every GEMV dispatch has the same core grid, the same per-core tile shape
+/// (up to a narrower n1 for N < cores * n1Max) and the same DMA pattern; only
+/// the block count varies.
+
+/// Largest n1 whose double-buffered A/B/C tiles fit `l1Limit`, capped at
+/// `n1Max`.
+int64_t gemvN1Cap(int64_t M, int64_t kTile, int64_t bytesLhs, int64_t bytesRhs,
+                  int64_t bytesOut, int64_t l1Limit, int64_t n1Max);
+
+/// Whether N is a multiple of the full core count.
+/// The GEMV pipeline's per-core N tile and the core count a block reaches, for
+/// a (1 x K) x (N x K)^T matmul with `kTile` K elements streamed per step.
+/// Over the divisors `n1` of N whose double-buffered A/B/C tiles fit
+/// `l1Limit`, take the one whose block covers the most cores. Among the
+/// candidates that reach every core, the canonical one: the largest n1 that
+/// is <= `n1Max` (the pad pass's choice; a larger n1 would be a layout the
+/// pad pass never intends). Otherwise (NPU-only builds, where N is not
+/// padded) ties go to the largest tile (fewest blocks). A block must fill
+/// whole columns or stay in one (`cores <= numRows || cores % numRows == 0`):
+/// the L2 weight split hands every memtile one column. Shared by
+/// `KernelDispatch` (tile sizes) and the Flow pad pass (whether N needs
+/// padding) so both see the same core count.
+struct GemvNTiling {
+  int64_t n1;
+  int64_t cores;
+};
+FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
+                                         int64_t bytesLhs, int64_t bytesRhs,
+                                         int64_t bytesOut, int64_t numRows,
+                                         int64_t numCols, int64_t l1Limit,
+                                         int64_t n1Max);
+
+/// The N the Flow pad pass pads a GEMV to for the canonical layout:
+///   blocks = ceil(N / (cores * n1Cap)),  n1 = ceil(N / (cores * blocks)),
+///   N' = cores * n1 * blocks,
+/// i.e. the fewest blocks the per-core cap allows, then the narrowest tile
+/// that fills them. Padding is < cores (b = 1) or < cores * blocks (so under
+/// 2 / n1Cap of N for b >= 2). N=1000 -> 1024 (n1 32, 1 block), 500 -> 512
+/// (n1 16), 2144 -> 2208 (n1 23, 3 blocks). Returns N unchanged when it
+/// already has that form, or when N < cores (one output per core is not
+/// worth a pad + crop).
+int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
+                       int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
+                       int64_t numCols, int64_t l1Limit, int64_t n1Max);
+
+/// Per-core N tile cap of the canonical GEMV layout (`gemv_n1` in the
+/// executable target config; absent means 32).
+int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr);
+
+/// The pool column policy (`pool_columns_policy` in the executable target
+/// config, one of "odd" | "cost" | "full" | "max"; absent means `Max`). Read
+/// per dispatch by the Flow pooling pad pass so it pads OH exactly when the
+/// lowering strategy, running with the same policy, will spread the padded OH
+/// over all columns.
+PoolColumnsPolicy getConfigPoolColumnsPolicy(
+    IREE::HAL::ExecutableTargetAttr targetAttr);
+llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy);
+
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr);
 
@@ -127,6 +216,90 @@ bool isReductionOp(linalg::LinalgOp linalgOp);
 bool isConv2DNhwcHwcfOp(Operation *linalgOp);
 bool isDepthwiseConv2DNhwcHwcOp(Operation *linalgOp);
 bool isConvOp(linalg::GenericOp linalgOp);
+
+/// Loop-dimension structure of a 2-D max pooling `linalg.generic` in a
+/// channels-last-like layout: the output indexing map is the identity over the
+/// parallel loops, the data input indexes each output dim either directly
+/// (`plainDims`: batch, channel) or as `d * stride + k` (`spatialDims`, with
+/// the window loop `k` in `windowDims` and the stride in `strides`), and the
+/// second input is the window (`windowDims` only). Body: `maximumf(out, in)`.
+struct MaxPoolingDims {
+  SmallVector<unsigned> plainDims;
+  SmallVector<unsigned> spatialDims;
+  SmallVector<unsigned> windowDims;
+  SmallVector<int64_t> strides;
+};
+FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp);
+
+/// Utility to identify a 2-D max pooling generic (see `getMaxPoolingDims`).
+bool isMaxPoolingOp(linalg::LinalgOp linalgOp);
+
+/// Number of array columns the pool pipeline spreads a pooling's leading
+/// spatial output dim `oh` over under `PoolColumnsPolicy::Odd`: its odd factor
+/// when 1 < odd <= numCols (a halving pooling chain keeps that factor down to
+/// its last layer, so every layer gets the same column count), else the
+/// largest divisor of `oh` that is <= numCols.
+int64_t choosePoolColumns(int64_t oh, int64_t numCols);
+
+/// Per-column cost model of a pool dispatch, `t(cols) = fixedMs +
+/// perColumnMs * (cols - 1) + msPerMBPerColumn * MB / cols`: each column adds
+/// a fixed cost (its shim DMA programming / sync) and one shim channel's worth
+/// of bandwidth. Fitted on npu4, f32 scalar pooling, VGG-16 pool1-5 at 7
+/// columns and pool4/5 at 1 column (docs_POOL/1001_pool_column_cost_model.md).
+struct PoolColumnCost {
+  double fixedMs = 0.74;
+  double perColumnMs = 0.21;
+  double msPerMBPerColumn = 1.77;
+  // Host side of padding OH (only when a padded candidate is considered): a
+  // pad dispatch that copies the input and a crop dispatch that copies the
+  // output, at an assumed host copy rate, plus a launch each. Not measured;
+  // an estimate (5 GB/s, 50 us) that keeps a padded candidate from winning on
+  // a few hundred microseconds of NPU time (pool5: 2 padded columns would be
+  // 0.17 ms faster than 1 unpadded column on the NPU alone).
+  double hostMsPerMB = 0.2;
+  double hostDispatchMs = 0.05;
+  double timeMs(int64_t cols, double bytes) const {
+    return fixedMs + perColumnMs * (cols - 1) +
+           msPerMBPerColumn * (bytes / (1024.0 * 1024.0)) / cols;
+  }
+  double hostPadMs(double bytesCopied) const {
+    return hostMsPerMB * (bytesCopied / (1024.0 * 1024.0)) +
+           2 * hostDispatchMs;
+  }
+};
+
+/// What a 2-D max pooling moves through the array for the cost model, from
+/// its output extents and window: `(inExtent(oh) * inExtent(ow) * c) *
+/// bytesIn + (oh * ow * c) * bytesOut`, `inExtent(t) = (t - 1) * stride +
+/// window`. Computed from the same quantities in the preprocessing pass and
+/// the root config so the two choose the same column count.
+struct PoolShape {
+  int64_t ow, c, windowH, windowW, strideH, strideW, bytesIn, bytesOut;
+  double bytesMoved(int64_t oh) const;
+};
+
+/// Column count for `oh` under `policy` (see `PoolColumnsPolicy`). With
+/// `allowPad` the result may name an `ohPadded > oh` the caller must pad OH up
+/// to first (preprocessing); the root config calls with `allowPad = false` on
+/// the shape it is given and gets the same `cols` the preprocessing chose for
+/// it, since both evaluate the same candidates on the same bytes.
+struct PoolColumns {
+  int64_t cols;
+  int64_t ohPadded;
+};
+PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
+                              PoolColumnsPolicy policy, const PoolShape &shape,
+                              bool allowPad,
+                              const PoolColumnCost &cost = PoolColumnCost());
+
+/// Returns true if `v` has no defined contents: it is a `tensor.empty`, or a
+/// slice of one. Such an operand (e.g. a pooling window that only sizes the
+/// reduction loops) never needs to be copied between memory levels.
+bool isUndefinedTensor(Value v);
+
+/// Whether pooling dispatches may be placed on the NPU (`pooling` in the
+/// executable target config; absent means disabled).
+bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr);
 
 /// Utility to convert a `uint32_t` value into a hex string.
 std::string utohexstr(uint32_t value, size_t width, bool header = true,

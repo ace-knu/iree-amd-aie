@@ -223,6 +223,10 @@ void AMDAIEBufferizeToAllocationPass::runOnOperation() {
       return signalPassFailure();
     }
     for (auto operand : *operandsToBufferize) {
+      // An input with no defined contents (a pooling window `tensor.empty`) is
+      // not staged through any memory level; comprehensive bufferization
+      // later gives it a local allocation where it is used.
+      if (isUndefinedTensor(operand)) continue;
       AMDAIEMemSpaceAttr memorySpaceAttr =
           getMemorySpaceAttr(rewriter, memorySpace);
       rewriter.setInsertionPointAfter(operand.getDefiningOp());
