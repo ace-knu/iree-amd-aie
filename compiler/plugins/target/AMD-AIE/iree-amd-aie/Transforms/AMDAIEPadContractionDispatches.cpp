@@ -315,21 +315,6 @@ static IREE::HAL::DeviceAffinityAttr getHostAffinity(ModuleOp module) {
   return getFirstDeviceWithRole(module, DeviceRole::Host);
 }
 
-/// Creates a `flow.executable` + `flow.dispatch` that zero-pads `v` up to
-/// `dstShape` (high padding via `tensor.pad`), placed on `hostAffinity`. Returns
-/// the padded value, or `v` unchanged if `dstShape` already matches. A dispatch
-/// (unlike `flow.tensor.update`, which only copies contiguous outer-dim
-/// sub-ranges) performs the strided placement required to pad an inner
-/// dimension. `counter` uniquifies the symbol names.
-/// `padOne` pads with 1.0 instead of 0: used for a GEMV's weight. Its padded
-/// rows only feed outputs that are cropped off, and A's padded K columns are
-/// zero, so any finite value is correct there; it must not be zero because the
-/// GEMV pipeline deadlocks when one core's rows are all exact zeros (its
-/// scalar bf16 loop takes the fast path and the core finishes far ahead of the
-/// others; the same hang reproduces with NaN rows or with a zero-row core on
-/// the unpadded 20-core shape, so it is a core-synchronisation defect of the
-/// pipeline, not of padding: docs_POOL/1012_full_array_padding_design.md
-/// §8.8).
 /// First index `i` such that no `pad_executable_i` / `crop_executable_i` /
 /// `concat_executable_i` symbol exists yet in `module`: the helper dispatch
 /// builders below number their executables from it, so the passes in this
@@ -350,13 +335,18 @@ static int firstFreeHelperIndex(ModuleOp module) {
   return next;
 }
 
+/// Creates a `flow.executable` + `flow.dispatch` that zero-pads `v` up to
+/// `dstShape` (high padding via `tensor.pad`), placed on `hostAffinity`. Returns
+/// the padded value, or `v` unchanged if `dstShape` already matches. A dispatch
+/// (unlike `flow.tensor.update`, which only copies contiguous outer-dim
+/// sub-ranges) performs the strided placement required to pad an inner
+/// dimension. `counter` uniquifies the symbol names.
 /// `padValue`, when set, is the constant to pad with instead of 0 (the pooling
 /// pass passes its dispatch's init fill value, -inf for max).
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
                                    Value v, ArrayRef<int64_t> dstShape,
                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
-                                   int &counter, bool padOne = false,
-                                   TypedAttr padValue = nullptr) {
+                                   int &counter, TypedAttr padValue = nullptr) {
   Location loc = v.getLoc();
   auto srcType = cast<RankedTensorType>(v.getType());
   if (dstShape == srcType.getShape()) return v;
@@ -375,10 +365,7 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   Block *entry = funcOp.addEntryBlock();
   OpBuilder fb = OpBuilder::atBlockBegin(entry);
   Type elemType = srcType.getElementType();
-  TypedAttr fillAttr = padValue;
-  if (!fillAttr)
-    fillAttr = padOne ? static_cast<TypedAttr>(fb.getFloatAttr(elemType, 1.0))
-                      : fb.getZeroAttr(elemType);
+  TypedAttr fillAttr = padValue ? padValue : fb.getZeroAttr(elemType);
   Value zero = fb.create<arith::ConstantOp>(loc, fillAttr);
   Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
@@ -689,10 +676,9 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     Value lhsPadded =
         createPaddingDispatch(rewriter, module, dispatch.getArguments()[lhsArgNo],
                               lhsPad, hostAffinity, counter);
-    Value rhsPadded = createPaddingDispatch(
-        rewriter, module, dispatch.getArguments()[rhsArgNo], rhsPad,
-        hostAffinity, counter,
-        /*padOne=*/isGemv && isa<FloatType>(rhsType.getElementType()));
+    Value rhsPadded =
+        createPaddingDispatch(rewriter, module, dispatch.getArguments()[rhsArgNo],
+                              rhsPad, hostAffinity, counter);
     dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
 
@@ -1074,7 +1060,7 @@ void AMDAIEPadPoolingDispatchesPass::runOnOperation() {
     rewriter.setInsertionPoint(dispatch);
     Value inPadded = createPaddingDispatch(
         rewriter, module, dispatch.getArguments()[inArgNo], inPad,
-        hostAffinity, counter, /*padOne=*/false, padValue);
+        hostAffinity, counter, padValue);
     dispatch.getArgumentsMutable().slice(inArgNo, 1).assign(inPadded);
     Value result = dispatch.getResult(0);
     result.setType(RankedTensorType::get(outPad, outType.getElementType()));

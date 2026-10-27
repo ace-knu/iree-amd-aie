@@ -113,11 +113,7 @@ struct AMDAIEOptions {
   // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
   bool enableGemvPipeline{true};
   // Let the Flow pad pass grow a GEMV's N (host pad + crop) to the canonical
-  // layout (N=1000 -> 1024: 20 -> 32 cores). The padded weight rows are
-  // filled with 1.0, not 0: a core whose rows are all exact zeros runs its
-  // scalar bf16 loop on the fast path, finishes far ahead of the others and
-  // the GEMV pipeline deadlocks ("ert state 8"); see
-  // docs_POOL/1012_full_array_padding_design.md §8.8.
+  // layout (N=1000 -> 1024: 20 -> 32 cores). The padded weight rows are zero.
   bool gemvPadN{true};
   // Per-core N tile cap of the canonical GEMV layout (outputs per core per
   // block); 32 is the fc1 tile the pipeline was measured with.
