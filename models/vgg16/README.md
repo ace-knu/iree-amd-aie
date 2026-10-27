@@ -2,7 +2,8 @@
 
 Full `vgg16-12.onnx` — 13 conv + 15 relu + 5 maxpool + 3 flatten + 3 FC + 2 dropout,
 input `[1,3,224,224]` -> `[1,1000]` logits — compiled and run heterogeneously:
-conv/matmul on the NPU, pooling/flatten/layout ops on the CPU.
+conv/matmul on the NPU, pooling/flatten/layout ops on the CPU (`--pool accel` in
+`scripts/onnx` moves the first four poolings to the NPU; it is slower).
 
 This is the largest model the amd-aie plugin is known to run end to end, so the
 recipe below doubles as the reference for which compile flags a real f32 CNN

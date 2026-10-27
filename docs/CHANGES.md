@@ -4,7 +4,89 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
 - 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S10. S6·S10은 dev 통합 때 삭제)
-- **dev 통합(2026-10-25) 후 상태는 바로 아래 절을 본다.** 0~6절은 10/20 스냅숏이다.
+- **dev-POOL 통합(2026-10-28) 후 상태는 바로 아래 절을 본다.** 그 다음 절은 3devices 통합(2026-10-25) 때 상태, 0~6절은 10/20 스냅숏이다.
+
+## dev-POOL 통합 후 상태 (2026-10-28, 브랜치 `pool-integration`)
+
+`origin/dev-POOL`(GEMV pipeline, NPU max pooling pipeline)을 dev `2c5763b8`에 병합했다(`7060d5f3`, 작성자 보존). 3devices 통합과 같이 겹치는 부분은 dev가 우선이다.
+
+### 기준과 원칙
+
+- **GEMV**: M==1 transpose_b matmul(FC)은 GEMV pipeline으로 컴파일한다. N축만 32개 core에 나누고, 나뉜 tile은 ukernel로 벡터화한다(bf16). f32도 같은 pipeline으로 돈다(scalar, f32 ukernel 없음).
+- **N-split 삭제**: FC를 Flow에서 N으로 쪼개던 pass는 NPU DMA cliff 우회였으므로 GEMV pipeline이 들어오면서 완전히 지웠다.
+- **pool**: NPU max pooling은 옵션이다(`--iree-amdaie-accelerate-pooling`). 기본은 CPU이고, 스크립트는 `--pool {cpu,accel}`로 고른다.
+- **ukernel 출처**: upstream mlir-aie `aie_kernels/`(aie_api)를 먼저 가져온다. 없을 때만 직접 쓴다.
+
+### dev 기준으로 본 변경
+
+#### 1. 겹친 부분 (병합 충돌 5곳)
+
+| 파일 | dev | dev-POOL | 통합 후 | 커밋 |
+|---|---|---|---|---|
+| `AMDAIEAssignDeviceAffinities.cpp` | 가속기 여러 개, round-robin | amd-aie target config `pooling`이면 pool을 NPU로 | pool 허용을 배정 pass 옵션 `accelerate-pooling` 하나로 정하고, 가속기 전체에 round-robin(장치별 op 선택은 나중) | `7060d5f3`, `f44d40e0` |
+| `AMDAIEPadContractionDispatches.cpp` | 장치별 core 수 기준 pad | GEMV N pad, pool OH/C pad | 둘 다. 이후 GEMV pad 규칙을 GEMM과 같은 `getPaddingMultiples`로 합침 | `7060d5f3`, `14c757a2` |
+| `AMDAIEUtils` | dev helper | GEMV/pool helper | 둘 다 | `7060d5f3` |
+| pad lit | dev 케이스 | GEMV 케이스 | 합집합. dev `matmul_tb_uk`는 M=1이 GEMV가 되므로 M=2로 | `7060d5f3` |
+| 플래그 이름 | — | `--iree-amdaie-enable-pooling` | `--iree-amdaie-accelerate-pooling`(배정 pass 옵션) | `f44d40e0` |
+
+#### 2. 추가된 부분
+
+| 영역 | 내용 | 커밋 |
+|---|---|---|
+| GEMV pipeline (dev-POOL) | `tile_pipeline="gemv"`: copy-based, N을 32 core 1-D forall로, K tile 256(matvec이면 64의 배수) | `7060d5f3` |
+| pool pipeline (dev-POOL) | 2-D max pooling을 spatial x channel core grid로. `--iree-amdaie-pool-core-split`, `--iree-amdaie-pool-columns-policy`(기본 `max`), OH/C pad, halo pre-split | `7060d5f3` |
+| channels-last (dev-POOL) | `--iree-amdaie-pooling-channels-last`: NCHW pooling을 transpose로 감싼 NHWC pooling으로 바꿔 NHWC conv 사이 transpose가 상쇄되게 함(기본 꺼짐) | `7060d5f3` |
+| matvec ukernel | upstream `mv_bf16.cc`를 옮긴 `uKernels/npu4/peano/matvec.cc`(f32 누적, K는 instance 값, `(ptr, offset)` 인자). bf16 GEMV tile을 이 ukernel로 lower | `69a5e8b7` |
+| aie_api 내장 | submodule `third_party/aie_api`(Xilinx/aie_api, MIT), 헤더를 바이너리에 embed하고 ukernel이 `<aie_api/aie.hpp>`를 쓸 때만 꺼내 `-I`로 넘김. `aie_arch.h`, `aie_kernel_utils.h`는 mlir-aie에서 복사 | `286008ec`, `d3486957` |
+| 스크립트 | `--pool {cpu,accel}` | `31f1e935` |
+
+#### 3. 통합 중에 생긴 문제와 처리
+
+| 문제 | 원인 | 처리 | 커밋 |
+|---|---|---|---|
+| f32 GEMV hang(ert state 6), dev-POOL은 weight를 1.0으로 pad해 피함 | memtile weight buffer 하나(S2MM 1개)를 core별 MM2S 4개가 lock pair 하나로 나눠 읽음. core 속도가 다르면 lock count가 꼬임. dev의 producer별 lock pair 수정은 이 반대 방향(consumer 여럿)을 다루지 않았음 | consumer별 lock pair. pad 값을 0으로 되돌림 | `6ef3dc1f`, `0c5bc58f` |
+| ukernel all + GEMV에서 컴파일러 crash | matmul ukernel matcher가 2-D GEMV op에 rank 4/6 전제의 `getTilingInfo`를 호출. `zero_fill` template이 1x32에서 `static_assert` 실패 | rank 확인 후 호출, fill matcher가 `M*N % 16 != 0`을 거름, `zero_fill.cc` unroll 하한 | `247f29d2` |
+| aie_api 헤더 추출 실패 | 하위 폴더를 만들지 않고 파일을 씀 | 폴더 생성 | `d3486957` |
+| f32 GEMV N 4096 → 4160 pad(host pad 34 ms/run) | GEMV pad가 L1 한도로 per-core N을 다시 고름 | pad 규칙을 GEMM과 통일(N은 core 수 x 8의 배수, K는 matvec이면 64) | `14c757a2` |
+
+#### 4. 지운 것
+
+| 항목 | 이유 | 커밋 |
+|---|---|---|
+| `AMDAIESplitLargeContractionDispatches`(N-split pass), lit, concat helper | FC DMA cliff 우회. GEMV pipeline으로 대체 | `7d49efaa` |
+| `--iree-amdaie-enable-gemv-pipeline` | 임시 스위치. 필요하면 최신 구조에 맞춰 새로 만든다 | `7d49efaa` |
+| GEMV weight 1.0 pad, `chooseGemvNPad`, `core_stack_size` config | lock 수정과 pad 규칙 통일로 불필요 | `0c5bc58f`, `14c757a2` |
+
+### 검증 (`31f1e935`)
+
+- ctest amd-aie 230/230, npu4 CI(`run.py --skip_tests=Performance`) 32/32(lock 수정 시점), 회귀 27/27(수동·자동).
+- CPU+NPU (ukernel all):
+
+| 모델 | dev `2c5763b8` | 통합 후 | 정확도 |
+|---|---|---|---|
+| MLP bf16 / f32 | 0.17 / 0.21 s | 0.19~0.21 / 0.20 s | 출력이 dev와 바이트 단위로 같음(GEMV 없음, 시간 차는 측정 편차) |
+| VGG bf16 | 2.19 s | 1.62 s | corr 0.99998, top-1 일치 |
+| VGG f32 | 35.04 s | 31.10 s | corr 1.0, top-1 일치 |
+
+- VGG bf16 FC dispatch: fc1 30.7 → 14.0 ms, fc2 12.0 → 7.4 ms, fc3 5.1 → 3.8 ms(scalar GEMV 대비 matvec ukernel). e2e는 hwctx 생성/해제(약 1.2 s)가 대부분이다.
+- GPU 조합(f32): CPU+GPU VGG 0.40 s, CPU+NPU+GPU 13.73 s, CPU+GPU+NPU 17.84 s(dev 14.16 / 21.32 s). 모두 corr 1.0, top-1 일치. FC가 8조각에서 1개 dispatch가 되어 round-robin 배치가 바뀌었다.
+- `--pool accel`: CPU+NPU VGG bf16 1.95 s, f32 31.43 s, CPU+GPU f32 0.70 s(pool CPU 0.40 s), CPU+NPU+GPU f32 17.15 s(13.73 s). 정확도는 같다.
+
+### 알려진 제한
+
+| 항목 | 내용 |
+|---|---|
+| pool이 가속기에서 느림 | NPU pool 4개 kernel 합 22.3 ms + dispatch당 hwctx 약 95 ms, CPU는 합 1.7 ms. ukernel을 넣어도 hwctx 비용이 남아 기본값은 CPU |
+| pool의 장치 선택 | `--pool accel`은 GPU에도 round-robin으로 보낸다(amd-aie만 고르는 기능 없음) |
+| transpose와 fuse된 pool | 뒤에 NHWC conv가 없는 pool(VGG pool5)은 transpose와 한 dispatch가 되어 CPU에 남는다 |
+| M ≥ 2 큰 FC | N-split이 없어져 batch ≥ 2 classifier 같은 큰 transpose_b FC는 DMA cliff(ert state 6)에 걸릴 수 있다 |
+| host 없는 빌드의 GEMV | NPU만 선언하면 Flow pad pass가 돌지 않아 GEMV N이 pad되지 않는다. N이 소수(예: 1009)면 1 core에 몰려 timeout. e2e 모델은 host가 필요하므로 단일 op 테스트에서만 해당 |
+
+### 남은 일
+
+- 기존 peano ukernel(`matmul.cc`, `zero_fill.cc`, `trunci.cc`)을 upstream aie_api 커널로 옮기기(A/B 측정 후).
+- NPU pool ukernel(upstream에 없음, aie_api로 작성). hwctx 재사용 뒤에 측정.
+- 장치별 op 선택(pool을 amd-aie에만 등), hwctx 재사용, lock pair 코드 정리.
 
 ## dev 통합 후 상태 (2026-10-25, 브랜치 `3devices-integration`)
 
@@ -486,3 +568,4 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 | 2026-10-20 | 세션 1 챕터 01 | 첫 판(9/28 기준선 대비 우리 56덩어리, 전임자 108덩어리, 새 파일 9묶음, 디버그 11묶음, 우회 목록) |
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |
 | 2026-10-25 | dev 통합 S9 | "dev 통합 후 상태" 절 추가, 명세 경로를 `docs/specs/`로, 4·5·6절 상태 칸과 N04·N07·N09에 통합 결과를 덧붙임 |
+| 2026-10-28 | dev-POOL 통합 P9 | "dev-POOL 통합 후 상태" 절 추가 |
