@@ -126,13 +126,15 @@ struct AMDAIEOptions {
   // wrapped in transposes, so pooling matches the NHWC convs and the transposes
   // around each pool cancel. Stage 0 of the NPU pooling work; default off.
   bool poolingChannelsLast{false};
-  // Place 2-D max pooling dispatches on the NPU (pool tile pipeline) instead
-  // of the host. Stage 1 of the NPU pooling work; default off.
-  bool enablePooling{false};
+  // Count 2-D max pooling as accelerator work in the Flow-phase device
+  // placement, so it is placed round-robin on the accelerators like
+  // contractions/convs (the NPU lowers it with the pool tile pipeline). See the
+  // `accelerate-pooling` option of AMDAIEAssignDeviceAffinities. Default off.
+  bool acceleratePooling{false};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
 
   // How the pool pipeline lays max pooling out on the core array (see
-  // `PoolCoreSplit`). Only matters with `--iree-amdaie-enable-pooling`.
+  // `PoolCoreSplit`). Only matters with `--iree-amdaie-accelerate-pooling`.
   PoolCoreSplit poolCoreSplit{PoolCoreSplit::SpatialChannel};
   // How many columns the pool pipeline uses for a pooling (and whether the
   // preprocessing pads OH to get there); see `PoolColumnsPolicy`.
@@ -253,10 +255,13 @@ struct AMDAIEOptions {
                        "the L1 budget). Default 32."));
 
     binder.opt<bool>(
-        "iree-amdaie-enable-pooling", enablePooling, llvm::cl::cat(category),
-        llvm::cl::desc("Place 2-D max pooling dispatches on the NPU and lower "
-                       "them with the copy-based pool tile pipeline. Default "
-                       "false (pooling stays on the host)."));
+        "iree-amdaie-accelerate-pooling", acceleratePooling,
+        llvm::cl::cat(category),
+        llvm::cl::desc("In the Flow-phase device placement, count 2-D max "
+                       "pooling as accelerator work: it is placed round-robin "
+                       "on the accelerators like contractions/convs (the NPU "
+                       "lowers it with the copy-based pool tile pipeline). "
+                       "Default false (pooling stays on the host)."));
 
     binder.opt<bool>(
         "iree-amdaie-pooling-channels-last", poolingChannelsLast,
@@ -413,7 +418,7 @@ struct AMDAIEOptions {
     binder.opt<PoolCoreSplit>(
         "iree-amdaie-pool-core-split", poolCoreSplit, llvm::cl::cat(category),
         llvm::cl::desc("How the pool pipeline spreads a max pooling over the "
-                       "core array (with --iree-amdaie-enable-pooling)"),
+                       "core array (with --iree-amdaie-accelerate-pooling)"),
         llvm::cl::values(
             clEnumValN(PoolCoreSplit::SpatialChannel, "spatial-channel",
                        "Columns take the leading spatial output dim (its odd "
@@ -425,7 +430,7 @@ struct AMDAIEOptions {
         "iree-amdaie-pool-columns-policy", poolColumnsPolicy,
         llvm::cl::cat(category),
         llvm::cl::desc("How many array columns a max pooling is spread over "
-                       "(with --iree-amdaie-enable-pooling)"),
+                       "(with --iree-amdaie-accelerate-pooling)"),
         llvm::cl::values(
             clEnumValN(PoolColumnsPolicy::Odd, "odd",
                        "OH's odd factor (7 for VGG-16), never pads OH."),

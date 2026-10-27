@@ -196,8 +196,6 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     addConfig("core_stack_size",
               IntegerAttr::get(IntegerType::get(context, 32),
                                options.coreStackSize));
-    // Set the pooling placement flag (read by AMDAIEAssignDeviceAffinities).
-    addConfig("pooling", BoolAttr::get(context, options.enablePooling));
     // The pool column policy, read per dispatch by the Flow pooling pad pass
     // (the lowering strategy gets the same value as a pass option).
     addConfig("pool_columns_policy",

@@ -94,7 +94,11 @@ def AMDAIEAssignDeviceAffinities :
       "executable name '_dispatch_N'), ~substr (executable/export name), *. "
       "Devices: npu, gpu, cpu (first amd-aie / vulkan-spirv / llvm-cpu "
       "device) or @<device global>. Unmatched dispatches are placed as "
-      "before. Prints the placement to stderr. Empty = off.">
+      "before. Prints the placement to stderr. Empty = off.">,
+    Option<"acceleratePooling", "accelerate-pooling", "bool", /*default=*/"false",
+      "Count 2-D max pooling (a dispatch of fill + max pooling only) as "
+      "accelerator work, placed round-robin on the accelerators like "
+      "contractions/convs. Off: pooling stays on the host.">
   ];
 }
 

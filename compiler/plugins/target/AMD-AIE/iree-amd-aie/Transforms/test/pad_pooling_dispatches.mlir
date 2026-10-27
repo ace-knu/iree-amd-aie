@@ -39,7 +39,7 @@
 // CHECK-SAME:      : (tensor<16x14x512xf32>) -> tensor<14x14x512xf32>
 // CHECK:         util.return %[[CROP]]
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
-  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "full", pooling = true, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "full", target_device = "npu4", ukernels = "none"}>]> : !hal.device
   util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
   flow.executable private @dispatch_0 {
     flow.executable.export public @pool4 workgroups() -> (index, index, index) {
@@ -82,7 +82,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         flow.dispatch @dispatch_1::@pool4_max(%arg0)
 // CHECK-SAME:      : (tensor<28x28x512xf32>) -> tensor<14x14x512xf32>
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
-  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "max", pooling = true, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "max", target_device = "npu4", ukernels = "none"}>]> : !hal.device
   util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
   flow.executable private @dispatch_1 {
     flow.executable.export public @pool4_max workgroups() -> (index, index, index) {
@@ -124,7 +124,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         flow.dispatch @dispatch_2::@pool1(%arg0)
 // CHECK-SAME:      : (tensor<224x224x64xf32>) -> tensor<112x112x64xf32>
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
-  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "full", pooling = true, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "full", target_device = "npu4", ukernels = "none"}>]> : !hal.device
   util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
   flow.executable private @dispatch_2 {
     flow.executable.export public @pool1 workgroups() -> (index, index, index) {
@@ -167,7 +167,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         flow.dispatch @dispatch_3::@pool5_cost(%arg0)
 // CHECK-SAME:      : (tensor<14x14x512xf32>) -> tensor<7x7x512xf32>
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
-  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "cost", pooling = true, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, pool_columns_policy = "cost", target_device = "npu4", ukernels = "none"}>]> : !hal.device
   util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
   flow.executable private @dispatch_3 {
     flow.executable.export public @pool5_cost workgroups() -> (index, index, index) {

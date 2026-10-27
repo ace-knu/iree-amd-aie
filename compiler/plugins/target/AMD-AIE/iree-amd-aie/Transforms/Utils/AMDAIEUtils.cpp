@@ -320,11 +320,6 @@ int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
   return numCores * n1 * blocks;
 }
 
-bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<BoolAttr> attr = getConfigAttr<BoolAttr>(targetAttr, "pooling");
-  return attr && attr->getValue();
-}
-
 /// Utility to retrieve a constant index from an OpFoldResult.
 int64_t getConstantIndexOrAssert(OpFoldResult ofr) {
   std::optional<int64_t> res = getConstantIntValue(ofr);

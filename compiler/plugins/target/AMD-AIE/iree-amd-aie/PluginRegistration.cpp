@@ -102,9 +102,11 @@ struct AMDAIESession
     // accelerators (round-robin) and everything else (transposes, casts) to the
     // host. Requires a host device.
     // --iree-amdaie-placement-map (experiment, default empty) pins dispatches
-    // by number/name rules.
+    // by number/name rules. --iree-amdaie-accelerate-pooling adds max pooling
+    // to the accelerator work.
     AMDAIE::AMDAIEAssignDeviceAffinitiesOptions placementOptions;
     placementOptions.placementMap = options.placementMap;
+    placementOptions.acceleratePooling = options.acceleratePooling;
     passManager.addPass(
         AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(placementOptions));
     // With affinity known per-dispatch, pad NPU contraction operands up to the

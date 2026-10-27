@@ -297,10 +297,6 @@ PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
 /// reduction loops) never needs to be copied between memory levels.
 bool isUndefinedTensor(Value v);
 
-/// Whether pooling dispatches may be placed on the NPU (`pooling` in the
-/// executable target config; absent means disabled).
-bool getConfigEnablePooling(IREE::HAL::ExecutableTargetAttr targetAttr);
-
 /// Utility to convert a `uint32_t` value into a hex string.
 std::string utohexstr(uint32_t value, size_t width, bool header = true,
                       bool lowercase = false);
