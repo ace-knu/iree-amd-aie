@@ -720,6 +720,12 @@ static LogicalResult writeAieKernelHeaders(const Path &includeDir) {
     for (const iree_file_toc_t *file = start; file < start + size; ++file) {
       if (!StringRef(file->name).starts_with(prefix)) continue;
       Path path = includeDir / file->name;
+      if (std::error_code ec =
+              sys::fs::create_directories(path.parent_path().string())) {
+        llvm::errs() << "Failed to create " << path.parent_path().string()
+                     << ": " << ec.message();
+        return failure();
+      }
       if (auto maybeErr = dumpStrToDisk(std::string(file->data, file->size),
                                         path.string());
           maybeErr.has_value()) {
