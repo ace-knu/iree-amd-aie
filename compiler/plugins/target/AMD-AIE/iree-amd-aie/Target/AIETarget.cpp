@@ -189,13 +189,10 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // split passes and by KernelDispatch).
     addConfig("gemv_pipeline", BoolAttr::get(context, options.enableGemvPipeline));
     // Whether the Flow pad pass may grow a GEMV's N to reach every core, and
-    // the core stack size it needs for the same L1 budget as KernelDispatch.
+    // the per-core N tile cap of the GEMV pipeline.
     addConfig("gemv_pad_n", BoolAttr::get(context, options.gemvPadN));
     addConfig("gemv_n1", IntegerAttr::get(IntegerType::get(context, 32),
                                           options.gemvN1));
-    addConfig("core_stack_size",
-              IntegerAttr::get(IntegerType::get(context, 32),
-                               options.coreStackSize));
     // The pool column policy, read per dispatch by the Flow pooling pad pass
     // (the lowering strategy gets the same value as a pass option).
     addConfig("pool_columns_policy",

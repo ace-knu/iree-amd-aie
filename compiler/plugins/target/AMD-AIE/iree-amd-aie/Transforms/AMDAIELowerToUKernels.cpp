@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree-amd-aie/Transforms/KernelDispatch.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIEUtils.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
@@ -205,9 +206,8 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchMatvecDAGForUKernel(
   }
   int64_t N = rhsType.getDimSize(0);
   int64_t K = rhsType.getDimSize(1);
-  // The ukernel reads K in 64-lane vectors.
-  if (K % 64 != 0) {
-    return rewriter.notifyMatchFailure(op, "K is not a multiple of 64");
+  if (K % kMatvecUKernelK != 0) {
+    return rewriter.notifyMatchFailure(op, "K is not whole ukernel vectors");
   }
   Type lhsElemType = lhsType.getElementType();
   Type rhsElemType = rhsType.getElementType();

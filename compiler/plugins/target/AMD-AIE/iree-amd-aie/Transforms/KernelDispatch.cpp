@@ -635,7 +635,7 @@ static bool isGemvLike(linalg::LinalgOp linalgOp) {
 static LogicalResult setRootConfigForGemvPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     AMDAIEDeviceModel deviceModel, uint32_t numRows, uint32_t numCols,
-    uint32_t stackSize) {
+    uint32_t stackSize, std::string enableAMDAIEUkernels) {
   FailureOr<InputDimsAndSizes> maybeDims = getInputDimsAndSizes(linalgOp);
   if (failed(maybeDims)) return failure();
   unsigned nDim = maybeDims->nDims[0];
@@ -651,14 +651,31 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t nBytesRhs = bytesOf(linalgOp.getDpsInputOperand(1)->get());
   int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
 
-  // K tile; per-core N tile and L0 N block from the shared GEMV rule
-  // (`chooseGemvNTiling`, also used by the Flow pad pass to decide whether N
-  // needs padding to reach every core). The core memory budget leaves the
-  // core's stack out, which the buffer allocation adds back
+  // K tile, whole matvec ukernel vectors when the tile is lowered to it (it
+  // is enabled and has a template for the element types).
+  MLIRContext *context = entryPointFn.getContext();
+  DictionaryAttr ukernelConfig = DictionaryAttr::get(
+      context,
+      {NamedAttribute(StringAttr::get(context, "ukernels"),
+                      StringAttr::get(context, enableAMDAIEUkernels))});
+  Type lhsElemType = getElementTypeOrSelf(linalgOp.getDpsInputOperand(0)->get());
+  Type rhsElemType = getElementTypeOrSelf(linalgOp.getDpsInputOperand(1)->get());
+  Type outElemType = getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get());
+  bool useMatvec =
+      K % kMatvecUKernelK == 0 &&
+      hasUkernel(ukernelConfig, "matvec") &&
+      hasUKernelTemplate(deviceModel.device, "matvec",
+                         {lhsElemType, rhsElemType, outElemType},
+                         /*transposeB=*/true);
+  int64_t kTile =
+      useMatvec ? kMatvecUKernelK * findLargestFactor(K / kMatvecUKernelK,
+                                                      kGemvKTile / kMatvecUKernelK)
+                : findLargestFactor(K, kGemvKTile);
+  // Per-core N tile and L0 N block from `chooseGemvNTiling`. The core memory
+  // budget leaves the core's stack out, which the buffer allocation adds back
   // (K=4000 bf16 once picked n1 = 64 at 65512 B and failed at 66536 > 65536).
   // N=4096: 32 x 32 cores. N=1000 (fc3): no divisor reaches 32 or 24 cores,
   // so 50 x 20 cores in one block unless the pad pass has grown N to 1024.
-  int64_t kTile = findLargestFactor(K, kGemvKTile);
   int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize() - stackSize;
   int64_t n1Max =
       getConfigGemvN1(IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn));
@@ -681,7 +698,6 @@ static LogicalResult setRootConfigForGemvPipeline(
   SmallVector<int64_t> tileSizeLevel2(numLoops, 0);
   tileSizeLevel2[nDim] = n1Tile;
 
-  MLIRContext *context = entryPointFn.getContext();
   auto pipelineConfig = DictionaryAttr::get(
       context, {NamedAttribute(StringAttr::get(context, kTilePipelineOverrideName),
                                StringAttr::get(context, kGemvPipelineName))});
@@ -1146,7 +1162,8 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
     if (takesGemvPipeline(entryPointFn, genericOp, passPipeline)) {
       return setRootConfigForGemvPipeline(entryPointFn, genericOp,
                                           getDeviceModel(targetDevice), numRows,
-                                          numCols, stackSize);
+                                          numCols, stackSize,
+                                          enableAMDAIEUkernels);
     }
     if (passPipeline == TilePassPipeline::PackPeelPipeline) {
       return setRootConfigForPackPeelPipeline(
@@ -1542,7 +1559,8 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
   if (takesGemvPipeline(entryPointFn, linalgOp, passPipeline)) {
     return setRootConfigForGemvPipeline(entryPointFn, linalgOp,
                                         getDeviceModel(targetDevice), numRows,
-                                        numCols, stackSize);
+                                        numCols, stackSize,
+                                        enableAMDAIEUkernels);
   }
   // TODO (nmeshram) : This needs to be moved in a separate more generalized
   // logic. Also, need a flag to experiment between pad based and pack based

@@ -69,15 +69,6 @@ static int64_t roundUpToMultiple(int64_t value, int64_t multiple) {
 /// Tile multiples a matmul's M, N, K must be padded up to on a given target.
 struct PaddingMultiples {
   int64_t m, n, k;
-  // Whether the target routes M == 1 matmuls to the GEMV pipeline (see
-  // `isGemvMExtent`), which tiles neither M nor a fixed N tile, so those need
-  // no M/N padding and no N-split.
-  bool gemvPipeline;
-  // Whether a GEMV's N may be padded so the GEMV pipeline reaches every core
-  // (`gemv_pad_n`), and what that decision needs: the core grid and the
-  // per-core memory budget KernelDispatch sizes its N tile with.
-  bool gemvPadN;
-  int64_t numRows, numCols, l1Limit, gemvN1;
 };
 
 /// Resolves the amd-aie executable target a dispatch is pinned to via its
@@ -109,15 +100,35 @@ static IREE::HAL::ExecutableTargetAttr getDispatchTarget(
 /// from the shared pack-peel reduction tile. If the matmul is lowered to a
 /// ukernel M/N are doubled, because the matmul ukernels process 2x2 vector
 /// instructions per step and need an even count per core (KernelDispatch picks
-/// the per-core tile to match). Returns nullopt if `target` is not a recognized
+/// the per-core tile to match).
+///
+/// An M == 1 matmul the GEMV pipeline takes (KernelDispatch, same predicate)
+/// has its own multiples: M is left untiled, N is spread over every core in
+/// whole multiples of `kGemvNPerCoreMultiple` outputs when the target allows
+/// it (`gemv_pad_n`), and K is a multiple of the matvec ukernel's vector when
+/// the tile is lowered to it. Returns nullopt if `target` is not a recognized
 /// amd-aie target.
 static std::optional<PaddingMultiples> getPaddingMultiples(
-    IREE::HAL::ExecutableTargetAttr target, Type lhsElemType, Type rhsElemType,
-    Type accElemType, bool transposeB) {
+    IREE::HAL::ExecutableTargetAttr target, int64_t m, Type lhsElemType,
+    Type rhsElemType, Type accElemType, bool transposeB) {
   std::optional<AMDAIEDevice> device = getConfigAMDAIEDevice(target);
   std::optional<int64_t> numRows = getConfigNumRows(target);
   std::optional<int64_t> numCols = getConfigNumColumns(target);
   if (!device || !numRows || !numCols) return std::nullopt;
+  if (getConfigEnableGemvPipeline(target) && isGemvMExtent(m)) {
+    bool useMatvec = transposeB &&
+                     hasUkernel(target.getConfiguration(), "matvec") &&
+                     hasUKernelTemplate(*device, "matvec",
+                                        {lhsElemType, rhsElemType, accElemType},
+                                        /*transposeB=*/true);
+    return PaddingMultiples{
+        /*m=*/1,
+        /*n=*/getConfigGemvPadN(target)
+            ? *numRows * *numCols * kGemvNPerCoreMultiple
+            : 1,
+        /*k=*/useMatvec ? kMatvecUKernelK
+                        : getPackPeelReductionTile(/*kPackScaleL1=*/1)};
+  }
   AMDAIEDeviceModel deviceModel = getDeviceModel(*device);
   FailureOr<std::array<uint32_t, 3>> instr =
       deviceModel.getAIEMatmulInstructionSize(lhsElemType, rhsElemType,
@@ -145,14 +156,7 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   return PaddingMultiples{
       /*m=*/*numRows * perCore * (*instr)[0],
       /*n=*/*numCols * perCore * (*instr)[1],
-      /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1),
-      /*gemvPipeline=*/getConfigEnableGemvPipeline(target),
-      /*gemvPadN=*/getConfigGemvPadN(target),
-      /*numRows=*/*numRows,
-      /*numCols=*/*numCols,
-      /*l1Limit=*/static_cast<int64_t>(deviceModel.getCoreTileLocalMemorySize()) -
-          getConfigCoreStackSize(target),
-      /*gemvN1=*/getConfigGemvN1(target)};
+      /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
 }
 
 /// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
@@ -615,33 +619,13 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
             .getElementType();
 
     std::optional<PaddingMultiples> mult = getPaddingMultiples(
-        target, lhsType.getElementType(), rhsType.getElementType(), outElemType,
-        /*transposeB=*/rhsNPos < rhsKPos);
+        target, m, lhsType.getElementType(), rhsType.getElementType(),
+        outElemType, /*transposeB=*/rhsNPos < rhsKPos);
     if (!mult) continue;
 
-    // An M == 1 (GEMV) matmul is lowered by the GEMV pipeline (KernelDispatch,
-    // same predicate), which leaves M untiled and spreads N over the cores by
-    // whatever factor N has, so M is never padded (that removes the 32x
-    // zero-padding of the output rows). N is padded to the canonical GEMV
-    // layout (`chooseGemvNPad`: every core, n1 <= gemv_n1, fewest blocks;
-    // N=1000 -> 1024, 2144 -> 2208) when the target allows it (`gemv_pad_n`);
-    // the weight pad is a host dispatch redone every inference. K keeps its
-    // multiple: the pipeline takes any K, but a 32-aligned K keeps the DMA
-    // runs long.
-    bool isGemv = mult->gemvPipeline && isGemvMExtent(m);
-    int64_t mPad = isGemv ? m : roundUpToMultiple(m, mult->m);
+    int64_t mPad = roundUpToMultiple(m, mult->m);
+    int64_t nPad = roundUpToMultiple(n, mult->n);
     int64_t kPad = roundUpToMultiple(k, mult->k);
-    int64_t nPad = n;
-    if (!isGemv) {
-      nPad = roundUpToMultiple(n, mult->n);
-    } else if (mult->gemvPadN) {
-      auto bytesOf = [](Type t) { return t.getIntOrFloatBitWidth() / 8; };
-      int64_t kTile = detail::findLargestFactor(kPad, kGemvKTile);
-      nPad = chooseGemvNPad(m, n, kTile, bytesOf(lhsType.getElementType()),
-                            bytesOf(rhsType.getElementType()),
-                            bytesOf(outElemType), mult->numRows, mult->numCols,
-                            mult->l1Limit, mult->gemvN1);
-    }
     if (mPad == m && nPad == n && kPad == k) continue;  // already divisible
     // Any output dim (M outer and/or N inner) may be padded; the grown result is
     // cropped back on the host by a single extract_slice dispatch.
@@ -779,18 +763,18 @@ void AMDAIESplitLargeContractionDispatchesPass::runOnOperation() {
     Type elemType = resultType.getElementType();
 
     // Even, tile-aligned chunk size (N is already a multiple of the N tile).
-    std::optional<PaddingMultiples> mult = getPaddingMultiples(
-        target,
-        cast<RankedTensorType>(dispatch.getArguments()[lhsArgNo].getType())
-            .getElementType(),
-        rhsType.getElementType(), elemType, /*transposeB=*/true);
-    if (!mult) continue;
     // M == 1 shapes take the GEMV pipeline, whose weight L3->L2 DMA is a single
     // 2-D pattern per K step that subsumes the whole K loop into one
     // descriptor (dense0: 65 shim DMA programmings for the merged dispatch,
     // fewer than one of these chunks under pack-peel), so the reason to split
     // does not apply to them.
-    if (mult->gemvPipeline && isGemvMExtent(M)) continue;
+    if (getConfigEnableGemvPipeline(target) && isGemvMExtent(M)) continue;
+    std::optional<PaddingMultiples> mult = getPaddingMultiples(
+        target, M,
+        cast<RankedTensorType>(dispatch.getArguments()[lhsArgNo].getType())
+            .getElementType(),
+        rhsType.getElementType(), elemType, /*transposeB=*/true);
+    if (!mult) continue;
     int64_t C = chooseChunkN(N, mult->n, kNChunkMax);
     int64_t nChunks = N / C;
     if (nChunks < 2) continue;

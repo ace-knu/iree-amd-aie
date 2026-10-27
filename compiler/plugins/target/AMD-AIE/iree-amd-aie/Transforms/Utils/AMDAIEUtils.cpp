@@ -217,12 +217,6 @@ bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr) {
   return !attr || attr->getValue();
 }
 
-int64_t getConfigCoreStackSize(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<IntegerAttr> attr =
-      getConfigAttr<IntegerAttr>(targetAttr, "core_stack_size");
-  return attr ? attr->getInt() : 1024;
-}
-
 int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<IntegerAttr> attr =
       getConfigAttr<IntegerAttr>(targetAttr, "gemv_n1");
@@ -262,17 +256,6 @@ static int64_t gemvL1Bytes(int64_t M, int64_t n1, int64_t kTile,
   return 2 * (M * kTile * bytesLhs + n1 * kTile * bytesRhs + M * n1 * bytesOut);
 }
 
-int64_t gemvN1Cap(int64_t M, int64_t kTile, int64_t bytesLhs, int64_t bytesRhs,
-                  int64_t bytesOut, int64_t l1Limit, int64_t n1Max) {
-  int64_t cap = 0;
-  for (int64_t n1 = 1; n1 <= n1Max; ++n1) {
-    if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
-      break;
-    cap = n1;
-  }
-  return cap;
-}
-
 FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
                                          int64_t bytesLhs, int64_t bytesRhs,
                                          int64_t bytesOut, int64_t numRows,
@@ -305,20 +288,6 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
   }
   if (best.n1 == 0) return failure();
   return best;
-}
-
-int64_t chooseGemvNPad(int64_t M, int64_t N, int64_t kTile, int64_t bytesLhs,
-                       int64_t bytesRhs, int64_t bytesOut, int64_t numRows,
-                       int64_t numCols, int64_t l1Limit, int64_t n1Max) {
-  int64_t numCores = numRows * numCols;
-  if (N < numCores) return N;
-  int64_t cap =
-      gemvN1Cap(M, kTile, bytesLhs, bytesRhs, bytesOut, l1Limit, n1Max);
-  if (cap <= 0) return N;
-  auto ceilDiv = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
-  int64_t blocks = ceilDiv(N, numCores * cap);
-  int64_t n1 = ceilDiv(N, numCores * blocks);
-  return numCores * n1 * blocks;
 }
 
 /// Utility to retrieve a constant index from an OpFoldResult.

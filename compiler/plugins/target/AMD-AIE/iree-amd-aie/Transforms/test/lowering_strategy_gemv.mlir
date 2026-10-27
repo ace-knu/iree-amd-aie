@@ -82,10 +82,9 @@ module {
 
 // -----
 
-// N=1088 = 32 x 34 after the pad pass has grown 1025 for the canonical layout
-// (blocks 2, n1 17). Among the n1 that reach 32 cores (1, 2, 17, 34) the root
+// N=1088 = 32 x 34. Among the n1 that reach 32 cores (1, 2, 17, 34) the root
 // config takes the largest <= gemv_n1 (32): 17, two blocks of 544, not 34 in
-// one block, so the pad pass's intent (one tile shape for every GEMV) holds.
+// one block, so the per-core tile stays within the cap.
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
 // CHECK-SAME:      [0, 544, 0], [0, 0, 256], [0, 17, 0]
 // CHECK-SAME:  ]>

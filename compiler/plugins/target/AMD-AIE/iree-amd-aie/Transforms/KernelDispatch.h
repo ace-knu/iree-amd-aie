@@ -49,6 +49,14 @@ enum class HardwareMapping { Core, Block, None };
 /// evaluates the GEMV core count on the same K tile.
 constexpr int64_t kGemvKTile = 256;
 
+/// K elements the matvec ukernel reads per vector; with it the GEMV K tile is a
+/// multiple of this.
+constexpr int64_t kMatvecUKernelK = 64;
+
+/// The Flow pad pass grows a GEMV's N to a multiple of this many outputs per
+/// core, so the per-core N always has a divisor of at least this size.
+constexpr int64_t kGemvNPerCoreMultiple = 8;
+
 /// How the pool pipeline spreads a max-pooling dispatch over the core array
 /// (see `setRootConfigForPoolPipeline`).
 enum class PoolCoreSplit {
