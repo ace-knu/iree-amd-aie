@@ -79,13 +79,9 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
 /// (`AMDAIESplitLogicalObjFifos`) still splits along the first non-unit dim and
 /// for M >= 2 that is M, not N: every core then writes C into one memtile and
 /// channel assignment fails. Those shapes stay on pack-peel until that is
-/// fixed. Shared by `KernelDispatch` and the Flow-phase pad/split passes so
-/// they agree on which dispatches are GEMV.
+/// fixed. Shared by `KernelDispatch` and the Flow-phase pad pass so they agree
+/// on which dispatches are GEMV.
 bool isGemvMExtent(int64_t m);
-
-/// Whether small-M matmuls take the GEMV pipeline for this target
-/// (`gemv_pipeline` in the executable target config; absent means enabled).
-bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr);
 
 /// Whether the Flow pad pass may pad a GEMV's N up to a multiple of
 /// `numRows * numCols * kGemvNPerCoreMultiple` so the GEMV pipeline reaches

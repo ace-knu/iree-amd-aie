@@ -185,9 +185,6 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     // Set microkernel enabling flag.
     addConfig("ukernels",
               StringAttr::get(context, options.enableAMDAIEUkernels));
-    // Set the GEMV pipeline routing flag (read per dispatch by the Flow pad /
-    // split passes and by KernelDispatch).
-    addConfig("gemv_pipeline", BoolAttr::get(context, options.enableGemvPipeline));
     // Whether the Flow pad pass may grow a GEMV's N to reach every core, and
     // the per-core N tile cap of the GEMV pipeline.
     addConfig("gemv_pad_n", BoolAttr::get(context, options.gemvPadN));

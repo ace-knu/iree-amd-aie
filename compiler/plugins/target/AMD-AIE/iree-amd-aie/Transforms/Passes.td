@@ -153,13 +153,6 @@ def AMDAIEPadPoolingDispatches :
       "mlir::iree_compiler::AMDAIE::createAMDAIEPadPoolingDispatchesPass()";
 }
 
-def AMDAIESplitLargeContractionDispatches :
-    Pass<"iree-amdaie-split-large-contraction-dispatches", "ModuleOp"> {
-  let summary = "Split a large-(K,N) transpose_b NPU matmul dispatch into N-chunk sub-dispatches (weight sliced along N) concatenated on the host, keeping each weight L3->L2 shim DMA within the shim's addressing limits.";
-  let constructor =
-      "mlir::iree_compiler::AMDAIE::createAMDAIESplitLargeContractionDispatchesPass()";
-}
-
 def AMDAIEAssignLogicalObjectFifoDepth :
     Pass<"iree-amdaie-assign-logical-objectfifo-depth", ""> {
   let summary = "Assign a buffer depth of the logical objectfifos.";

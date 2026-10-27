@@ -205,12 +205,6 @@ PoolColumns choosePoolColumns(int64_t oh, int64_t numCols,
   return {choosePoolColumns(oh, numCols), oh};
 }
 
-bool getConfigEnableGemvPipeline(IREE::HAL::ExecutableTargetAttr targetAttr) {
-  std::optional<BoolAttr> attr =
-      getConfigAttr<BoolAttr>(targetAttr, "gemv_pipeline");
-  return !attr || attr->getValue();
-}
-
 bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<BoolAttr> attr =
       getConfigAttr<BoolAttr>(targetAttr, "gemv_pad_n");

@@ -65,7 +65,7 @@ appendix for reference.
 | `--iree-preprocessing-pass-pipeline=...convert-conv-to-channels-last` | ONNX convs are NCHW; the im2col path expects NHWC. |
 | `--iree-dispatch-creation-no-fuse-into-contraction-conv-roots` | Works around a codegen gap: amd-aie cannot tile a contraction dispatch that has elementwise ops fused into it, so fusion across contraction/conv group boundaries is switched off. The real fix is on the codegen side, not here. |
 | `--iree-global-opt-detach-elementwise-through-reshape` | Detaches the bias add from the conv init through the im2col reshape, so the contraction dispatch has a plain `linalg.fill` init. |
-| `--iree-flow-enable-executable-deduplication=false` | Deduplicating two convs that differ only in constant-weight offset turns that offset into a runtime push constant, which `amdaie.npu.address_patch` cannot carry (it is static-only). The N-split pass also relies on its clones not being merged. |
+| `--iree-flow-enable-executable-deduplication=false` | Deduplicating two convs that differ only in constant-weight offset turns that offset into a runtime push constant, which `amdaie.npu.address_patch` cannot carry (it is static-only). |
 
 The last three are flags of the `ace-knu/iree` fork (see `.gitmodules`); they do
 not exist in upstream IREE.

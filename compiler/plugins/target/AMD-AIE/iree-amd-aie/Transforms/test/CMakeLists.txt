@@ -103,7 +103,6 @@ iree_lit_test_suite(
     "remove_wrap_flag_from_gep.mlir"
     "sink_into_core.mlir"
     "split_control_packet_data.mlir"
-    "split_large_contraction_dispatches.mlir"
     "split_logicalobjfifos.mlir"
     "split_logicalobjfifos_for_connection_reuse.mlir"
     "temporary_alloc_bufferization.mlir"

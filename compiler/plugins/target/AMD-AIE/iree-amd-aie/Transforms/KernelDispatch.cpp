@@ -709,30 +709,25 @@ static LogicalResult setRootConfigForGemvPipeline(
 }
 
 /// Returns true if `linalgOp` takes the GEMV pipeline under `passPipeline`, i.e.
-/// the target has it enabled (`--iree-amdaie-enable-gemv-pipeline`), the shape
-/// qualifies (`isGemvLike`) and the global pipeline is one of the pack-peel
-/// variants that pad M otherwise. Checked before the pipeline switch so the
-/// per-dispatch override is emitted regardless of which pack-peel variant is
-/// selected globally -- the Flow pad/split passes skip M/N padding for these
-/// shapes based on the target attr alone, so codegen must agree with them under
-/// every global pipeline.
-static bool takesGemvPipeline(mlir::FunctionOpInterface entryPointFn,
-                              linalg::LinalgOp linalgOp,
+/// the shape qualifies (`isGemvLike`) and the global pipeline is one of the
+/// pack-peel variants that pad M otherwise. Checked before the pipeline switch
+/// so the per-dispatch override is emitted regardless of which pack-peel
+/// variant is selected globally -- the Flow pad pass skips M padding for these
+/// shapes based on the shape alone, so codegen must agree with it under every
+/// global pipeline.
+static bool takesGemvPipeline(linalg::LinalgOp linalgOp,
                               TilePassPipeline passPipeline) {
-  // TODO(gemv): the Flow pad/split passes (AMDAIEPadContractionDispatches.cpp)
-  // decide "this dispatch is GEMV" from the `gemv_pipeline` target attr and
-  // `isGemvMExtent` alone; they cannot see the global tile pipeline. Any
-  // condition added here (or a new global pipeline that handles matmuls) must
-  // be mirrored there, or M == 1 arrives unpadded at a pipeline that expects
-  // M % instr_m == 0. Consider carrying the decision in one shared predicate
-  // (target attr + shape) used by both sides, or folding the global pipeline
-  // into the target attr, so the two cannot drift.
+  // TODO(gemv): the Flow pad pass (AMDAIEPadContractionDispatches.cpp) decides
+  // "this dispatch is GEMV" from `isGemvMExtent` alone; it cannot see the
+  // global tile pipeline. Any condition added here (or a new global pipeline
+  // that handles matmuls) must be mirrored there, or M == 1 arrives unpadded
+  // at a pipeline that expects M % instr_m == 0. Consider carrying the
+  // decision in one shared predicate used by both sides, or folding the global
+  // pipeline into the target attr, so the two cannot drift.
   if (passPipeline != TilePassPipeline::PackPeelPipeline &&
       passPipeline != TilePassPipeline::PackPeel4LevelTilingPipeline)
     return false;
-  return getConfigEnableGemvPipeline(
-             IREE::HAL::ExecutableTargetAttr::lookup(entryPointFn)) &&
-         isGemvLike(linalgOp);
+  return isGemvLike(linalgOp);
 }
 
 static LogicalResult setRootConfigForPackPeelPipeline(
@@ -1159,7 +1154,7 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
   if (isMatmul(genericOp) || isMatmulTransposeA(genericOp) ||
       isMatmulTransposeB(genericOp)) {
     // M == 1 shapes leave the pack-peel variants here; see `isGemvLike`.
-    if (takesGemvPipeline(entryPointFn, genericOp, passPipeline)) {
+    if (takesGemvPipeline(genericOp, passPipeline)) {
       return setRootConfigForGemvPipeline(entryPointFn, genericOp,
                                           getDeviceModel(targetDevice), numRows,
                                           numCols, stackSize,
@@ -1556,7 +1551,7 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
   auto linalgOp = cast<linalg::LinalgOp>(contractionOp.getOperation());
 
   // M == 1 shapes leave the pack-peel variants here; see `isGemvLike`.
-  if (takesGemvPipeline(entryPointFn, linalgOp, passPipeline)) {
+  if (takesGemvPipeline(linalgOp, passPipeline)) {
     return setRootConfigForGemvPipeline(entryPointFn, linalgOp,
                                         getDeviceModel(targetDevice), numRows,
                                         numCols, stackSize,

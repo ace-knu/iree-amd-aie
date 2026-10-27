@@ -108,10 +108,6 @@ struct AMDAIEOptions {
   }
 
   std::string enableAMDAIEUkernels{"none"};
-  // Route small-M (GEMV-like) matmuls to the GEMV tile pipeline and skip their
-  // M/N padding and N-splitting (KernelDispatch, AMDAIEPadContractionDispatches).
-  // Off restores the pack-peel-only behaviour, for A/B comparison and rollback.
-  bool enableGemvPipeline{true};
   // Let the Flow pad pass grow a GEMV's N (host pad + crop) to the canonical
   // layout (N=1000 -> 1024: 20 -> 32 cores). The padded weight rows are zero.
   bool gemvPadN{true};
@@ -230,13 +226,6 @@ struct AMDAIEOptions {
         llvm::cl::desc("Enables microkernels in the amdaie backend. May be "
                        "`none`, `all`, or a comma-separated list of specific "
                        "unprefixed microkernels to enable, e.g. `matmul`."));
-
-    binder.opt<bool>(
-        "iree-amdaie-enable-gemv-pipeline", enableGemvPipeline,
-        llvm::cl::cat(category),
-        llvm::cl::desc("Lower small-M (GEMV-like) matmuls with the GEMV tile "
-                       "pipeline instead of pack-peel (and skip their M/N "
-                       "padding and N-splitting). Default true."));
 
     binder.opt<bool>(
         "iree-amdaie-gemv-pad-n", gemvPadN, llvm::cl::cat(category),

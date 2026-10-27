@@ -120,12 +120,6 @@ struct AMDAIESession
     // dispatch and just grows in place (a fill created before dispatch
     // formation gets hoisted out as a splat the pool pipeline cannot take).
     passManager.addPass(AMDAIE::createAMDAIEPadPoolingDispatchesPass());
-    // Split large-(K,N) transpose_b NPU matmul dispatches (padded above) into
-    // N-chunk sub-dispatches so each weight's L3->L2 shim DMA stays within the
-    // shim addressing limits (a single large-N weight DMA degrades and stalls).
-    // No-op for conv / small matmuls / non-amd-aie dispatches.
-    passManager.addPass(
-        AMDAIE::createAMDAIESplitLargeContractionDispatchesPass());
   }
 
   void populateHALTargetDevices(IREE::HAL::TargetDeviceList &targets) override {

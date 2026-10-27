@@ -115,7 +115,6 @@ std::unique_ptr<Pass> createAMDAIEConvertPoolingToChannelsLastPass(
 /// Create a pass that splits a large-(K,N) transpose_b NPU matmul dispatch into
 /// N-chunk sub-dispatches (weight sliced along N) concatenated on the host, to
 /// keep each weight L3->L2 shim DMA within the shim's addressing limits.
-std::unique_ptr<Pass> createAMDAIESplitLargeContractionDispatchesPass();
 
 /// Create a pass to pad NPU max pooling dispatches' OH at the Flow dispatch
 /// boundary per the target's pool column policy.
