@@ -265,6 +265,10 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
         op, "no ukernel template for the element type");
   }
 
+  // A 2-D fill (unpacked tile) or a packed 4-D/6-D one (`getTilingInfo`).
+  if (!llvm::is_contained({2, 4, 6}, outType.getRank())) {
+    return rewriter.notifyMatchFailure(op, "fill is not 2-D, 4-D or 6-D");
+  }
   int M, N, r, t;
   if (outType.getRank() == 2) {
     M = outType.getDimSize(0);

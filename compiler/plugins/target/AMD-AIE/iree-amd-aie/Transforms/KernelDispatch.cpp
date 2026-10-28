@@ -661,7 +661,7 @@ static LogicalResult setRootConfigForGemvPipeline(
   Type rhsElemType = getElementTypeOrSelf(linalgOp.getDpsInputOperand(1)->get());
   Type outElemType = getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get());
   bool useMatvec =
-      K % kMatvecUKernelK == 0 &&
+      K % kMatvecUKernelK == 0 && isAie2P(deviceModel.device) &&
       hasUkernel(ukernelConfig, "matvec") &&
       hasUKernelTemplate(deviceModel.device, "matvec",
                          {lhsElemType, rhsElemType, outElemType},

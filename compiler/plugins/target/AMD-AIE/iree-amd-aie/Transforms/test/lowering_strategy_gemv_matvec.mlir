@@ -1,4 +1,5 @@
 // RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu4 num-rows=4 num-cols=8 enable-ukernels=all})' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-lowering-strategy{target-device=npu1_4col num-rows=4 num-cols=4 enable-ukernels=all})' %s | FileCheck %s --check-prefix=NPU1
 
 // With the matvec ukernel (bf16 x bf16 -> f32) the GEMV K tile is 256 or 64:
 // K=320 takes 64 (5 x 64), not 160, the largest factor <= 256 the scalar tile
@@ -7,6 +8,11 @@
 // CHECK-SAME:      [0, 1024, 0], [0, 0, 64], [0, 32, 0]
 // CHECK-SAME:  ]>
 // CHECK:       func.func @gemv_matvec_k320
+// The matvec ukernel exists on npu4 (AIE2P) only, so npu1 keeps the scalar
+// rule: the largest factor of 320 <= 256, 160.
+// NPU1:        #config = #iree_codegen.lowering_config<tile_sizes = [
+// NPU1-SAME:       [0, {{[0-9]+}}, 0], [0, 0, 160]
+// NPU1:        func.func @gemv_matvec_k320
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   <storage_buffer>,
   <storage_buffer>,

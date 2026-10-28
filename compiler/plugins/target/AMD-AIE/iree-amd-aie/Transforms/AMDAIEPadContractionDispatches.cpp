@@ -115,7 +115,8 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   std::optional<int64_t> numCols = getConfigNumColumns(target);
   if (!device || !numRows || !numCols) return std::nullopt;
   if (isGemvShape(m, transposeB)) {
-    bool useMatvec = hasUkernel(target.getConfiguration(), "matvec") &&
+    bool useMatvec = isAie2P(*device) &&
+                     hasUkernel(target.getConfiguration(), "matvec") &&
                      hasUKernelTemplate(*device, "matvec",
                                         {lhsElemType, rhsElemType, accElemType},
                                         /*transposeB=*/true);

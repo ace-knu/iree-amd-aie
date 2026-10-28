@@ -568,3 +568,19 @@ module {
 // CHECK-LABEL: func @gemv_tile_fill_partial_vector(
 //   CHECK-NOT:   linalg.fill
 //       CHECK:   iree_codegen.ukernel.generic "zero_fill_f32_1x26"
+
+// -----
+
+// A zero fill that is neither an unpacked 2-D tile nor a packed 4-D/6-D one
+// (here 3-D) is left as a linalg.fill.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
+module {
+  func.func @fill_3d(%arg0: tensor<2x4x16xf32>) -> tensor<2x4x16xf32> attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+    %cst = arith.constant 0.0 : f32
+    %0 = linalg.fill ins(%cst : f32) outs(%arg0 : tensor<2x4x16xf32>) -> tensor<2x4x16xf32>
+    return %0 : tensor<2x4x16xf32>
+  }
+}
+// CHECK-LABEL: func @fill_3d(
+//       CHECK:   linalg.fill
+//   CHECK-NOT:   iree_codegen.ukernel.generic
