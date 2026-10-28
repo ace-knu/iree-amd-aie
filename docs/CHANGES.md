@@ -256,7 +256,6 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 
 ### 남은 일
 
-- SPIR-V subgroup 크기 수정(`f1a30ce2c`)을 upstream(iree-org/iree)에 PR로 보내고, 반영되면 fork 커밋을 뺀다. `ElideAsyncCopies` 변경(S1)도 같은 메모에 적는다.
 - 미룬 것: 날짜별 문서 재배치, hwctx 재사용 최적화, `--verbose`의 GPU 시간, 장치별 수치 형식, GPU bf16.
 
 ## 0. 기준
