@@ -45,8 +45,7 @@ enum class BufferizeOperand {
 enum class HardwareMapping { Core, Block, None };
 
 /// K elements the GEMV pipeline streams through L1 per step (see
-/// `setRootConfigForGemvPipeline`). Shared with the Flow pad pass, which
-/// evaluates the GEMV core count on the same K tile.
+/// `setRootConfigForGemvPipeline`).
 constexpr int64_t kGemvKTile = 256;
 
 /// K elements the matvec ukernel reads per vector; with it the GEMV K tile is a

@@ -108,11 +108,12 @@ struct AMDAIEOptions {
   }
 
   std::string enableAMDAIEUkernels{"none"};
-  // Let the Flow pad pass grow a GEMV's N (host pad + crop) to the canonical
-  // layout (N=1000 -> 1024: 20 -> 32 cores). The padded weight rows are zero.
+  // Let the Flow pad pass grow a GEMV's N (host pad + crop) to a multiple of
+  // every core times 8 outputs (N=1000 -> 1024: 20 -> 32 cores). The padded
+  // weight rows are zero.
   bool gemvPadN{true};
-  // Per-core N tile cap of the canonical GEMV layout (outputs per core per
-  // block); 32 is the fc1 tile the pipeline was measured with.
+  // Per-core N tile cap of the GEMV tiling when N reaches every core (outputs
+  // per core per block); 32 is the fc1 tile the pipeline was measured with.
   int64_t gemvN1{32};
   // Preprocessing: rewrite NCHW max pooling as NHWC (channels-last) pooling
   // wrapped in transposes, so pooling matches the NHWC convs and the transposes
@@ -230,14 +231,14 @@ struct AMDAIEOptions {
     binder.opt<bool>(
         "iree-amdaie-gemv-pad-n", gemvPadN, llvm::cl::cat(category),
         llvm::cl::desc("Pad a GEMV's N on the host (Flow pad pass, with a "
-                       "crop) to the canonical layout so the GEMV pipeline "
-                       "uses every core. Default true."));
+                       "crop) to a multiple of every core times 8 outputs so "
+                       "the GEMV pipeline uses every core. Default true."));
 
     binder.opt<int64_t>(
         "iree-amdaie-gemv-n1", gemvN1, llvm::cl::cat(category),
-        llvm::cl::desc("Per-core N tile cap of the canonical GEMV layout: N "
-                       "is padded to 32 * n1 * blocks with n1 <= this (and "
-                       "the L1 budget). Default 32."));
+        llvm::cl::desc("Per-core N tile cap of the GEMV tiling: when N "
+                       "reaches every core, the per-core tile is the largest "
+                       "divisor <= this that fits the L1 budget. Default 32."));
 
     binder.opt<bool>(
         "iree-amdaie-accelerate-pooling", acceleratePooling,
@@ -406,8 +407,9 @@ struct AMDAIEOptions {
                        "core array (with --iree-amdaie-accelerate-pooling)"),
         llvm::cl::values(
             clEnumValN(PoolCoreSplit::SpatialChannel, "spatial-channel",
-                       "Columns take the leading spatial output dim (its odd "
-                       "factor, 7 for VGG-16), rows take the channel dim."),
+                       "Columns take the leading spatial output dim (as many "
+                       "as --iree-amdaie-pool-columns-policy gives), rows "
+                       "take the channel dim."),
             clEnumValN(PoolCoreSplit::Search, "search",
                        "Search one distributed output dim, ranked by core "
                        "count, channel tile and L1 bytes.")));

@@ -5,7 +5,8 @@ and the `run` flags (iree-run-module) that open it; `{symbol}` is filled with
 the device symbol (`d<index>_` + the name with '-' as '_'). A model is placed on the devices
 picked with --devices, in that order. The CPU (local-host) comes first: it
 runs the host code and is the default (lead) device; the accelerators after it
-take contraction/conv dispatches round-robin in the listed order.
+take contraction/conv dispatches (and max pooling with --pool accel)
+round-robin in the listed order.
 Every OPTIONS group holds either fixed `flags` (always passed) or user options,
 each a map of choice -> flags. To add, remove or change a device or an option,
 edit this file only. A flag that only works around a current gap is marked with

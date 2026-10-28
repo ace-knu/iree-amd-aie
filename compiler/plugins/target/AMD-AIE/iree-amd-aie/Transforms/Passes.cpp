@@ -311,10 +311,11 @@ void addPackPeelBasedPassPipeline(OpPassManager &funcPassManager,
 void addGemvPassPipeline(OpPassManager &funcPassManager) {
   // Same loop structure as pack-peel -- forall (N block) > scf.for (K) >
   // forall (core) -- but the operands move as `linalg.copy` rather than
-  // `linalg.pack`: the scalar core code gains nothing from a packed layout, the
-  // weight then keeps its DRAM layout so each L3->L2 transfer is one 2-D DMA,
-  // and there is no pack permutation to express an untiled M with. The root
-  // config (`setRootConfigForGemvPipeline`) leaves M untiled, spreads N over
+  // `linalg.pack`: the core code (matvec ukernel or scalar) reads the tiles
+  // row-major and gains nothing from a packed layout, the weight then keeps
+  // its DRAM layout so each L3->L2 transfer is one 2-D DMA, and there is no
+  // pack permutation to express an untiled M with. The root config
+  // (`setRootConfigForGemvPipeline`) leaves M untiled, spreads N over up to
   // every core, and streams K.
   auto addCleanups = [&]() {
     funcPassManager.addPass(createAMDAIECleanupPass());

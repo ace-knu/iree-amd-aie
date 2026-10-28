@@ -625,10 +625,11 @@ static bool isGemvLike(linalg::LinalgOp linalgOp) {
 
 /// GEMV pipeline root config. M is left untiled (below one row-group of vector
 /// instruction rows, tiling it over `numRows` would only distribute zero
-/// padding), N is spread over all `numRows * numCols` cores by one 1-D forall
+/// padding), N is spread over up to `numRows * numCols` cores by one 1-D forall
 /// with `n1Tile` outputs per core, and K is streamed through L1 in `kTile`
-/// steps. There is no packing_config: data moves as plain copies. The scalar
-/// core code gains nothing from a packed layout, and keeping the weight in its
+/// steps. There is no packing_config: data moves as plain copies. The core code
+/// (the matvec ukernel or scalar code) reads the tiles row-major, so it gains
+/// nothing from a packed layout, and keeping the weight in its
 /// DRAM layout makes each L3->L2 transfer a single 2-D DMA whose contiguous run
 /// is `kTile` elements.
 static LogicalResult setRootConfigForGemvPipeline(
@@ -1143,7 +1144,7 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
          "expected lowering_config is not set");
 
   // Max pooling only reaches the backend when the Flow placement admitted it
-  // (`pooling` target config); it always takes the pool pipeline, whatever the
+  // (`accelerate-pooling`); it always takes the pool pipeline, whatever the
   // global tile pipeline is (a module mixes it with conv matmuls).
   if (FailureOr<MaxPoolingDims> pool = getMaxPoolingDims(genericOp);
       succeeded(pool)) {

@@ -15,7 +15,7 @@
 // takes OH's largest divisor <= 8 (all 8 when OH divides by 8, else 7 for the
 // VGG-16 layers), never padding; `cost` (CHECK) picks the divisor of OH that
 // minimises the per-column cost model t = 0.74 + 0.21 (cols - 1) + 1.77 MB /
-// cols [ms] (docs_POOL/1001_pool_column_cost_model.md); `odd` (ODD) takes
+// cols [ms]; `odd` (ODD) takes
 // OH's odd factor (7 for every VGG-16 layer); `full` (FULL) takes all 8 when
 // OH divides by 8 (the preprocessing pads OH so it does; on an unpadded OH it
 // falls back to `odd`).

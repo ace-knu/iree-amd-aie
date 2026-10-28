@@ -212,7 +212,7 @@ int64_t choosePoolColumns(int64_t oh, int64_t numCols);
 /// perColumnMs * (cols - 1) + msPerMBPerColumn * MB / cols`: each column adds
 /// a fixed cost (its shim DMA programming / sync) and one shim channel's worth
 /// of bandwidth. Fitted on npu4, f32 scalar pooling, VGG-16 pool1-5 at 7
-/// columns and pool4/5 at 1 column (docs_POOL/1001_pool_column_cost_model.md).
+/// columns and pool4/5 at 1 column.
 struct PoolColumnCost {
   double fixedMs = 0.74;
   double perColumnMs = 0.21;
