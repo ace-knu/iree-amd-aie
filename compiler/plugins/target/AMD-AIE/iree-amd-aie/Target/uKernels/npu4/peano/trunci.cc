@@ -4,11 +4,13 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "aie_kernels/aie_kernel_utils.h"
+
 template <int M, int N, int r, int u>
 void trunci_vectorized(v32int32 *__restrict in, int64_t offsetIn, int64_t shift,
                        v32int8 *__restrict out, int64_t offsetOut) {
   static_assert(M * N / r / u > 0);
-#pragma clang loop unroll_count(M *N / r / u)
+  AIE_LOOP_UNROLL(M * N / r / u)
   for (unsigned i = 0; i < M * N / r; i++) {
     out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], shift, 0);
   }

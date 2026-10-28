@@ -886,8 +886,12 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
         if (!instances.empty())
           extraArgs.push_back("-DUK_INSTANCES=" + instances);
         // A ukernel taken from mlir-aie's aie_kernels is written against
-        // aie_api; compile it with the flags mlir-aie compiles those with.
-        if (StringRef(*ukernelFileContent).contains("<aie_api/aie.hpp>")) {
+        // aie_api and the aie_kernels headers (a ukernel of ours may use the
+        // latter alone); compile it with the flags mlir-aie compiles those
+        // with.
+        StringRef ukernelContent(*ukernelFileContent);
+        if (ukernelContent.contains("<aie_api/aie.hpp>") ||
+            ukernelContent.contains("\"aie_kernels/")) {
           Path includeDir = tempDir / "ukernel_include";
           if (!aieKernelHeadersWritten) {
             if (failed(writeAieKernelHeaders(includeDir))) return failure();
