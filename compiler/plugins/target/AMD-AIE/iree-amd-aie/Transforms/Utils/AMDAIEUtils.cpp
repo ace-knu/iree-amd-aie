@@ -139,10 +139,7 @@ int64_t choosePoolColumns(int64_t oh, int64_t numCols) {
   int64_t odd = oh;
   while (odd % 2 == 0) odd /= 2;
   if (odd > 1 && odd <= numCols) return odd;
-  int64_t best = 1;
-  for (int64_t d = 1; d <= std::min(oh, numCols); ++d)
-    if (oh % d == 0) best = d;
-  return best;
+  return detail::findLargestFactor(oh, numCols);
 }
 
 double PoolShape::bytesMoved(int64_t oh) const {

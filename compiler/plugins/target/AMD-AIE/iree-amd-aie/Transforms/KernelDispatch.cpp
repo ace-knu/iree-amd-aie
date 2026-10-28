@@ -1281,13 +1281,6 @@ SmallVector<int64_t> divisorsOf(int64_t n) {
   return r;
 }
 
-int64_t largestDivisorUpTo(int64_t n, int64_t limit) {
-  int64_t best = 1;
-  for (int64_t d : divisorsOf(n))
-    if (d <= limit) best = d;
-  return best;
-}
-
 /// `PoolCoreSplit::Search`: every divisor combination of the output dims is an
 /// L1 tile candidate; cores are spread along exactly one output dim, filling
 /// whole columns; when more than one column is used the L2 block must be
@@ -1412,7 +1405,7 @@ FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
     // not overlap.
     if (cols > 1 && g.window[dS] != g.stride[dS]) return failure();
   }
-  int64_t rows = largestDivisorUpTo(C, numRows);
+  int64_t rows = findLargestFactor(C, numRows);
   if (cols * rows <= 1) return failure();
   int64_t tC = C / rows;
 
