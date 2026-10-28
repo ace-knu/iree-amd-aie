@@ -25,6 +25,7 @@ iree_c_embed_data(
     "uKernels/npu4/peano/zero_fill.cc"
     "uKernels/aie_kernels/aie_arch.h"
     "uKernels/aie_kernels/aie_kernel_utils.h"
+    "uKernels/aie_kernels/common/zero.h"
   C_FILE_OUTPUT
     "ukernels.c"
   H_FILE_OUTPUT
