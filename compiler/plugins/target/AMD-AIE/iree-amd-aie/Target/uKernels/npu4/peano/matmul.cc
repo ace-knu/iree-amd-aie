@@ -1,324 +1,215 @@
-// Copyright 2025 The IREE Authors
-//
-// Licensed under the Apache License v2.0 with LLVM Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
+// Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-template <unsigned rowA, unsigned colA, unsigned colB, unsigned L0_M,
-          unsigned L0_K, unsigned L0_N>
-void matmul_vectorized_i8_i32(const int8 *__restrict pA, unsigned offsetA,
-                              const int8 *__restrict pB, unsigned offsetB,
-                              int32 *__restrict pC, unsigned offsetC) {
-  const unsigned size_A = L0_M * L0_K;
-  const unsigned size_B = L0_K * L0_N;
-  const unsigned size_C = L0_M * L0_N;
+// The matmul ukernel: C += A * B over 8x8x8 micro-tiles, bf16 x bf16 -> f32
+// (through bfp16) and i8 x i8 -> i32. Taken from mlir-aie's
+// aie_kernels/linalg/mm_aie2p.h (943cbc4), its matmul_vectorized_2x2_mmul,
+// with the changes the iree L1 layout needs. Each micro-tile is row-major as
+// upstream, but the pack places the tiles in a different order:
+// - A tiles are ordered [k][m], not [m][k].
+// - C tiles are ordered [n][m] (upstream's C_COL_MAJ order), each tile still
+//   row-major, so no tile is transposed.
+// - B tiles are ordered [n][k] holding k x n tiles without a transposed B
+//   (upstream's B_COL_MAJ order, untransposed tiles), and [k][n] holding n x k
+//   tiles with one (upstream's row-major order, transposed tiles).
+// The entry points take the (pointer, offset) operands of a ukernel call.
 
-  // Use a double set of A/B variables to help the compiler in finding better
-  // pipelining solutions. The number of registers needed among them should stay
-  // within vector register limits, sp we expect these to be mapped to actual
-  // vector registers.
-  v64int8 A0;
-  v64int8 A1;
-  v64int8 B0;
-  v64int8 B1;
+#include <stdint.h>
+#include <type_traits>
 
-  v64int8 A0_1;
-  v64int8 A1_1;
-  v64int8 B0_1;
-  v64int8 B1_1;
+#define AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 1
 
-  // The accumulator variables for calculating the results of the AxB MAC
-  // operations. This should fit within the number of available accumulator
-  // registers, so we expect these to be mapped to actual accumulator registers.
-  v64acc32 acc_C00;
-  v64acc32 acc_C01;
-  v64acc32 acc_C10;
-  v64acc32 acc_C11;
+#include "aie_kernels/aie_arch.h"
+#include "aie_kernels/aie_kernel_utils.h"
 
-#pragma clang loop min_iteration_count(rowA / 2)
-#pragma clang loop max_iteration_count(rowA / 2)
-  for (unsigned z = 0; z < rowA; z += 2) {
-    v64acc32 *__restrict pC0 = (v64acc32 *)(pC + offsetC + (z)*size_C);
-    v64acc32 *__restrict pC1 = (v64acc32 *)(pC + offsetC + ((z + 1)) * size_C);
+#include <aie_api/aie.hpp>
 
-#pragma clang loop min_iteration_count(colB / 2)
-#pragma clang loop max_iteration_count(colB / 2)
-    for (unsigned j = 0; j < colB; j += 2) {
-      const v64int8 *__restrict pA0 = (v64int8 *)(pA + offsetA + (z)*size_A);
-      const v64int8 *__restrict pA1 =
-          (v64int8 *)(pA + offsetA + ((z + 1)) * size_A);
+template <typename T_in, typename T_out, unsigned rowA, unsigned colA,
+          unsigned colB, unsigned r, unsigned s, unsigned t, bool TransposeB,
+          bool unroll_k = false>
+static inline void matmul_vectorized_2x2_mmul(const T_in *__restrict pA,
+                                              const T_in *__restrict pB,
+                                              T_out *__restrict pC) {
 
-      const v64int8 *__restrict pB0 =
-          (v64int8 *)(pB + offsetB + (j)*colA * size_B);
-      const v64int8 *__restrict pB1 =
-          (v64int8 *)(pB + offsetB + ((j + 1)) * colA * size_B);
+  using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
 
-      acc_C00 = *pC0;
-      acc_C01 = *(pC0 + rowA);
+  // The bfp16 emulation converts every A and B tile from bf16 to bfp16 before
+  // the MAC, and that conversion follows the core rounding mode. The default
+  // mode is rounding_mode::floor, which rounds toward negative infinity, so
+  // each converted element is biased low and the bias accumulates over the K
+  // reduction rather than cancelling. Select round-to-nearest-even for the
+  // duration of the kernel and restore the caller's mode before returning. Only
+  // the bf16 shapes convert, so the integer shapes keep whatever mode the
+  // caller set.
+  constexpr bool emulated_bf16 = std::is_same_v<T_in, bfloat16>;
+  aie::rounding_mode saved_rounding = aie::rounding_mode::floor;
+  if constexpr (emulated_bf16)
+    saved_rounding = aie::swap_rounding(aie::rounding_mode::conv_even);
 
-      acc_C10 = *pC1;
-      acc_C11 = *(pC1 + rowA);
+  for (unsigned z = 0; z < rowA; z += 2)
+    chess_prepare_for_pipelining chess_loop_range(4, ) {
 
-      A0 = *pA0;
-      pA0 += rowA;
-      A1 = *pA1;
-      pA1 += rowA;
+      T_out *__restrict pCj = pC + z * MMUL::size_C;
+      // Peano does not strength-reduce the j-indexed tile addresses, so these
+      // cursors step with j rather than rebuilding each address from j.
+      const T_in *__restrict pAz = pA + z * MMUL::size_A;
+      const T_in *__restrict pBj = pB;
 
-      B0 = *pB0++;
-      B1 = *pB1++;
+      for (unsigned j = 0; j < colB; j += 2) {
 
-      A0_1 = *pA0;
-      pA0 += rowA;
-      A1_1 = *pA1;
-      pA1 += rowA;
+        T_out *__restrict pC1 = pCj;
+        T_out *__restrict pC2 = pCj + rowA * MMUL::size_C;
+        pCj += 2 * rowA * MMUL::size_C;
+        const T_in *__restrict pA1 = pAz;
+        const T_in *__restrict pA2 = pAz + MMUL::size_A;
+        const T_in *__restrict pB1 = pBj;
+        const T_in *__restrict pB2;
+        if constexpr (TransposeB) {
+          pB2 = pBj + MMUL::size_B;
+          pBj += 2 * MMUL::size_B;
+        } else {
+          pB2 = pBj + colA * MMUL::size_B;
+          pBj += 2 * colA * MMUL::size_B;
+        }
 
-      B0_1 = *pB0++;
-      B1_1 = *pB1++;
-      acc_C00 = mac_8x8_8x8(A0, B0, acc_C00);
-      acc_C01 = mac_8x8_8x8(A0, B1, acc_C01);
-      acc_C10 = mac_8x8_8x8(A1, B0, acc_C10);
-      acc_C11 = mac_8x8_8x8(A1, B1, acc_C11);
+        aie::vector<T_in, MMUL::size_A> A0;
+        aie::vector<T_in, MMUL::size_A> A1;
+        aie::vector<T_in, MMUL::size_B> B0;
+        aie::vector<T_in, MMUL::size_B> B1;
 
-#pragma clang loop min_iteration_count((colA - 2) / 2)
-#pragma clang loop max_iteration_count((colA - 2) / 2)
-      for (unsigned i = 1; i < colA - 1; i += 2) {
-        A0 = *pA0;
-        pA0 += rowA;
-        A1 = *pA1;
-        pA1 += rowA;
+        // Load partial results from C buffer for accumulation in-place. The
+        // zero_fill function handles the zeroing of data when a new
+        // accumulation is needed (after the 'K' reduction dimension)
+        aie::vector<T_out, MMUL::size_C> acc_C00 =
+            aie::load_v<MMUL::size_C>(pC1);
+        aie::vector<T_out, MMUL::size_C> acc_C01 =
+            aie::load_v<MMUL::size_C>(pC2);
+        aie::vector<T_out, MMUL::size_C> acc_C10 =
+            aie::load_v<MMUL::size_C>(pC1 + MMUL::size_C);
+        aie::vector<T_out, MMUL::size_C> acc_C11 =
+            aie::load_v<MMUL::size_C>(pC2 + MMUL::size_C);
 
-        B0 = *pB0++;
-        B1 = *pB1++;
+        // Starting a short unrolled reduction with mul and adding the loaded
+        // C tiles after it keeps them off the MAC chain. Longer reductions
+        // spill more this way. Integer sums are exact in any order.
+        constexpr bool add_c_last = unroll_k && colA <= 4 && AIE_TUNED_AIE2P &&
+                                    std::is_integral_v<T_out>;
 
-        acc_C00 = mac_8x8_8x8(A0_1, B0_1, acc_C00);
-        acc_C01 = mac_8x8_8x8(A0_1, B1_1, acc_C01);
-        acc_C10 = mac_8x8_8x8(A1_1, B0_1, acc_C10);
-        acc_C11 = mac_8x8_8x8(A1_1, B1_1, acc_C11);
+        MMUL C00, C01, C10, C11;
+        if constexpr (!add_c_last) {
+          C00 = MMUL(acc_C00);
+          C01 = MMUL(acc_C01);
+          C10 = MMUL(acc_C10);
+          C11 = MMUL(acc_C11);
+        }
 
-        A0_1 = *pA0;
-        pA0 += rowA;
-        A1_1 = *pA1;
-        pA1 += rowA;
+        auto k_step = [&](bool first) {
+          A0 = aie::load_v<MMUL::size_A>(pA1);
+          pA1 += rowA * MMUL::size_A;
+          A1 = aie::load_v<MMUL::size_A>(pA2);
+          pA2 += rowA * MMUL::size_A;
+          if constexpr (TransposeB) {
+            B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), t, s);
+            pB1 += MMUL::size_B * colB;
+            B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), t, s);
+            pB2 += MMUL::size_B * colB;
+          } else {
+            B0 = aie::load_v<MMUL::size_B>(pB1);
+            pB1 += MMUL::size_B;
+            B1 = aie::load_v<MMUL::size_B>(pB2);
+            pB2 += MMUL::size_B;
+          }
 
-        B0_1 = *pB0++;
-        B1_1 = *pB1++;
+          if (add_c_last && first) {
+            C00.mul(A0, B0);
+            C01.mul(A0, B1);
+            C10.mul(A1, B0);
+            C11.mul(A1, B1);
+          } else {
+            C00.mac(A0, B0);
+            C01.mac(A0, B1);
+            C10.mac(A1, B0);
+            C11.mac(A1, B1);
+          }
+        };
 
-        acc_C00 = mac_8x8_8x8(A0, B0, acc_C00);
-        acc_C01 = mac_8x8_8x8(A0, B1, acc_C01);
-        acc_C10 = mac_8x8_8x8(A1, B0, acc_C10);
-        acc_C11 = mac_8x8_8x8(A1, B1, acc_C11);
+        // Peano only software-pipelines an innermost single-block loop, so
+        // unrolling K lets 'j', with its C loads and stores, pipeline. The
+        // caller enables it only where one mmul step is one instruction.
+        // The unrolled reduction does not fit the register file: int8 ->
+        // int32 spills 16 bytes of stack per unit of K. Rolling long
+        // reductions back up is not a uniform win on hardware either.
+        if constexpr (unroll_k) {
+          AIE_LOOP_UNROLL_FULL
+          for (unsigned i = 0; i < colA; ++i)
+            k_step(i == 0);
+        } else {
+          for (unsigned i = 0; i < colA; ++i)
+            k_step(false);
+        }
+        if constexpr (add_c_last) {
+          C00 = MMUL(aie::add(C00.to_accum(), acc_C00));
+          C01 = MMUL(aie::add(C01.to_accum(), acc_C01));
+          C10 = MMUL(aie::add(C10.to_accum(), acc_C10));
+          C11 = MMUL(aie::add(C11.to_accum(), acc_C11));
+        }
+
+        aie::store_v(pC1, C00.template to_vector<T_out>());
+        pC1 += MMUL::size_C;
+        aie::store_v(pC2, C01.template to_vector<T_out>());
+        pC2 += MMUL::size_C;
+        aie::store_v(pC1, C10.template to_vector<T_out>());
+        pC1 += MMUL::size_C;
+        aie::store_v(pC2, C11.template to_vector<T_out>());
+        pC2 += MMUL::size_C;
       }
-
-      acc_C00 = mac_8x8_8x8(A0_1, B0_1, acc_C00);
-      acc_C01 = mac_8x8_8x8(A0_1, B1_1, acc_C01);
-      acc_C10 = mac_8x8_8x8(A1_1, B0_1, acc_C10);
-      acc_C11 = mac_8x8_8x8(A1_1, B1_1, acc_C11);
-
-      // -----
-
-      v64acc32 *__restrict pOut00 = pC0;
-      *pOut00 = acc_C00;
-      pC0 += rowA;
-
-      v64acc32 *__restrict pOut01 = pC0;
-      *pOut01 = acc_C01;
-      pC0 += rowA;
-
-      // -----
-
-      v64acc32 *__restrict pOut10 = pC1;
-      *pOut10 = acc_C10;
-      pC1 += rowA;
-
-      v64acc32 *__restrict pOut11 = pC1;
-      *pOut11 = acc_C11;
-      pC1 += rowA;
     }
-  }
+
+  if constexpr (emulated_bf16)
+    aie::set_rounding(saved_rounding);
 }
 
 template <unsigned m, unsigned k, unsigned n, bool TransposeB>
-void matmul_vectorized_8x8x8_i8_i8_i32(const int8 *__restrict pA,
-                                       unsigned offsetA,
-                                       const int8 *__restrict pB,
-                                       unsigned offsetB, int32 *__restrict pC,
-                                       unsigned offsetC) {
+static inline void matmul_vectorized_8x8x8_i8_i8_i32(const int8 *__restrict pA,
+                                                     const int8 *__restrict pB,
+                                                     int32 *__restrict pC) {
   constexpr int r = 8;
   constexpr int s = 8;
   constexpr int t = 8;
-  static_assert(!TransposeB, "The i8 ukernel has no transposed B support.");
-  static_assert(m / r > 0,
-                "There should be at least one iteration on the M dimension.");
-  static_assert(
-      k / s % 2 == 0,
-      "The ukernel is manually unrolled in the K iteration with a factor of 2,"
-      "so the number of K iterations should be a factor of 2.");
-  static_assert(n / t > 0,
-                "There should be at least one iteration on the N dimension.");
-  static_assert(m / r % 2 == 0 && n / t % 2 == 0,
-                "The ukernel is manually unrolled 2x2 in the M and N "
-                "iterations, so their counts should be multiples of 2.");
-  return matmul_vectorized_i8_i32<m / r, k / s, n / t, r, s, t>(
-      pA, offsetA, pB, offsetB, pC, offsetC);
-}
 
-v64bfp16ebs8 load_v64bf16_as_bfp16(const bfloat16 *__restrict p) {
-  v32bfloat16 v0 = *(v32bfloat16 *)(p);
-  v32bfloat16 v1 = *(v32bfloat16 *)(p + 32);
-  v32accfloat accum0 = ups(v0);
-  v32accfloat accum1 = ups(v1);
-  v64accfloat accum = concat(accum0, accum1);
-  return to_v64bfp16ebs8(accum);
-}
+  static_assert(m % (2 * r) == 0);
+  static_assert(k % s == 0);
+  static_assert(n % (2 * t) == 0);
 
-v64bfp16ebs8 load_v64bf16_as_bfp16_T(const bfloat16 *__restrict p) {
-  v32bfloat16 v0 = *(v32bfloat16 *)(p);
-  v32bfloat16 v1 = *(v32bfloat16 *)(p + 32);
-  v32bfloat16 v0_shuffed = shuffle(v0, 29);
-  v32bfloat16 v1_shuffed = shuffle(v1, 29);
-  v32bfloat16 v_shuffed_lo = shuffle(v0_shuffed, v1_shuffed, 14);
-  v32bfloat16 v_shuffed_hi = shuffle(v0_shuffed, v1_shuffed, 15);
-  v32accfloat accum0 = ups(v_shuffed_lo);
-  v32accfloat accum1 = ups(v_shuffed_hi);
-  v64accfloat accum = concat(accum0, accum1);
-  return to_v64bfp16ebs8(accum);
-}
+  // Upstream unrolls K below K = 416, but the unrolled reduction spills 16
+  // bytes of stack per unit of K (1472 bytes at K = 128) past the 1024-byte
+  // core stack iree assigns by default. Rolled, it needs 64 bytes and is no
+  // slower on the npu4 benchmarks.
+  constexpr bool unroll_k = false;
 
-// A B block is [k][n] without a transposed B, which `mac_8x8_8x8T` needs
-// transposed, and already [n][k] with one.
-template <bool TransposeB>
-v64bfp16ebs8 load_B_v64bf16_as_bfp16(const bfloat16 *__restrict p) {
-  if constexpr (TransposeB)
-    return load_v64bf16_as_bfp16(p);
-  else
-    return load_v64bf16_as_bfp16_T(p);
+  return matmul_vectorized_2x2_mmul<int8, int32, (m / r), (k / s), (n / t), r,
+                                    s, t, TransposeB, unroll_k>(pA, pB, pC);
 }
 
 // TODO: The goal is every element type combination the hardware supports, each
 // with and without a transposed B. Only this template supports a transposed B
 // for now. When a template is added or gains it, add it to the table in
 // `hasUKernelTemplate` (Transforms/Utils/AMDAIEUtils.cpp).
-template <unsigned rowA, unsigned colA, unsigned colB, unsigned L0_M,
-          unsigned L0_K, unsigned L0_N, bool TransposeB>
-void matmul_vectorized_bf16_f32(const bfloat16 *__restrict pA, unsigned offsetA,
-                                const bfloat16 *__restrict pB, unsigned offsetB,
-                                float *__restrict pC, unsigned offsetC) {
-  const unsigned size_A = L0_M * L0_K;
-  const unsigned size_B = L0_K * L0_N;
-  const unsigned size_C = L0_M * L0_N;
-  // The B blocks are ordered [n][k] without a transposed B and [k][n] with one.
-  const unsigned stepB_n = TransposeB ? size_B : colA * size_B;
-  const unsigned stepB_k = TransposeB ? colB * size_B : size_B;
-
-  // The bf16 -> bfp16 conversions round with the core rounding mode, which is
-  // floor by default and biases every product. Round to nearest even instead,
-  // and restore the mode for the code that runs after this call.
-  const unsigned prevRnd = get_rnd();
-  set_rnd(rnd_conv_even);
-
-  v64bfp16ebs8 A0;
-  v64bfp16ebs8 A1;
-  v64bfp16ebs8 B0;
-  v64bfp16ebs8 B1;
-  v64accfloat acc_C00;
-  v64accfloat acc_C01;
-  v64accfloat acc_C10;
-  v64accfloat acc_C11;
-
-  for (unsigned z = 0; z < rowA; z += 2) {
-    v64accfloat *__restrict pC0 = (v64accfloat *)(pC + offsetC + (z)*size_C);
-    v64accfloat *__restrict pC1 =
-        (v64accfloat *)(pC + offsetC + ((z + 1)) * size_C);
-
-    for (unsigned j = 0; j < colB; j += 2) {
-      const bfloat16 *__restrict pA0 = (bfloat16 *)(pA + offsetA + (z)*size_A);
-      const bfloat16 *__restrict pA1 =
-          (bfloat16 *)(pA + offsetA + ((z + 1)) * size_A);
-
-      const bfloat16 *__restrict pB0 = (bfloat16 *)(pB + offsetB + (j)*stepB_n);
-      const bfloat16 *__restrict pB1 =
-          (bfloat16 *)(pB + offsetB + ((j + 1)) * stepB_n);
-
-      A0 = load_v64bf16_as_bfp16(pA0);
-      pA0 += rowA * size_A;
-      A1 = load_v64bf16_as_bfp16(pA1);
-      pA1 += rowA * size_A;
-
-      B0 = load_B_v64bf16_as_bfp16<TransposeB>(pB0);
-      pB0 += stepB_k;
-      B1 = load_B_v64bf16_as_bfp16<TransposeB>(pB1);
-      pB1 += stepB_k;
-
-      acc_C00 = *pC0;
-      acc_C01 = *(pC0 + rowA);
-
-      acc_C10 = *pC1;
-      acc_C11 = *(pC1 + rowA);
-
-      acc_C00 = mac_8x8_8x8T(A0, B0, acc_C00);
-      acc_C01 = mac_8x8_8x8T(A0, B1, acc_C01);
-      acc_C10 = mac_8x8_8x8T(A1, B0, acc_C10);
-      acc_C11 = mac_8x8_8x8T(A1, B1, acc_C11);
-
-      for (unsigned i = 1; i < colA; ++i) {
-        A0 = load_v64bf16_as_bfp16(pA0);
-        pA0 += rowA * size_A;
-        A1 = load_v64bf16_as_bfp16(pA1);
-        pA1 += rowA * size_A;
-
-        B0 = load_B_v64bf16_as_bfp16<TransposeB>(pB0);
-        pB0 += stepB_k;
-        B1 = load_B_v64bf16_as_bfp16<TransposeB>(pB1);
-        pB1 += stepB_k;
-
-        acc_C00 = mac_8x8_8x8T(A0, B0, acc_C00);
-        acc_C01 = mac_8x8_8x8T(A0, B1, acc_C01);
-        acc_C10 = mac_8x8_8x8T(A1, B0, acc_C10);
-        acc_C11 = mac_8x8_8x8T(A1, B1, acc_C11);
-      }
-
-      // -----
-
-      v64accfloat *__restrict pOut00 = pC0;
-      *pOut00 = acc_C00;
-      pC0 += rowA;
-
-      v64accfloat *__restrict pOut01 = pC0;
-      *pOut01 = acc_C01;
-      pC0 += rowA;
-
-      // -----
-
-      v64accfloat *__restrict pOut10 = pC1;
-      *pOut10 = acc_C10;
-      pC1 += rowA;
-
-      v64accfloat *__restrict pOut11 = pC1;
-      *pOut11 = acc_C11;
-      pC1 += rowA;
-    }
-  }
-  set_rnd(prevRnd);
-}
-
 template <unsigned m, unsigned k, unsigned n, bool TransposeB>
-void matmul_vectorized_8x8x8_bf16_bf16_f32(const bfloat16 *__restrict pA,
-                                           unsigned offsetA,
-                                           const bfloat16 *__restrict pB,
-                                           unsigned offsetB,
-                                           float *__restrict pC,
-                                           unsigned offsetC) {
+static inline void
+matmul_vectorized_8x8x8_bf16_bf16_f32(const bfloat16 *__restrict pA,
+                                      const bfloat16 *__restrict pB,
+                                      float *__restrict pC) {
   constexpr int r = 8;
   constexpr int s = 8;
   constexpr int t = 8;
-  static_assert(m / r > 0);
-  static_assert(k / s > 0);
-  static_assert(n / t > 0);
-  static_assert(m / r % 2 == 0 && n / t % 2 == 0,
-                "The ukernel is manually unrolled 2x2 in the M and N "
-                "iterations, so their counts should be multiples of 2.");
-  return matmul_vectorized_bf16_f32<m / r, k / s, n / t, r, s, t, TransposeB>(
-      pA, offsetA, pB, offsetB, pC, offsetC);
+
+  static_assert(m % (2 * r) == 0);
+  static_assert(k % s == 0);
+  static_assert(n % (2 * t) == 0);
+
+  return matmul_vectorized_2x2_mmul<bfloat16, float, (m / r), (k / s),
+                                    (n / t), r, s, t, TransposeB>(pA, pB, pC);
 }
 
 // clang-format off
@@ -332,7 +223,7 @@ extern "C" {
       lhs_ctype_in *a_in, unsigned offsetA, rhs_ctype_in *b_in, unsigned offsetB,                                \
       acc_ctype_out *c_out, unsigned offsetC) {                                                                  \
     matmul_vectorized_##r##x##s##x##t##_##lhs_mlir_type_in##_##rhs_mlir_type_in##_##acc_mlir_type_out<           \
-        M, K, N, transpose_b>(a_in, offsetA, b_in, offsetB, c_out, offsetC);                                     \
+        M, K, N, transpose_b>(a_in + offsetA, b_in + offsetB, c_out + offsetC);                                  \
   }
 
 // The compiler passes the functions a device calls as `UK_INSTANCES`, a list
