@@ -521,8 +521,8 @@ func.func @generic_matmul_bf16bf16f32_odd_m(%arg0 : tensor<4x7x8x8xbf16>, %arg1 
 // -----
 
 // The GEMV pipeline's tile is an unpacked 2-D matmul, which the matvec ukernel
-// takes for bf16 (not f32, which has no template). Its zero fill is lowered
-// when it is a whole number of 16-lane vectors (1x32) and not otherwise (1x26).
+// takes for bf16 (not f32, which has no template). Its zero fill is lowered at
+// any size, a whole number of 16-lane vectors (1x32) or not (1x26).
 #executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu4", ukernels = "all"}>
 module {
   func.func @gemv_tile_bf16(%arg0: tensor<1x256xbf16>, %arg1: tensor<32x256xbf16>,
@@ -566,5 +566,5 @@ module {
 //       CHECK:   linalg.matmul
 //   CHECK-NOT:   iree_codegen.ukernel.generic
 // CHECK-LABEL: func @gemv_tile_fill_partial_vector(
-//       CHECK:   linalg.fill
-//   CHECK-NOT:   iree_codegen.ukernel.generic
+//   CHECK-NOT:   linalg.fill
+//       CHECK:   iree_codegen.ukernel.generic "zero_fill_f32_1x26"

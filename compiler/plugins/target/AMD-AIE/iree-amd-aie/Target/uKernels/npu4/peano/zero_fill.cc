@@ -6,7 +6,9 @@
 
 // Zeroes an M x N buffer with mlir-aie's aie_kernels/common/zero.h (943cbc4),
 // without its event markers, behind the (pointer, offset) operands of a
-// ukernel call.
+// ukernel call. A whole number of native vectors keeps every tile of the
+// buffer vector aligned and takes the compile-time kernel; any other size
+// takes the runtime-length one, which aligns its own stores.
 
 #include <stdint.h>
 
@@ -14,12 +16,20 @@
 
 #include <aie_api/aie.hpp>
 
+template <typename T, int M, int N>
+static inline void zero_fill(T *__restrict c) {
+  if constexpr (M * N % aie::native_vector_length_v<T> == 0)
+    zero_vectorized<T, M, N, false>(c);
+  else
+    zero_vectorized(c, M * N);
+}
+
 // clang-format off
 extern "C" {
 
 #define zero_fill_named_c_func(name, ctype_out, M, N)          \
   void name(ctype_out *c_out, unsigned offsetC) {             \
-    zero_vectorized<ctype_out, M, N, false>(c_out + offsetC); \
+    zero_fill<ctype_out, M, N>(c_out + offsetC);              \
   }
 
 // The compiler passes the functions a device calls as `UK_INSTANCES`, a list

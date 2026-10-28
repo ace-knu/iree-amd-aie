@@ -274,11 +274,6 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
     // t.
     std::tie(M, N, r, t) = getTilingInfo(outType);
   }
-  // The zero_fill ukernels store whole 16-lane vectors.
-  if ((M * N) % 16 != 0) {
-    return rewriter.notifyMatchFailure(
-        op, "fill is not a whole number of vectors");
-  }
 
   std::string elemTypeAndSize = typeToString(outElemType) + "_" +
                                 std::to_string(M) + "x" + std::to_string(N);
