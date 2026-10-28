@@ -667,9 +667,11 @@ static LogicalResult setRootConfigForGemvPipeline(
       hasUKernelTemplate(deviceModel.device, "matvec",
                          {lhsElemType, rhsElemType, outElemType},
                          /*transposeB=*/true);
+  // The matvec ukernel takes a K tile of 256 or 64: its stack at 128 and 192
+  // (1024 and 1088 bytes) leaves no room for the core's own in the 1024-byte
+  // default stack.
   int64_t kTile =
-      useMatvec ? kMatvecUKernelK * findLargestFactor(K / kMatvecUKernelK,
-                                                      kGemvKTile / kMatvecUKernelK)
+      useMatvec ? (K % kGemvKTile == 0 ? kGemvKTile : kMatvecUKernelK)
                 : findLargestFactor(K, kGemvKTile);
   // Per-core N tile and L0 N block from `chooseGemvNTiling`. The core memory
   // budget leaves the core's stack out, which the buffer allocation adds back
