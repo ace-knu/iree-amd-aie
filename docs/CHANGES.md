@@ -15,7 +15,8 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 - **GEMV**: M==1 transpose_b matmul(FC)은 GEMV pipeline으로 컴파일한다. N축만 32개 core에 나누고, 나뉜 tile은 ukernel로 벡터화한다(bf16). f32도 같은 pipeline으로 돈다(scalar, f32 ukernel 없음).
 - **N-split 삭제**: FC를 Flow에서 N으로 쪼개던 pass는 NPU DMA cliff 우회였으므로 GEMV pipeline이 들어오면서 완전히 지웠다.
 - **pool**: NPU max pooling은 옵션이다(`--iree-amdaie-accelerate-pooling`). 기본은 CPU이고, 스크립트는 `--pool {cpu,accel}`로 고른다.
-- **ukernel 출처**: upstream mlir-aie `aie_kernels/`(aie_api)를 먼저 가져온다. 없을 때만 직접 쓴다.
+- **ukernel 출처**: upstream mlir-aie `aie_kernels/`(aie_api)를 먼저 가져온다. 없을 때만 직접 쓴다. 통합 중에 peano ukernel 넷(matmul, matvec, zero_fill, trunci)을 이 원칙에 맞췄다.
+- **ukernel unroll**: upstream 소스의 unroll 지시를 그대로 따른다. core stack(기본 1024 B)이나 program memory(16 KB)를 넘을 때만 소스에서 끄고 이유를 주석에 남긴다. core 코드의 `-unroll-full-max-count=0`(`XCLBinGen.cpp`)은 소스의 unroll pragma를 막지 못하므로 ukernel에는 쓰지 않는다. 우리 커널도 pragma는 `aie_kernel_utils.h`의 `AIE_LOOP_*` macro로 쓴다.
 
 ### dev 기준으로 본 변경
 
@@ -33,19 +34,25 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 | 영역 | 내용 | 커밋 |
 |---|---|---|
-| GEMV pipeline (dev-POOL) | `tile_pipeline="gemv"`: copy-based, N을 32 core 1-D forall로, K tile 256(matvec이면 64의 배수) | `7060d5f3` |
+| GEMV pipeline (dev-POOL) | `tile_pipeline="gemv"`: copy-based, N을 32 core 1-D forall로, K tile 256(matvec이면 256 또는 64) | `7060d5f3`, `7854b375` |
 | pool pipeline (dev-POOL) | 2-D max pooling을 spatial x channel core grid로. `--iree-amdaie-pool-core-split`, `--iree-amdaie-pool-columns-policy`(기본 `max`), OH/C pad, halo pre-split | `7060d5f3` |
 | channels-last (dev-POOL) | `--iree-amdaie-pooling-channels-last`: NCHW pooling을 transpose로 감싼 NHWC pooling으로 바꿔 NHWC conv 사이 transpose가 상쇄되게 함(기본 꺼짐) | `7060d5f3` |
 | matvec ukernel | upstream `mv_bf16.cc`를 옮긴 `uKernels/npu4/peano/matvec.cc`(f32 누적, K는 instance 값, `(ptr, offset)` 인자). bf16 GEMV tile을 이 ukernel로 lower | `69a5e8b7` |
-| aie_api 내장 | submodule `third_party/aie_api`(Xilinx/aie_api, MIT), 헤더를 바이너리에 embed하고 ukernel이 `<aie_api/aie.hpp>`를 쓸 때만 꺼내 `-I`로 넘김. `aie_arch.h`, `aie_kernel_utils.h`는 mlir-aie에서 복사 | `286008ec`, `d3486957` |
+| aie_api 내장 | submodule `third_party/aie_api`(Xilinx/aie_api, MIT), 헤더를 바이너리에 embed하고 ukernel이 `<aie_api/aie.hpp>`나 `aie_kernels/` 헤더를 쓸 때만 꺼내 `-I`로 넘김. `aie_arch.h`, `aie_kernel_utils.h`, `common/zero.h`는 mlir-aie에서 복사 | `286008ec`, `d3486957`, `ab97d20a`, `75ebbebf` |
+| zero_fill ukernel | upstream `common/zero.h`. native vector 배수면 compile-time 커널, 아니면 runtime 길이 커널(정렬을 스스로 맞춤)이라 fill 크기 제한이 없음 | `ab97d20a`, `f0ef9de3` |
+| matmul ukernel | upstream `mm_aie2p.h`의 `matmul_vectorized_2x2_mmul`(bf16은 bfp16, i8). tile pointer만 iree L1 pack 순서(A `[k][m]`, C `[n][m]`, B는 transpose_b에 따라 `[n][k]`/`[k][n]`)로 바꿈. upstream은 i8 K < 416에서 K 루프를 다 펼치지만 stack 1472 B로 core stack을 넘어 펼치지 않음 | `a6874c90` |
+| trunci ukernel | upstream에 없어 우리 커널 유지. unroll pragma만 `AIE_LOOP_UNROLL`로 | `75ebbebf` |
 | 스크립트 | `--pool {cpu,accel}` | `31f1e935` |
+
+ukernel 이전의 A/B(npu4 CI Performance, i8): 커널 시간이 결과를 좌우하는 512x512x512 callrepl_100이 30.75 → 29.18 ms(−5%). 나머지는 같거나 측정 편차 범위(같은 빌드도 512x4096x512 pack-peel이 750 / 820 us로 갈림). bf16 matmul stack은 576 → 64 B. MLP·VGG bf16/f32 출력은 이전과 바이트 단위로 같다.
 
 #### 3. 통합 중에 생긴 문제와 처리
 
 | 문제 | 원인 | 처리 | 커밋 |
 |---|---|---|---|
 | f32 GEMV hang(ert state 6), dev-POOL은 weight를 1.0으로 pad해 피함 | memtile weight buffer 하나(S2MM 1개)를 core별 MM2S 4개가 lock pair 하나로 나눠 읽음. core 속도가 다르면 lock count가 꼬임. dev의 producer별 lock pair 수정은 이 반대 방향(consumer 여럿)을 다루지 않았음 | consumer별 lock pair. pad 값을 0으로 되돌림 | `6ef3dc1f`, `0c5bc58f` |
-| ukernel all + GEMV에서 컴파일러 crash | matmul ukernel matcher가 2-D GEMV op에 rank 4/6 전제의 `getTilingInfo`를 호출. `zero_fill` template이 1x32에서 `static_assert` 실패 | rank 확인 후 호출, fill matcher가 `M*N % 16 != 0`을 거름, `zero_fill.cc` unroll 하한 | `247f29d2` |
+| ukernel all + GEMV에서 컴파일러 crash | matmul ukernel matcher가 2-D GEMV op에 rank 4/6 전제의 `getTilingInfo`를 호출. `zero_fill` template이 1x32에서 `static_assert` 실패 | rank 확인 후 호출. fill은 처음에 `M*N % 16 != 0`을 걸렀다가 upstream `zero.h`로 옮긴 뒤 조건을 없앰 | `247f29d2`, `f0ef9de3` |
+| K = 128, 192 GEMV 컴파일 실패(stack 초과) | 우리 `matvec.cc`(f32에 더함)의 stack이 upstream(bf16 덮어씀)의 약 2배. K tile 128/192에서 1024/1088 B | matvec K tile을 256 또는 64로만 고름 | `7854b375` |
 | aie_api 헤더 추출 실패 | 하위 폴더를 만들지 않고 파일을 씀 | 폴더 생성 | `d3486957` |
 | f32 GEMV N 4096 → 4160 pad(host pad 34 ms/run) | GEMV pad가 L1 한도로 per-core N을 다시 고름 | pad 규칙을 GEMM과 통일(N은 core 수 x 8의 배수, K는 matvec이면 64) | `14c757a2` |
 
@@ -57,7 +64,7 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 | `--iree-amdaie-enable-gemv-pipeline` | 임시 스위치. 필요하면 최신 구조에 맞춰 새로 만든다 | `7d49efaa` |
 | GEMV weight 1.0 pad, `chooseGemvNPad`, `core_stack_size` config | lock 수정과 pad 규칙 통일로 불필요 | `0c5bc58f`, `14c757a2` |
 
-### 검증 (`31f1e935`)
+### 검증 (`31f1e935`, ukernel 이전은 위 A/B와 각 커밋)
 
 - ctest amd-aie 230/230, npu4 CI(`run.py --skip_tests=Performance`) 32/32(lock 수정 시점), 회귀 27/27(수동·자동).
 - CPU+NPU (ukernel all):
@@ -84,7 +91,7 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 ### 남은 일
 
-- 기존 peano ukernel(`matmul.cc`, `zero_fill.cc`, `trunci.cc`)을 upstream aie_api 커널로 옮기기(A/B 측정 후).
+- matvec stack 줄이기(f32 C 누적의 spill). 줄이면 K tile 128/192를 다시 허용. 4-lane f32 load/store로 바꾸는 시도는 Peano backend가 처리하지 못함(`unable to legalize ... <2 x s64>`).
 - NPU pool ukernel(upstream에 없음, aie_api로 작성). hwctx 재사용 뒤에 측정.
 - 장치별 op 선택(pool을 amd-aie에만 등), hwctx 재사용, lock pair 코드 정리.
 
@@ -568,4 +575,4 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 | 2026-10-20 | 세션 1 챕터 01 | 첫 판(9/28 기준선 대비 우리 56덩어리, 전임자 108덩어리, 새 파일 9묶음, 디버그 11묶음, 우회 목록) |
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |
 | 2026-10-25 | dev 통합 S9 | "dev 통합 후 상태" 절 추가, 명세 경로를 `docs/specs/`로, 4·5·6절 상태 칸과 N04·N07·N09에 통합 결과를 덧붙임 |
-| 2026-10-28 | dev-POOL 통합 P9 | "dev-POOL 통합 후 상태" 절 추가 |
+| 2026-10-28 | dev-POOL 통합 P9 | "dev-POOL 통합 후 상태" 절 추가, ukernel upstream 이전과 unroll 규칙 반영 |
