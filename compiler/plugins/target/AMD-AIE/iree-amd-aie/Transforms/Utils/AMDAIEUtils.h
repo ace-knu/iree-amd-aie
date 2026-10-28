@@ -78,10 +78,12 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
 /// 2 <= M < 32 would also profit, but the GEMV lowering's L2 split
 /// (`AMDAIESplitLogicalObjFifos`) still splits along the first non-unit dim and
 /// for M >= 2 that is M, not N: every core then writes C into one memtile and
-/// channel assignment fails. Those shapes stay on pack-peel until that is
+/// channel assignment fails. For the same reason the weight must be [N, K]
+/// (`transposeB`, K contiguous): a [K, N] weight block is cut along K, so every
+/// core reads from one memtile. Those shapes stay on pack-peel until that is
 /// fixed. Shared by `KernelDispatch` and the Flow-phase pad pass so they agree
 /// on which dispatches are GEMV.
-bool isGemvMExtent(int64_t m);
+bool isGemvShape(int64_t m, bool transposeB);
 
 /// Whether the Flow pad pass may pad a GEMV's N up to a multiple of
 /// `numRows * numCols * kGemvNPerCoreMultiple` so the GEMV pipeline reaches

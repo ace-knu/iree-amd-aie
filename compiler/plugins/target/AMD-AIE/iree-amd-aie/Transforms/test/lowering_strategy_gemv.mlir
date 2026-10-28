@@ -4,7 +4,7 @@
 // untiled, N is spread over all 32 cores (L0 block = 32 cores x 32), K is
 // streamed in tiles of 256, there is no packing_config, and translation_info
 // carries the per-dispatch pipeline override. Every other M stays on pack-peel
-// (see isGemvMExtent for why 2..31 is not taken yet).
+// (see isGemvShape for why 2..31 is not taken yet).
 
 // VGG-16 fc1 as ONNX Gemm lowers it: M=1, transpose_b weight [N, K].
 // CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [

@@ -656,7 +656,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 
 // -----
 
-// M=2 is not routed to the GEMV pipeline (only M == 1 is, see isGemvMExtent),
+// M=2 is not routed to the GEMV pipeline (only M == 1 is, see isGemvShape),
 // so it is padded to the pack-peel multiples like any other matmul: M 2 -> 32
 // with a crop back to [2, 1000], and N 1000 -> 1024.
 
@@ -693,6 +693,47 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
   util.func public @main_m2(%arg0: tensor<2x4096xbf16>, %arg1: tensor<1000x4096xbf16>) -> tensor<2x1000xf32> {
     %0 = flow.dispatch @dispatch_m2::@matmul_m2(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<2x4096xbf16>, tensor<1000x4096xbf16>) -> tensor<2x1000xf32>
     util.return %0 : tensor<2x1000xf32>
+  }
+}
+
+// -----
+
+// M=1 with a [K, N] weight (not transpose_b) is not routed to the GEMV pipeline
+// either (see isGemvShape), so M is padded 1 -> 32 like M=2 rather than left
+// at 1 for GEMV. N 1000 -> 1024.
+
+// CHECK-LABEL: func.func @matmul_m1_kn
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x256xbf16>>
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<256x1024xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1024xf32>>
+// CHECK:       flow.executable private @pad_executable_0
+// CHECK:         tensor.pad %{{.+}} low[0, 0] high[31, 0]
+// CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 1000] [1, 1]
+// CHECK-LABEL: util.func public @main_m1_kn
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_m1_kn {
+    flow.executable.export public @matmul_m1_kn workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_m1_kn(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x256xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<256x1000xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1000xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [1, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x256xbf16>> -> tensor<1x256xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [256, 1000], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<256x1000xbf16>> -> tensor<256x1000xbf16>
+        %2 = tensor.empty() : tensor<1x1000xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<1x1000xf32>) -> tensor<1x1000xf32>
+        %4 = linalg.matmul ins(%0, %1 : tensor<1x256xbf16>, tensor<256x1000xbf16>) outs(%3 : tensor<1x1000xf32>) -> tensor<1x1000xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [1, 1000], strides = [1, 1] : tensor<1x1000xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1000xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_m1_kn(%arg0: tensor<1x256xbf16>, %arg1: tensor<256x1000xbf16>) -> tensor<1x1000xf32> {
+    %0 = flow.dispatch @dispatch_m1_kn::@matmul_m1_kn(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<1x256xbf16>, tensor<256x1000xbf16>) -> tensor<1x1000xf32>
+    util.return %0 : tensor<1x1000xf32>
   }
 }
 

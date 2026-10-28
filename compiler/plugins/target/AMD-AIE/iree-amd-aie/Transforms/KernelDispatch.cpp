@@ -581,7 +581,8 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
 /// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim,
-/// no fused elementwise consumer) with M == 1 (see `isGemvMExtent`).
+/// no fused elementwise consumer) with M == 1 and an [N, K] weight (see
+/// `isGemvShape`).
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
@@ -610,18 +611,13 @@ static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (ShapedType::isDynamic(M) || ShapedType::isDynamic(maybeDims->nSizes[0]) ||
       ShapedType::isDynamic(maybeDims->kSizes[0]))
     return false;
-  // The weight must be [N, K] (transpose_b, K contiguous): the GEMV L2 split
-  // (`AMDAIESplitLogicalObjFifos`) cuts the weight block along its first
-  // non-unit dim, which for a plain [K, N] weight is K, so every core then
-  // reads from one memtile and channel assignment fails ("no producer DMA
-  // channel available") once more than a few cores are used.
   AffineMap rhsMap = linalgOp.getIndexingMapsArray()[1];
   std::optional<unsigned> nPos = rhsMap.getResultPosition(
       getAffineDimExpr(maybeDims->nDims[0], linalgOp.getContext()));
   std::optional<unsigned> kPos = rhsMap.getResultPosition(
       getAffineDimExpr(maybeDims->kDims[0], linalgOp.getContext()));
-  if (!nPos || !kPos || *nPos > *kPos) return false;
-  return isGemvMExtent(M);
+  if (!nPos || !kPos) return false;
+  return isGemvShape(M, /*transposeB=*/*nPos < *kPos);
 }
 
 /// GEMV pipeline root config. M is left untiled (below one row-group of vector
@@ -719,13 +715,12 @@ static LogicalResult setRootConfigForGemvPipeline(
 /// global pipeline.
 static bool takesGemvPipeline(linalg::LinalgOp linalgOp,
                               TilePassPipeline passPipeline) {
-  // TODO(gemv): the Flow pad pass (AMDAIEPadContractionDispatches.cpp) decides
-  // "this dispatch is GEMV" from `isGemvMExtent` alone; it cannot see the
-  // global tile pipeline. Any condition added here (or a new global pipeline
-  // that handles matmuls) must be mirrored there, or M == 1 arrives unpadded
-  // at a pipeline that expects M % instr_m == 0. Consider carrying the
-  // decision in one shared predicate used by both sides, or folding the global
-  // pipeline into the target attr, so the two cannot drift.
+  // TODO(gemv): the Flow pad pass (AMDAIEPadContractionDispatches.cpp) shares
+  // the shape condition (`isGemvShape`) but cannot see the global tile
+  // pipeline. A new global pipeline that handles matmuls must be mirrored
+  // there, or M == 1 arrives unpadded at a pipeline that expects
+  // M % instr_m == 0. Folding the global pipeline into the target attr would
+  // let the two sides share this condition too.
   if (passPipeline != TilePassPipeline::PackPeelPipeline &&
       passPipeline != TilePassPipeline::PackPeel4LevelTilingPipeline)
     return false;

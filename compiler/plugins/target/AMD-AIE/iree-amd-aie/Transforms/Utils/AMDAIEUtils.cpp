@@ -132,7 +132,7 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
   });
 }
 
-bool isGemvMExtent(int64_t m) { return m == 1; }
+bool isGemvShape(int64_t m, bool transposeB) { return m == 1 && transposeB; }
 
 int64_t choosePoolColumns(int64_t oh, int64_t numCols) {
   if (oh <= 0 || numCols <= 0) return 1;
