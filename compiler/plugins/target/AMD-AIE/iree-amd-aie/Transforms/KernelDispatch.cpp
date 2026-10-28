@@ -684,8 +684,9 @@ static LogicalResult setRootConfigForGemvPipeline(
       chooseGemvNTiling(M, N, kTile, nBytesLhs, nBytesRhs, nBytesOut, numRows,
                         numCols, l1Limit, n1Max);
   if (failed(tiling)) {
-    return linalgOp.emitOpError("GEMV tiles (M=")
-           << M << ", n1=1, k=" << kTile << ") do not fit in core memory ("
+    return linalgOp.emitOpError("no GEMV tiling of N=")
+           << N << " with a per-core N tile of at least 2 that divides N and "
+           << "fits in core memory (M=" << M << ", k=" << kTile << ", "
            << l1Limit << " bytes).";
   }
   int64_t n1Tile = tiling->n1;

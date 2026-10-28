@@ -282,3 +282,36 @@ module {
     return
   }
 }
+
+// -----
+
+// N=32 (unpadded, e.g. an NPU-only build) is not spread over 32 cores of one
+// output each, which gives wrong results: n1 is at least 2, so 16 cores x 2.
+// CHECK:       #config = #iree_codegen.lowering_config<tile_sizes = [
+// CHECK-SAME:      [0, 32, 0], [0, 0, 256], [0, 2, 0]
+// CHECK-SAME:  ]>
+// CHECK:       func.func @gemv_n32
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @gemv_n32() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x256xbf16>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x256xbf16>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x32xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0], sizes = [1, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x256xbf16>> -> tensor<1x256xbf16>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0], sizes = [32, 256], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<32x256xbf16>> -> tensor<32x256xbf16>
+    %5 = tensor.empty() : tensor<1x32xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<1x32xf32>) -> tensor<1x32xf32>
+    %7 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d1, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d0, d1)>]
+         ins(%3, %4 : tensor<1x256xbf16>, tensor<32x256xbf16>) outs(%6 : tensor<1x32xf32>) -> tensor<1x32xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0], sizes = [1, 32], strides = [1, 1] : tensor<1x32xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x32xf32>>
+    return
+  }
+}

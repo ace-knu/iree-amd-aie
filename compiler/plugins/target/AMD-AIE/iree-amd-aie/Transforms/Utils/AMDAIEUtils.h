@@ -102,7 +102,8 @@ bool getConfigGemvPadN(IREE::HAL::ExecutableTargetAttr targetAttr);
 /// not grown, e.g. in NPU-only builds) ties go to the largest tile (fewest
 /// blocks). A block must fill whole columns or stay in one
 /// (`cores <= numRows || cores % numRows == 0`): the L2 weight split hands
-/// every memtile one column.
+/// every memtile one column. n1 is at least 2 (one output per core gives wrong
+/// results), so a prime N fails here unless the pad pass has grown it.
 struct GemvNTiling {
   int64_t n1;
   int64_t cores;

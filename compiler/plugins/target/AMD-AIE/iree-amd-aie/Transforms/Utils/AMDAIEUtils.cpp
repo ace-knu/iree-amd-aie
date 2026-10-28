@@ -268,7 +268,9 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
     }
     return n1 > best.n1;
   };
-  for (int64_t n1 = 1; n1 <= N; ++n1) {
+  // n1 = 1 is never taken: a GEMV with one output per core produces wrong
+  // results (all zeros on npu4), cause not yet known.
+  for (int64_t n1 = 2; n1 <= N; ++n1) {
     if (gemvL1Bytes(M, n1, kTile, bytesLhs, bytesRhs, bytesOut) > l1Limit)
       break;
     if (N % n1 != 0) continue;
