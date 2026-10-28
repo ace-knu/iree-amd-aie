@@ -31,7 +31,7 @@ void findLargestL1TileSizes(uint32_t m, uint32_t n, uint32_t k,
     uint32_t Acc = params.numBytesAcc * m * n * params.bufferDepthAcc;
     int64_t memoryUsage = A + B + C + Acc;
 
-    if (memoryUsage < params.memoryLimit && memoryUsage > curMax) {
+    if (memoryUsage <= params.memoryLimit && memoryUsage > curMax) {
       curMax = memoryUsage;
       best = {m, n, k};
     }

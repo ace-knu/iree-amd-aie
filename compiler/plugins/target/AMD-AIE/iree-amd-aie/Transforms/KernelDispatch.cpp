@@ -175,6 +175,7 @@ class ParameterSetting {
                                             bool isObjectFifo,
                                             AMDAIEDeviceModel deviceModel,
                                             uint32_t numRows, uint32_t numCols,
+                                            uint32_t stackSize,
                                             std::string enableAMDAIEUkernels,
                                             uint32_t kPackScaleL1 = 1);
 
@@ -199,8 +200,8 @@ class ParameterSetting {
 
 FailureOr<ParameterSetting> ParameterSetting::create(
     linalg::LinalgOp linalgOp, bool isObjectFifo, AMDAIEDeviceModel deviceModel,
-    uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels,
-    uint32_t kPackScaleL1) {
+    uint32_t numRows, uint32_t numCols, uint32_t stackSize,
+    std::string enableAMDAIEUkernels, uint32_t kPackScaleL1) {
   auto initType =
       llvm::cast<ShapedType>(linalgOp.getDpsInitOperand(0)->get().getType());
   uint32_t nBytesInit = initType.getElementTypeBitWidth() / 8;
@@ -287,9 +288,10 @@ FailureOr<ParameterSetting> ParameterSetting::create(
     bufferDepthAcc = 0;
   }
 
-  // Get the largest tile sizes that can fit in L1 memory.
+  // Get the largest tile sizes that can fit in L1 memory, which the core's
+  // stack shares with them.
   TileParams tileParams{
-      /*memoryLimit=*/deviceModel.getCoreTileLocalMemorySize(),
+      /*memoryLimit=*/deviceModel.getCoreTileLocalMemorySize() - stackSize,
       /*numBytesA=*/nBytesLhs,
       /*numBytesB=*/nBytesRhs,
       /*numBytesC=*/nBytesOut,
@@ -419,14 +421,15 @@ static SmallVector<int64_t> setOuterPermB(bool isMatmulTransposeB,
 static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     LowerToAIEPassPipeline useLowerToAIEPipeline, AMDAIEDevice targetDevice,
-    uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels) {
+    uint32_t numRows, uint32_t numCols, uint32_t stackSize,
+    std::string enableAMDAIEUkernels) {
   // Scale the L1 K with a factor of 2 compared with the outer dimensions M and
   // N to increase the L1 memory usage.
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
   auto maybePackPeelTiling = ParameterSetting::create(
-      linalgOp, isObjectFifo, deviceModel, numRows, numCols,
+      linalgOp, isObjectFifo, deviceModel, numRows, numCols, stackSize,
       enableAMDAIEUkernels, /*kPackScaleL1=*/2);
   if (failed(maybePackPeelTiling)) return failure();
   auto packPeelTiling = maybePackPeelTiling.value();
@@ -730,13 +733,14 @@ static bool takesGemvPipeline(linalg::LinalgOp linalgOp,
 static LogicalResult setRootConfigForPackPeelPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     LowerToAIEPassPipeline useLowerToAIEPipeline, AMDAIEDevice targetDevice,
-    uint32_t numRows, uint32_t numCols, std::string enableAMDAIEUkernels) {
+    uint32_t numRows, uint32_t numCols, uint32_t stackSize,
+    std::string enableAMDAIEUkernels) {
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   bool isObjectFifo =
       useLowerToAIEPipeline == LowerToAIEPassPipeline::ObjectFifo;
   auto maybePackPeelTiling =
       ParameterSetting::create(linalgOp, isObjectFifo, deviceModel, numRows,
-                               numCols, enableAMDAIEUkernels);
+                               numCols, stackSize, enableAMDAIEUkernels);
   if (failed(maybePackPeelTiling)) return failure();
   auto packPeelTiling = maybePackPeelTiling.value();
 
@@ -1122,8 +1126,8 @@ static LogicalResult setRootConfigForElementwiseCopyPipeline(
 static LogicalResult setRootConfigForPoolPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
-    uint32_t numRows, uint32_t numCols, PoolCoreSplit poolCoreSplit,
-    PoolColumnsPolicy poolColumnsPolicy);
+    uint32_t numRows, uint32_t numCols, uint32_t stackSize,
+    PoolCoreSplit poolCoreSplit, PoolColumnsPolicy poolColumnsPolicy);
 
 static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                    linalg::GenericOp genericOp,
@@ -1144,7 +1148,7 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
       succeeded(pool)) {
     return setRootConfigForPoolPipeline(entryPointFn, genericOp, *pool,
                                         getDeviceModel(targetDevice), numRows,
-                                        numCols, poolCoreSplit,
+                                        numCols, stackSize, poolCoreSplit,
                                         poolColumnsPolicy);
   }
 
@@ -1160,12 +1164,12 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
     if (passPipeline == TilePassPipeline::PackPeelPipeline) {
       return setRootConfigForPackPeelPipeline(
           entryPointFn, genericOp, useLowerToAIEPipeline, targetDevice, numRows,
-          numCols, enableAMDAIEUkernels);
+          numCols, stackSize, enableAMDAIEUkernels);
     }
     if (passPipeline == TilePassPipeline::PackPeel4LevelTilingPipeline) {
       return setRootConfigForPackPeel4LevelTilingPipeline(
           entryPointFn, genericOp, useLowerToAIEPipeline, targetDevice, numRows,
-          numCols, enableAMDAIEUkernels);
+          numCols, stackSize, enableAMDAIEUkernels);
     }
   } else if (isConvOp(genericOp)) {
     // Current tiling strategy is based on llvm-cpu ConvTileAndDecomposeExpert.
@@ -1467,8 +1471,8 @@ FailureOr<PoolTiling> spatialChannelPoolTiling(const PoolGeometry &g,
 static LogicalResult setRootConfigForPoolPipeline(
     mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
     const MaxPoolingDims &pool, AMDAIEDeviceModel deviceModel,
-    uint32_t numRows, uint32_t numCols, PoolCoreSplit poolCoreSplit,
-    PoolColumnsPolicy poolColumnsPolicy) {
+    uint32_t numRows, uint32_t numCols, uint32_t stackSize,
+    PoolCoreSplit poolCoreSplit, PoolColumnsPolicy poolColumnsPolicy) {
   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
   if (llvm::any_of(bounds, ShapedType::isDynamic))
     return linalgOp.emitOpError("pool pipeline expects static shapes");
@@ -1491,7 +1495,8 @@ static LogicalResult setRootConfigForPoolPipeline(
       getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get().getType())
           .getIntOrFloatBitWidth() /
       8;
-  g.l1Limit = deviceModel.getCoreTileLocalMemorySize();
+  // The core's stack shares L1 with the tiles, as in the GEMV pipeline.
+  g.l1Limit = deviceModel.getCoreTileLocalMemorySize() - stackSize;
   g.l2Limit = deviceModel.getMemTileSizeInBytes();
 
   FailureOr<PoolTiling> tiling = failure();
@@ -1560,12 +1565,12 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
   if (passPipeline == TilePassPipeline::PackPeelPipeline) {
     return setRootConfigForPackPeelPipeline(
         entryPointFn, linalgOp, useLowerToAIEPipeline, targetDevice, numRows,
-        numCols, enableAMDAIEUkernels);
+        numCols, stackSize, enableAMDAIEUkernels);
   }
   if (passPipeline == TilePassPipeline::PackPeel4LevelTilingPipeline) {
     return setRootConfigForPackPeel4LevelTilingPipeline(
         entryPointFn, linalgOp, useLowerToAIEPipeline, targetDevice, numRows,
-        numCols, enableAMDAIEUkernels);
+        numCols, stackSize, enableAMDAIEUkernels);
   }
   return linalgOp.emitError("Unhandled pass pipeline in setRootConfig.");
 }

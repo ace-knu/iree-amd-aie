@@ -302,3 +302,36 @@ module {
     return
   }
 }
+
+// -----
+
+// The L1 budget leaves out the core's 1024-byte stack. Under `max` the
+// largest-footprint tile [9, 10, 18] f32 = 2 x (18x20x18 + 9x10x18) x 4 B =
+// 64800 B fits 64 KB but not 64 KB - 1024, so OW is halved: [9, 5, 18].
+// MAX:          #config = #iree_codegen.lowering_config<tile_sizes = [
+// MAX-SAME:         [72, 5, 0, 0, 0], [9, 0, 18, 0, 0]
+// MAX-SAME:     ]>
+// MAX:          func.func @pool_l1_stack
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>
+]>
+module {
+  func.func @pool_l1_stack() {
+    %cst = arith.constant 0xFF800000 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<144x20x72xf32>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<72x10x72xf32>>
+    %2 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0, 0], sizes = [144, 20, 72], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<144x20x72xf32>> -> tensor<144x20x72xf32>
+    %3 = tensor.empty() : tensor<72x10x72xf32>
+    %4 = tensor.empty() : tensor<2x2xf32>
+    %5 = linalg.fill ins(%cst : f32) outs(%3 : tensor<72x10x72xf32>) -> tensor<72x10x72xf32>
+    %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1, d2, d3, d4) -> (d0 * 2 + d3, d1 * 2 + d4, d2)>, affine_map<(d0, d1, d2, d3, d4) -> (d3, d4)>, affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2)>], iterator_types = ["parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%2, %4 : tensor<144x20x72xf32>, tensor<2x2xf32>) outs(%5 : tensor<72x10x72xf32>) {
+    ^bb0(%in: f32, %in_0: f32, %out: f32):
+      %7 = arith.maximumf %out, %in : f32
+      linalg.yield %7 : f32
+    } -> tensor<72x10x72xf32>
+    iree_tensor_ext.dispatch.tensor.store %6, %1, offsets = [0, 0, 0], sizes = [72, 10, 72], strides = [1, 1, 1] : tensor<72x10x72xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<72x10x72xf32>>
+    return
+  }
+}
