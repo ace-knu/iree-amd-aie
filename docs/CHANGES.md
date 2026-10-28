@@ -34,7 +34,7 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 | 영역 | 내용 | 커밋 |
 |---|---|---|
-| GEMV pipeline (dev-POOL) | `tile_pipeline="gemv"`: copy-based, N을 32 core 1-D forall로, K tile 256(matvec이면 256 또는 64) | `7060d5f3`, `7854b375` |
+| GEMV pipeline (dev-POOL) | `tile_pipeline="gemv"`: copy-based, N을 최대 32 core 1-D forall로(core당 출력 2개 이상), K tile은 K의 256 이하 최대 약수(matvec이면 256 또는 64) | `7060d5f3`, `7854b375`, `33b86238` |
 | pool pipeline (dev-POOL) | 2-D max pooling을 spatial x channel core grid로. `--iree-amdaie-pool-core-split`, `--iree-amdaie-pool-columns-policy`(기본 `max`), OH/C pad, halo pre-split | `7060d5f3` |
 | channels-last (dev-POOL) | `--iree-amdaie-pooling-channels-last`: NCHW pooling을 transpose로 감싼 NHWC pooling으로 바꿔 NHWC conv 사이 transpose가 상쇄되게 함(기본 꺼짐) | `7060d5f3` |
 | matvec ukernel | upstream `mv_bf16.cc`를 옮긴 `uKernels/npu4/peano/matvec.cc`(f32 누적, K는 instance 값, `(ptr, offset)` 인자). bf16 GEMV tile을 이 ukernel로 lower | `69a5e8b7` |
@@ -55,6 +55,10 @@ ukernel 이전의 A/B(npu4 CI Performance, i8): 커널 시간이 결과를 좌�
 | K = 128, 192 GEMV 컴파일 실패(stack 초과) | 우리 `matvec.cc`(f32에 더함)의 stack이 upstream(bf16 덮어씀)의 약 2배. K tile 128/192에서 1024/1088 B | matvec K tile을 256 또는 64로만 고름 | `7854b375` |
 | aie_api 헤더 추출 실패 | 하위 폴더를 만들지 않고 파일을 씀 | 폴더 생성 | `d3486957` |
 | f32 GEMV N 4096 → 4160 pad(host pad 34 ms/run) | GEMV pad가 L1 한도로 per-core N을 다시 고름 | pad 규칙을 GEMM과 통일(N은 core 수 x 8의 배수, K는 matvec이면 64) | `14c757a2` |
+| M == 1, weight `[K, N]` matmul 컴파일 실패(dev에서는 됨) | pad pass는 M == 1이면 GEMV로 보고 M을 pad하지 않았지만, GEMV pipeline은 `[N, K]` weight만 받음 | 두 곳이 같은 판정 `isGemvShape(m, transposeB)`을 씀. `[K, N]`은 dev처럼 M을 32로 pad해 pack-peel | `0b80251e` |
+| L1 tile + core stack이 64 KB를 넘을 수 있음 | pool과 pack-peel tile 선택이 core stack(1024 B)을 빼지 않음(GEMV는 뺌) | 셋 다 stack을 뺀 예산을 씀. L1 탐색은 예산과 같은 크기도 받음(`<=`, L2와 같게). MLP·VGG tile은 그대로 | `93c03407` |
+| core당 출력 1개인 GEMV가 틀린 값을 냄 | 원인 미상(남은 일). host 있는 빌드는 N을 core x 8 배수로 pad해 만나지 않음 | GEMV tiling이 core당 출력 2개 이상만 고름. 소수 N(host 없는 빌드)은 컴파일 오류 | `33b86238` |
+| npu1에서 matvec용 K 규칙을 씀 | pad pass와 KernelDispatch의 matvec 판정에 AIE2P 확인이 없었음(matcher에는 있음) | 세 곳 모두 AIE2P 확인. rank 2/4/6이 아닌 zero fill은 ukernel로 내리지 않음(이전에는 assert) | `916141ca` |
 
 #### 4. 지운 것
 
@@ -87,13 +91,23 @@ ukernel 이전의 A/B(npu4 CI Performance, i8): 커널 시간이 결과를 좌�
 | pool의 장치 선택 | `--pool accel`은 GPU에도 round-robin으로 보낸다(amd-aie만 고르는 기능 없음) |
 | transpose와 fuse된 pool | 뒤에 NHWC conv가 없는 pool(VGG pool5)은 transpose와 한 dispatch가 되어 CPU에 남는다 |
 | M ≥ 2 큰 FC | N-split이 없어져 batch ≥ 2 classifier 같은 큰 transpose_b FC는 DMA cliff(ert state 6)에 걸릴 수 있다 |
-| host 없는 빌드의 GEMV | NPU만 선언하면 Flow pad pass가 돌지 않아 GEMV N이 pad되지 않는다. N이 소수(예: 1009)면 1 core에 몰려 timeout. e2e 모델은 host가 필요하므로 단일 op 테스트에서만 해당 |
+| host 없는 빌드의 GEMV | NPU만 선언하면 Flow pad pass가 돌지 않아 GEMV N이 pad되지 않는다. N이 소수(예: 1009)면 컴파일 오류. e2e 모델은 host가 필요하므로 단일 op 테스트에서만 해당 |
+| weight `[K, N]`인 M == 1 matmul | GEMV pipeline을 못 타고 M을 32로 pad해 pack-peel로 돈다(32행 중 31행은 0 계산 + host pad/crop). GEMV L2 split이 `[K, N]` weight를 K로 잘라 모든 core가 memtile 하나를 읽기 때문. MLP·VGG에는 없음 |
+| NPU 없는 `--pool accel` | channels-last 전처리는 pool을 독립 dispatch로 만들어 어느 가속기로든 보내게 하므로 NPU가 없어도 필요하다. 다만 그 안의 C pad와 halo split은 npu4 geometry(row 4, column 8)로 한다. C가 4의 배수가 아니거나 window가 겹치는 pool을 GPU로 보낼 때만 불필요한 pad/gather가 생김(VGG는 해당 없음) |
+| 작은 N의 GEMV pad | N은 항상 core 수 x 8 = 256의 배수로 pad된다(N = 10 → 256). 필요한 core만큼만 pad하는 규칙은 측정상 이득이 없었고(NPU 시간 3~4 ms가 고정 비용) core당 출력 1개 문제를 드러내 넣지 않음 |
 
 ### 남은 일
 
 - matvec stack 줄이기(f32 C 누적의 spill). 줄이면 K tile 128/192를 다시 허용. 4-lane f32 load/store로 바꾸는 시도는 Peano backend가 처리하지 못함(`unable to legalize ... <2 x s64>`).
 - NPU pool ukernel(upstream에 없음, aie_api로 작성). hwctx 재사용 뒤에 측정.
 - 장치별 op 선택(pool을 amd-aie에만 등), hwctx 재사용, lock pair 코드 정리.
+- core당 출력 1개 GEMV가 틀리는 원인(core의 weight tile이 activation tile과 같은 `memref<1x256xbf16>`이 되고 C가 [1, 1]인 경우. 의심만 함).
+- weight `[K, N]` M == 1 matmul을 GEMV로: 상수 weight를 컴파일 때 `[N, K]`로 전치하거나, GEMV L2 split이 N 위치를 따라 자르게 일반화.
+- 구조 정리(동작 변화가 커서 이번 통합에서는 기록만):
+  - GEMV/pool pipeline 선택이 dev의 `TilePassPipeline` enum이 아니라 문자열 override(`amdaie.tile_pipeline`)로 되어 있다.
+  - pool column policy가 세 경로(target config, lowering strategy 옵션, preprocessing 옵션)로 전달된다. 같은 값이어야 한다.
+  - 실험용 옵션이 일반 옵션으로 노출돼 있다: `--iree-amdaie-pool-core-split`, `--iree-amdaie-pool-columns-policy`(odd/cost/full/max), `--iree-amdaie-gemv-pad-n`, `--iree-amdaie-gemv-n1`, VGG pool로 맞춘 cost model 상수(`PoolColumnCost`). 남길 것을 정한 뒤 정리.
+  - `AMDAIEPadPoolingDispatches`가 `AMDAIEPadContractionDispatches.cpp` 안에 있다. 공용 helper(target 조회, pad/crop executable 생성)를 헤더로 빼야 나눌 수 있다.
 
 ## dev 통합 후 상태 (2026-10-25, 브랜치 `3devices-integration`)
 
