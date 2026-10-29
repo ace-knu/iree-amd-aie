@@ -116,6 +116,10 @@ std::unique_ptr<Pass> createAMDAIEConvertPoolingToChannelsLastPass(
 /// boundary per the target's pool column policy.
 std::unique_ptr<Pass> createAMDAIEPadPoolingDispatchesPass();
 
+/// Create a pass to fold the constant bias of NPU contraction dispatches into
+/// K at the Flow dispatch boundary, so they keep two inputs.
+std::unique_ptr<Pass> createAMDAIEFoldBiasIntoContractionDispatchesPass();
+
 /// Create a pass to assign types to `amdaie.connection` ops.
 std::unique_ptr<Pass> createAMDAIEAssignConnectionTypesPass(
     AMDAIEAssignConnectionTypesOptions options = {});

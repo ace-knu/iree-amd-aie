@@ -116,6 +116,13 @@ def AMDAIEAnnotateInputDevices :
       "mlir::iree_compiler::AMDAIE::createAMDAIEAnnotateInputDevicesPass()";
 }
 
+def AMDAIEFoldBiasIntoContractionDispatches :
+    Pass<"iree-amdaie-fold-bias-into-contraction-dispatches", "ModuleOp"> {
+  let summary = "Fold the constant bias of NPU contraction dispatches into the reduction dim (a ones column on the LHS, a bias row in the weight), so the dispatch keeps two inputs.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBiasIntoContractionDispatchesPass()";
+}
+
 def AMDAIEPadContractionDispatches :
     Pass<"iree-amdaie-pad-contraction-dispatches", "ModuleOp"> {
   let summary = "Pad NPU contraction dispatch operands up to the target pack-peel tile multiples at the Flow dispatch boundary (target-known, via each dispatch's device affinity).";

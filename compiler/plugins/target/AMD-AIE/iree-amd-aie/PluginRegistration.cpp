@@ -109,6 +109,11 @@ struct AMDAIESession
     placementOptions.acceleratePooling = options.acceleratePooling;
     passManager.addPass(
         AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(placementOptions));
+    // Fold a constant bias fused into an NPU contraction dispatch into K, so
+    // the dispatch keeps two inputs (then padded like any other K below).
+    // No-op without such a dispatch.
+    passManager.addPass(
+        AMDAIE::createAMDAIEFoldBiasIntoContractionDispatchesPass());
     // With affinity known per-dispatch, pad NPU contraction operands up to the
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.
