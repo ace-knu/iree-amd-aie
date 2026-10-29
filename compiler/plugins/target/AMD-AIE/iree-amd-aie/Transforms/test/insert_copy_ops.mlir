@@ -154,3 +154,46 @@ func.func @pool_window_not_copied(%in: tensor<4x4x8xf32>, %init: tensor<2x2x8xf3
   } -> tensor<2x2x8xf32>
   return %r : tensor<2x2x8xf32>
 }
+
+// -----
+
+// An elementwise op fed by a contraction is its epilogue (GEMV + ReLU): it
+// reads the contraction result where it is computed, so neither that result
+// nor the epilogue input is copied, its unread init becomes a fresh buffer, and
+// only the epilogue result is copied out.
+// CHECK-LABEL: func.func @matmul_epilogue_forall_over_n
+// CHECK:       scf.forall (%[[IV:.*]]) = (0) to (1024) step (256) shared_outs(%[[OUT:.*]] = %{{.*}})
+// CHECK:         %[[MATMUL:.*]] = linalg.matmul
+// CHECK-NOT:     linalg.copy ins(%[[MATMUL]]
+// CHECK:         %[[EMPTY:.*]] = bufferization.alloc_tensor() : tensor<1x256xbf16>
+// CHECK-NOT:     linalg.copy
+// CHECK:         %[[EXTRACT:.*]] = tensor.extract_slice %[[OUT]][0, %[[IV]]] [1, 256] [1, 1]
+// CHECK:         %[[RELU:.*]] = linalg.generic
+// CHECK-SAME:      ins(%[[MATMUL]] : tensor<1x256xf32>) outs(%[[EMPTY]] : tensor<1x256xbf16>)
+// CHECK:         %[[COPYOUT:.*]] = linalg.copy ins(%[[RELU]] : tensor<1x256xbf16>) outs(%[[EXTRACT]] : tensor<1x256xbf16>)
+// CHECK:         tensor.parallel_insert_slice %[[COPYOUT]] into %[[OUT]][0, %[[IV]]]
+func.func @matmul_epilogue_forall_over_n(%arg0: tensor<1x64xbf16>, %arg1: tensor<1024x64xbf16>) -> tensor<1x1024xbf16> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<1x1024xbf16>
+  %1 = scf.forall (%arg2) = (0) to (1024) step (256) shared_outs(%arg3 = %0) -> (tensor<1x1024xbf16>) {
+    %2 = tensor.extract_slice %arg1[%arg2, 0] [256, 64] [1, 1] : tensor<1024x64xbf16> to tensor<256x64xbf16>
+    %3 = tensor.empty() : tensor<1x256xf32>
+    %4 = linalg.fill ins(%cst : f32) outs(%3 : tensor<1x256xf32>) -> tensor<1x256xf32>
+    %5 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d1, d2)>,
+                                        affine_map<(d0, d1, d2) -> (d0, d1)>]
+         ins(%arg0, %2 : tensor<1x64xbf16>, tensor<256x64xbf16>) outs(%4 : tensor<1x256xf32>) -> tensor<1x256xf32>
+    %6 = tensor.extract_slice %arg3[0, %arg2] [1, 256] [1, 1] : tensor<1x1024xbf16> to tensor<1x256xbf16>
+    %7 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]}
+         ins(%5 : tensor<1x256xf32>) outs(%6 : tensor<1x256xbf16>) {
+    ^bb0(%in: f32, %out: bf16):
+      %8 = arith.maximumf %in, %cst : f32
+      %9 = arith.truncf %8 : f32 to bf16
+      linalg.yield %9 : bf16
+    } -> tensor<1x256xbf16>
+    scf.forall.in_parallel {
+      tensor.parallel_insert_slice %7 into %arg3[0, %arg2] [1, 256] [1, 1] : tensor<1x256xbf16> into tensor<1x1024xbf16>
+    }
+  } {mapping = [#gpu.block<y>]}
+  return %1 : tensor<1x1024xbf16>
+}

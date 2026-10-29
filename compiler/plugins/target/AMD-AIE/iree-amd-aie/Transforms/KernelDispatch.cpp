@@ -583,26 +583,20 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 // DRAM runs instead of 64 B.
 
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
-/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim,
-/// no fused elementwise consumer) with M == 1 and an [N, K] weight (see
-/// `isGemvShape`).
+/// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim)
+/// with M == 1 and an [N, K] weight (see `isGemvShape`), with at most a fused
+/// unary elementwise consumer (ReLU, truncf) as its epilogue.
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
-  // TODO(gemv): support a fused elementwise consumer (bias add / ReLU) as an
-  // epilogue. Today such an M == 1 dispatch is rejected here and then fails in
-  // pack-peel as well ("instruction size ... does not divide M (1)"), and the
-  // Flow pad pass only matches a plain `fill -> matmul -> store` dispatch, so
-  // fusion into contraction roots must stay disabled
-  // (`--iree-dispatch-creation-no-fuse-into-contraction-conv-roots`) and the
-  // FC bias/ReLU runs as a separate host dispatch. The natural place for the
-  // epilogue is the peeled last K step of `addGemvPassPipeline`, applied to the
-  // per-core L1 C tile before its copy back to L2 (`tileElementwise` is off
-  // there for now).
+  // A consumer with a second operand (a bias add) is rejected: the GEMV L1
+  // budget and copy staging have no place for it; a constant bias is to be
+  // folded into K in Flow instead.
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
       if (isElementwise(linalgUser) &&
-          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser))
+          !isa<linalg::FillOp, linalg::CopyOp>(linalgUser) &&
+          linalgUser.getNumDpsInputs() != 1)
         return false;
     }
   }
@@ -650,6 +644,14 @@ static LogicalResult setRootConfigForGemvPipeline(
   int64_t nBytesLhs = bytesOf(linalgOp.getDpsInputOperand(0)->get());
   int64_t nBytesRhs = bytesOf(linalgOp.getDpsInputOperand(1)->get());
   int64_t nBytesOut = bytesOf(linalgOp.getDpsInitOperand(0)->get());
+  // A fused epilogue writes its own L1 tile next to C (see
+  // `AMDAIEInsertCopyOps`), so its output counts towards the C term.
+  for (Operation *userOp : linalgOp->getUsers()) {
+    auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp);
+    if (linalgUser && isElementwise(linalgUser) &&
+        !isa<linalg::FillOp, linalg::CopyOp>(linalgUser))
+      nBytesOut += bytesOf(linalgUser.getDpsInitOperand(0)->get());
+  }
 
   // K tile, whole matvec ukernel vectors when the tile is lowered to it (it
   // is enabled and has a template for the element types).

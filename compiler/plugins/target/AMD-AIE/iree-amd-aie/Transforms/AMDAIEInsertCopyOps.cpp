@@ -158,6 +158,50 @@ LogicalResult promoteInputs(IRRewriter &rewriter, Operation *op) {
   return success();
 }
 
+/// Promotes the operands of an elementwise `epilogue` of a contraction: the
+/// contraction's result is read where it is computed, so that input gets no
+/// copy; an init the payload never reads gets a fresh buffer, not a copy of its
+/// contents.
+LogicalResult promoteEpilogueOperands(IRRewriter &rewriter,
+                                      linalg::LinalgOp epilogue) {
+  OpBuilder::InsertionGuard g(rewriter);
+  Location loc = epilogue.getLoc();
+  rewriter.setInsertionPoint(epilogue);
+  for (OpOperand *input : epilogue.getDpsInputOperands()) {
+    if (input->get().getDefiningOp<linalg::ContractionOpInterface>()) continue;
+    FailureOr<Value> maybeReplacement = promoteValue(rewriter, loc, input->get());
+    if (failed(maybeReplacement))
+      return epilogue.emitError() << "failed to promote input";
+    input->set(*maybeReplacement);
+  }
+  for (OpOperand &init : epilogue.getDpsInitsMutable()) {
+    if (epilogue.payloadUsesValueFromOperand(&init)) {
+      FailureOr<Value> maybeReplacement =
+          promoteValue(rewriter, loc, init.get());
+      if (failed(maybeReplacement))
+        return epilogue.emitError() << "failed to promote init";
+      init.set(*maybeReplacement);
+      continue;
+    }
+    auto initType = dyn_cast<RankedTensorType>(init.get().getType());
+    if (!initType || !initType.hasStaticShape())
+      return epilogue.emitError() << "expected a static init";
+    init.set(rewriter.create<bufferization::AllocTensorOp>(loc, initType,
+                                                           ValueRange{}));
+  }
+  return success();
+}
+
+/// Returns true if `op` is an elementwise generic fed by a contraction, i.e.
+/// the contraction's fused epilogue (not a `linalg.copy` of its result).
+bool isContractionEpilogue(Operation *op) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp || !isElementwise(genericOp)) return false;
+  return llvm::any_of(genericOp.getDpsInputs(), [](Value input) {
+    return input.getDefiningOp<linalg::ContractionOpInterface>();
+  });
+}
+
 class AMDAIEInsertCopyOpsPass
     : public impl::AMDAIEInsertCopyOpsBase<AMDAIEInsertCopyOpsPass> {
  public:
@@ -186,6 +230,11 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
             linalg::ContractionOpInterface>(op))
       targetOps.push_back(op);
   });
+  // A contraction with a fused elementwise epilogue (GEMV + ReLU) is staged
+  // the way pack-peel's unpack propagation stages one: the epilogue reads the
+  // contraction result in the buffer it is computed in, and only the
+  // epilogue's result moves out level by level. Staging the epilogue as a
+  // standalone op would chain same-memory-space copies around it instead.
   for (Operation *targetOp : targetOps) {
     // Captured before the init is replaced by its promoted copy.
     Value initDest;
@@ -197,7 +246,16 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
       }
       initDest = dstStyleOp.getDpsInits()[0];
     }
-    if (failed(promoteInputs(rewriter, targetOp))) return signalPassFailure();
+    if (isContractionEpilogue(targetOp)) {
+      if (failed(promoteEpilogueOperands(rewriter,
+                                         cast<linalg::GenericOp>(targetOp))))
+        return signalPassFailure();
+    } else if (failed(promoteInputs(rewriter, targetOp))) {
+      return signalPassFailure();
+    }
+    if (isa<linalg::ContractionOpInterface>(targetOp) &&
+        llvm::any_of(targetOp->getUsers(), isContractionEpilogue))
+      continue;
     if (failed(promoteResults(rewriter, targetOp, initDest)))
       return signalPassFailure();
   }

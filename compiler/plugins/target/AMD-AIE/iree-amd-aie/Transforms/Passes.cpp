@@ -348,6 +348,18 @@ void addGemvPassPipeline(OpPassManager &funcPassManager) {
         createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
   }
 
+  // Likewise a fused elementwise epilogue's output (no-op without one): its
+  // result, not the matmul's, leaves the cores (see `AMDAIEInsertCopyOps`), so
+  // it gathers the per-core tiles in shared memory for the L2 -> L3 copy.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeElementwise = true;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
   // Second copy level (stands in for the second packing), added before the K
   // loop exists so that, like pack-peel, the loop carries the whole N block of
   // C in local memory and the cores only slice it: no C read-back per K step,
