@@ -508,8 +508,12 @@ bool isMatmulInDefChain(Value operand) {
 
   if (isa<arith::ConstantOp>(defOp)) return false;
 
+  // After packing, a transposed matmul is a generic with permuted maps, which
+  // `isMatmul` alone rejects.
   if (auto defLinalgOp = dyn_cast_if_present<linalg::LinalgOp>(defOp)) {
-    if (isMatmul(defLinalgOp)) return true;
+    if (isMatmul(defLinalgOp) || isMatmulTransposeA(defLinalgOp) ||
+        isMatmulTransposeB(defLinalgOp))
+      return true;
   }
 
   // If something is being produced from a for/forall loop, we just assume it is
