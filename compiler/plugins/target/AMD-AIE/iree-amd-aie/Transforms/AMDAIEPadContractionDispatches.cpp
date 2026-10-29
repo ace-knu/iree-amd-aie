@@ -17,9 +17,11 @@
 //
 // Runs right after `AMDAIEAssignDeviceAffinities`, when every `flow.dispatch`
 // already carries a `stream.affinity` and dispatch regions are outlined. This
-// pass assumes the amd-aie contraction dispatch is a *plain* matmul
-// (`empty -> fill(0) -> matmul -> store`, with bias/relu/etc. already split into
-// separate dispatches upstream). For such a dispatch pinned to an amd-aie device
+// pass assumes the amd-aie contraction dispatch is a plain matmul
+// (`empty -> fill(0) -> matmul -> store`), optionally with a unary elementwise
+// epilogue (ReLU, truncf) between the matmul and the store; a bias has been
+// folded into K by AMDAIEFoldBiasIntoContractionDispatches or split into its own
+// dispatch upstream. For such a dispatch pinned to an amd-aie device
 // whose M/K dims are not multiples of the target tiles, it:
 //   * zero-pads the matmul operands to the padded shape *outside* the dispatch
 //     (a host `tensor.pad` dispatch), and
@@ -160,8 +162,8 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
       /*k=*/getPackPeelReductionTile(/*kPackScaleL1=*/1)};
 }
 
-/// A plain matmul (`empty -> fill -> matmul -> store`) inside a dispatch
-/// executable, with the ops/bindings needed to grow its M/K dims. Sizes are
+/// A plain matmul (`empty -> fill -> matmul [-> epilogue] -> store`) inside a
+/// dispatch executable, with the ops/bindings needed to grow its M/K dims. Sizes are
 /// intentionally not cached here -- they are read from each caller dispatch's
 /// operands so a shared executable can be handled per caller.
 struct MatmulInfo {
@@ -172,6 +174,7 @@ struct MatmulInfo {
   tensor::EmptyOp empty;
   IREE::TensorExt::DispatchTensorStoreOp store;  // writes the output binding
   BlockArgument outArg;                          // the output binding
+  linalg::GenericOp epilogue;  // unary elementwise op on the result, or null
 };
 
 /// Returns the func of a dispatch's single entry point, or null.
@@ -203,8 +206,9 @@ static IREE::TensorExt::DispatchTensorLoadOp getFullTensorLoad(Value operand) {
 }
 
 /// Inspects the func for a single plain matmul: LHS/RHS from full-tensor loads
-/// of bindings, an `empty`+`fill` output init, and the matmul result stored
-/// directly to the output binding.
+/// of bindings, an `empty`+`fill` output init, and the matmul result stored to
+/// the output binding directly or through a unary elementwise epilogue with an
+/// `empty` init.
 static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
   SmallVector<linalg::MatmulOp> matmuls;
   func.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
@@ -225,12 +229,22 @@ static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
       [&](IREE::TensorExt::DispatchTensorStoreOp s) { stores.push_back(s); });
   if (stores.size() != 1) return std::nullopt;
   auto store = stores.front();
-  // Plain matmul: the matmul result feeds the store directly (no output chain).
-  if (store.getValue() != matmul.getResult(0)) return std::nullopt;
+  linalg::GenericOp epilogue;
+  if (store.getValue() != matmul.getResult(0)) {
+    epilogue = store.getValue().getDefiningOp<linalg::GenericOp>();
+    if (!epilogue || !isElementwise(epilogue) ||
+        epilogue.getNumDpsInputs() != 1 || epilogue.getNumDpsInits() != 1 ||
+        epilogue.getDpsInputs()[0] != matmul.getResult(0) ||
+        !matmul.getResult(0).hasOneUse() ||
+        !epilogue.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() ||
+        !llvm::all_of(epilogue.getIndexingMapsArray(),
+                      [](AffineMap map) { return map.isIdentity(); }))
+      return std::nullopt;
+  }
   auto outArg = dyn_cast<BlockArgument>(store.getTarget());
   if (!outArg) return std::nullopt;
-  return MatmulInfo{matmul, lhsLoad, rhsLoad, lhsArg,
-                    rhsArg, fill,    empty,   store,  outArg};
+  return MatmulInfo{matmul, lhsLoad, rhsLoad, lhsArg, rhsArg,
+                    fill,   empty,   store,   outArg, epilogue};
 }
 
 /// Grows executable binding `arg` and its full-tensor `load` to `newShape`
@@ -266,13 +280,28 @@ static void growMatmulInit(IRRewriter &rewriter, MatmulInfo &info, int64_t mPad,
   info.matmul.setDpsInitOperand(0, newFill.getResult(0));
   info.matmul.getResult(0).setType(RankedTensorType::get({mPad, nPad}, elemType));
   rewriter.eraseOp(info.fill);
-  rewriter.eraseOp(info.empty);
+  // The epilogue may share the `empty` as its init; it is grown after this.
+  if (info.empty.use_empty()) rewriter.eraseOp(info.empty);
 }
 
-/// Grows the output binding and rewrites the store to write the full padded
-/// [mPad, nPad] matmul result.
+/// Grows the epilogue (if any) to [mPad, nPad] after the matmul result has
+/// grown, then the output binding, and rewrites the store to write the full
+/// padded result.
 static void growOutputStore(IRRewriter &rewriter, MatmulInfo &info,
                             int64_t mPad, int64_t nPad) {
+  Value result = info.matmul.getResult(0);
+  if (linalg::GenericOp epilogue = info.epilogue) {
+    auto empty = epilogue.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>();
+    rewriter.setInsertionPoint(epilogue);
+    auto paddedType = RankedTensorType::get(
+        {mPad, nPad}, getElementTypeOrSelf(empty.getType()));
+    Value newEmpty = rewriter.create<tensor::EmptyOp>(
+        empty.getLoc(), paddedType.getShape(), paddedType.getElementType());
+    epilogue.setDpsInitOperand(0, newEmpty);
+    epilogue.getResult(0).setType(paddedType);
+    if (empty.use_empty()) rewriter.eraseOp(empty);
+    result = epilogue.getResult(0);
+  }
   auto dtt = cast<IREE::TensorExt::DispatchTensorType>(info.outArg.getType());
   auto newTensorType = RankedTensorType::get(
       {mPad, nPad}, dtt.asRankedTensorType().getElementType());
@@ -280,7 +309,7 @@ static void growOutputStore(IRRewriter &rewriter, MatmulInfo &info,
                                                                newTensorType));
   rewriter.setInsertionPoint(info.store);
   rewriter.create<IREE::TensorExt::DispatchTensorStoreOp>(
-      info.store.getLoc(), info.matmul.getResult(0), info.outArg,
+      info.store.getLoc(), result, info.outArg,
       /*targetDynamicDims=*/ValueRange{});
   rewriter.eraseOp(info.store);
 }
@@ -594,8 +623,10 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     // Grow this caller's result to [mPad, nPad] and crop it back to [m, n] on
     // the host with an extract_slice dispatch (handles the inner N dim too).
     if (padOut) {
+      // The stored element type, the epilogue's when there is one.
       Value result = dispatch.getResult(0);
-      result.setType(RankedTensorType::get({mPad, nPad}, outElemType));
+      result.setType(RankedTensorType::get(
+          {mPad, nPad}, getElementTypeOrSelf(result.getType())));
       rewriter.setInsertionPointAfter(dispatch);
       Value cropped =
           createCropDispatch(rewriter, module, result, {m, n}, hostAffinity,
