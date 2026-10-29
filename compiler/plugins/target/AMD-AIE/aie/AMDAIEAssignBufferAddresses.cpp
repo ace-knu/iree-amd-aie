@@ -8,6 +8,7 @@
 #include "Passes.h"
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/Pass/Pass.h"
 
@@ -27,6 +28,21 @@ static uint32_t getMaxMemorySize(AMDAIEDeviceModel deviceModel, TileOp tile) {
   }
 }
 
+/// Returns the byte alignment of `buffer`'s start address, as upstream
+/// mlir-aie's `requiredBufferAlignBits`: a core buffer is aligned to the vector
+/// load/store bus, and on AIE2P one that can hold a full-width (512-bit)
+/// vector to 64 bytes, which such an access requires (aie_api's
+/// `vector_ldst_align`); an unaligned one is accessed at the wrong address
+/// without any error. A memtile buffer only needs the 4-byte DMA granularity.
+static int64_t getBufferAlignment(BufferOp buffer,
+                                  AMDAIEDeviceModel deviceModel) {
+  TileOp tile = getTileOp(*buffer);
+  if (deviceModel.isMemTile(tile.getCol(), tile.getRow())) return 4;
+  int64_t busBytes = deviceModel.getVectorLoadStoreAlignmentBits() / 8;
+  int64_t vectorBytes = isAie2P(deviceModel.device) ? 64 : busBytes;
+  return getAllocationSize(buffer) >= vectorBytes ? vectorBytes : busBytes;
+}
+
 //===----------------------------------------------------------------------===//
 // BasicAllocation : sequential allocation for all buffers
 //===----------------------------------------------------------------------===//
@@ -37,6 +53,7 @@ static LogicalResult basicAllocation(TileOp tile, SetVector<BufferOp> buffers,
   if (CoreOp core = getCoreOp(tile)) address += core.getStackSize();
 
   for (BufferOp buffer : buffers) {
+    address = llvm::alignTo(address, getBufferAlignment(buffer, deviceModel));
     buffer.setAddress(address);
     address += getAllocationSize(buffer);
   }
@@ -110,7 +127,7 @@ FailureOr<bool> checkAndAddBufferWithAddress(
 // it. If there is, it sets the buffer's address field and if not, the function
 // emits an error.
 FailureOr<bool> checkAndAddBufferWithMemBank(
-    BufferOp buffer, SmallVector<BankStates> &bankStates) {
+    BufferOp buffer, int64_t alignment, SmallVector<BankStates> &bankStates) {
   std::optional<uint32_t> maybeBank = buffer.getMemBank();
   if (!maybeBank) return false;
   uint32_t memBank = maybeBank.value();
@@ -122,7 +139,7 @@ FailureOr<bool> checkAndAddBufferWithMemBank(
       bankStates[memBank].nextAddr = addr.value();
   }
 
-  int64_t startAddr = bankStates[memBank].nextAddr;
+  int64_t startAddr = llvm::alignTo(bankStates[memBank].nextAddr, alignment);
   int64_t endAddr = startAddr + getAllocationSize(buffer);
   if (endAddr > bankStates[memBank].endAddr)
     return buffer->emitOpError("would over run the current bank limit");
@@ -137,8 +154,8 @@ FailureOr<bool> checkAndAddBufferWithMemBank(
 // the buffer's memory bank attribute and address, and updates the next
 // available address in the bank. If no suitable banks are found, it emits an
 // error and returns false.
-bool setBufferAddress(BufferOp buffer, uint32_t bankSize, int &startBankIndex,
-                      SmallVector<BankStates> &bankStates) {
+bool setBufferAddress(BufferOp buffer, uint32_t bankSize, int64_t alignment,
+                      int &startBankIndex, SmallVector<BankStates> &bankStates) {
   uint32_t numBanks = bankStates.size();
   assert(startBankIndex < numBanks &&
          "Unexpected input value for startBankIndex");
@@ -174,7 +191,10 @@ bool setBufferAddress(BufferOp buffer, uint32_t bankSize, int &startBankIndex,
 
     for (int i = 0; i < minNumBanksNeeded; ++i) {
       int bankIndex = (bankStart + i) % numBanks;
-      int64_t startAddr = bankStates[bankIndex].nextAddr;
+      // Only the buffer's start is aligned; a following bank continues it.
+      int64_t startAddr = i == 0 ? llvm::alignTo(bankStates[bankIndex].nextAddr,
+                                                 alignment)
+                                 : bankStates[bankIndex].nextAddr;
       int64_t available = bankStates[bankIndex].endAddr - startAddr;
 
       // If there is no space available in the current bank, break and try other
@@ -251,7 +271,8 @@ LogicalResult bankAwareAllocation(TileOp tile, SetVector<BufferOp> buffers,
   SmallVector<BufferOp> preAllocatedBuffers;
   SmallVector<BufferOp> buffersToAlloc;
   for (BufferOp buffer : buffers) {
-    FailureOr<bool> has_bank = checkAndAddBufferWithMemBank(buffer, bankStates);
+    FailureOr<bool> has_bank = checkAndAddBufferWithMemBank(
+        buffer, getBufferAlignment(buffer, deviceModel), bankStates);
     FailureOr<bool> has_addr =
         checkAndAddBufferWithAddress(buffer, bankSize, bankStates);
     if (failed(has_addr) || failed(has_bank)) return failure();
@@ -275,7 +296,9 @@ LogicalResult bankAwareAllocation(TileOp tile, SetVector<BufferOp> buffers,
   for (BufferOp buffer : buffersToAlloc) {
     // If the buffer doesn't fit in any of the bank space, it emits an error
     // and then deallocates all the buffers.
-    if (!setBufferAddress(buffer, bankSize, startBankIndex, bankStates)) {
+    if (!setBufferAddress(buffer, bankSize,
+                          getBufferAlignment(buffer, deviceModel),
+                          startBankIndex, bankStates)) {
       deAllocateBuffers(allocatedBuffers);
       return failure();
     } else {

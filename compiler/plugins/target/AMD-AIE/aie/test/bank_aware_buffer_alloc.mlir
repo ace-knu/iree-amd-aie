@@ -180,3 +180,26 @@ module @over_bank_limit_error {
     %buf0 = aie.buffer(%tile44) { sym_name = "a", mem_bank = 0 : i32, address = 1024 : i32 } : memref<10240xi32>
   }
 }
+
+// -----
+
+// On AIE2P a core buffer that can hold a full-width (64-byte) vector starts on
+// a 64-byte boundary. "e" wraps back to bank 0 behind the 688-byte "a", which
+// ends at 1712 (a 16-byte boundary, where a vector store writes the wrong
+// address), so it starts at 1728.
+// CHECK-LABEL: module @npu4_align_test
+// CHECK:         aie.buffer(%{{.*}}) {address = 1024 : i32, mem_bank = 0 : i32, sym_name = "a"} : memref<172xf32>
+// CHECK:         aie.buffer(%{{.*}}) {address = 1728 : i32, mem_bank = 0 : i32, sym_name = "e"} : memref<32xf32>
+module @npu4_align_test {
+ aie.device(npu4) {
+  %0 = aie.tile(0, 2)
+  %a = aie.buffer(%0) { sym_name = "a" } : memref<172xf32>
+  %b = aie.buffer(%0) { sym_name = "b" } : memref<32xf32>
+  %c = aie.buffer(%0) { sym_name = "c" } : memref<32xf32>
+  %d = aie.buffer(%0) { sym_name = "d" } : memref<32xf32>
+  %e = aie.buffer(%0) { sym_name = "e" } : memref<32xf32>
+  aie.core(%0) {
+    aie.end
+  }
+ }
+}
