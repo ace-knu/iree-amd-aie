@@ -154,3 +154,176 @@ module {
     util.return %0 : tensor<2x2xf32>
   }
 }
+
+// -----
+
+// im2col convolution: the matmul accumulates onto a host dispatch that
+// broadcasts a constant [N] bias over M. The matmul starts from fill(0)
+// instead, the bias becomes the weight's last K row (the weight read through a
+// reshape, which goes with it), and the broadcast dispatch is dropped.
+
+// CHECK-LABEL: util.global private @__bias_folded_weight_1
+// CHECK-SAME:    dense<{{\[}}[1.000000e+00, 2.000000e+00], [3.000000e+00, 4.000000e+00], [5.000000e-01, -2.500000e-01]]> : tensor<3x2xbf16>
+// CHECK-NOT:   @weight
+// CHECK-LABEL: func.func @conv
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x3xbf16>>
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x2xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>
+// CHECK:         %[[FILL:.+]] = linalg.fill
+// CHECK:         %[[MM:.+]] = linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<4x3xbf16>, tensor<3x2xbf16>) outs(%[[FILL]] : tensor<4x2xf32>)
+// CHECK:         linalg.generic {{.*}} ins(%[[MM]] : tensor<4x2xf32>)
+// CHECK-LABEL: util.func public @main
+// CHECK-NOT:     @broadcast
+// CHECK-NOT:     flow.tensor.reshape
+// CHECK:         %[[LHS:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %{{[a-z0-9_]+}})
+// CHECK:         %[[W:.+]] = util.global.load immutable @__bias_folded_weight_1 : tensor<3x2xbf16>
+// CHECK:         flow.dispatch @dispatch_0::@conv(%[[LHS]], %[[W]]) {{.*}} : (tensor<4x3xbf16>, tensor<3x2xbf16>) -> tensor<4x2xf32>
+module {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight {stream.affinity.default = #hal.device.affinity<@cpu>} = dense<[[[1.0, 2.0]], [[3.0, 4.0]]]> : tensor<2x1x2xbf16>
+  util.global private @bias {stream.affinity.default = #hal.device.affinity<@cpu>} = dense<[0.5, -0.25]> : tensor<2xf32>
+  flow.executable private @broadcast {
+    flow.executable.export public @broadcast workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @broadcast(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0], sizes = [2], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2xf32>> -> tensor<2xf32>
+        %1 = tensor.empty() : tensor<4x2xf32>
+        %2 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%0 : tensor<2xf32>) outs(%1 : tensor<4x2xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          linalg.yield %in : f32
+        } -> tensor<4x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %2, %arg1, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : tensor<4x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>
+        return
+      }
+    }
+  }
+  flow.executable private @dispatch_0 {
+    flow.executable.export public @conv workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @conv(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xbf16>> -> tensor<4x2xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xbf16>> -> tensor<2x2xbf16>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>> -> tensor<4x2xf32>
+        %3 = tensor.empty() : tensor<4x2xf32>
+        %4 = linalg.matmul ins(%0, %1 : tensor<4x2xbf16>, tensor<2x2xbf16>) outs(%2 : tensor<4x2xf32>) -> tensor<4x2xf32>
+        %5 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%4 : tensor<4x2xf32>) outs(%3 : tensor<4x2xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          %6 = arith.maximumf %in, %cst : f32
+          linalg.yield %6 : f32
+        } -> tensor<4x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %5, %arg3, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : tensor<4x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main(%arg0: tensor<4x2xbf16>) -> tensor<4x2xf32> {
+    %b = util.global.load immutable @bias : tensor<2xf32>
+    %acc = flow.dispatch @broadcast::@broadcast(%b) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<2xf32>) -> tensor<4x2xf32>
+    %w3 = util.global.load immutable @weight : tensor<2x1x2xbf16>
+    %w = flow.tensor.reshape %w3 : tensor<2x1x2xbf16> -> tensor<2x2xbf16>
+    %0 = flow.dispatch @dispatch_0::@conv(%arg0, %w, %acc) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<4x2xbf16>, tensor<2x2xbf16>, tensor<4x2xf32>) -> tensor<4x2xf32>
+    util.return %0 : tensor<4x2xf32>
+  }
+}
+
+// -----
+
+// The broadcast may instead be hoisted by const-eval into a global that a
+// `util.initializer` sets, here from an inline constant; the global load is
+// the accumulator.
+
+// CHECK-LABEL: util.global private @__bias_folded_weight_1
+// CHECK-SAME:    dense<{{\[}}[1.000000e+00, 2.000000e+00], [3.000000e+00, 4.000000e+00], [5.000000e-01, -2.500000e-01]]> : tensor<3x2xbf16>
+// CHECK-LABEL: util.func public @main
+// CHECK-NOT:     @acc_global
+// CHECK:         flow.dispatch @dispatch_0::@conv(%{{.+}}, %{{.+}}) {{.*}} : (tensor<4x3xbf16>, tensor<3x2xbf16>) -> tensor<4x2xf32>
+module {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight {stream.affinity.default = #hal.device.affinity<@cpu>} = dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xbf16>
+  util.global private @acc_global {stream.affinity.default = #hal.device.affinity<@cpu>} : tensor<4x2xf32>
+  flow.executable private @broadcast {
+    flow.executable.export public @broadcast workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @broadcast(%arg0: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>) {
+        %cst = arith.constant dense<[0.5, -0.25]> : tensor<2xf32>
+        %1 = tensor.empty() : tensor<4x2xf32>
+        %2 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%cst : tensor<2xf32>) outs(%1 : tensor<4x2xf32>) {
+        ^bb0(%in: f32, %out: f32):
+          linalg.yield %in : f32
+        } -> tensor<4x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %2, %arg0, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : tensor<4x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>
+        return
+      }
+    }
+  }
+  util.initializer attributes {stream.affinity.default = #hal.device.affinity<@cpu>} {
+    %0 = flow.dispatch @broadcast::@broadcast() {stream.affinity = #hal.device.affinity<@cpu>} : () -> tensor<4x2xf32>
+    util.global.store %0, @acc_global : tensor<4x2xf32>
+    util.return
+  }
+  flow.executable private @dispatch_0 {
+    flow.executable.export public @conv workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @conv(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xbf16>> -> tensor<4x2xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xbf16>> -> tensor<2x2xbf16>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>> -> tensor<4x2xf32>
+        %4 = linalg.matmul ins(%0, %1 : tensor<4x2xbf16>, tensor<2x2xbf16>) outs(%2 : tensor<4x2xf32>) -> tensor<4x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg3, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : tensor<4x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main(%arg0: tensor<4x2xbf16>) -> tensor<4x2xf32> {
+    %w = util.global.load immutable @weight : tensor<2x2xbf16>
+    %acc = util.global.load immutable @acc_global : tensor<4x2xf32>
+    %0 = flow.dispatch @dispatch_0::@conv(%arg0, %w, %acc) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<4x2xbf16>, tensor<2x2xbf16>, tensor<4x2xf32>) -> tensor<4x2xf32>
+    util.return %0 : tensor<4x2xf32>
+  }
+}
+
+// -----
+
+// A runtime accumulator is no broadcast bias: the dispatch would reach the
+// backend with three inputs, so the pass fails here.
+module {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_0 {
+    flow.executable.export public @acc workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @acc(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>) {
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>> -> tensor<4x2xf32>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>> -> tensor<2x2xf32>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x2xf32>> -> tensor<4x2xf32>
+        %3 = linalg.matmul ins(%0, %1 : tensor<4x2xf32>, tensor<2x2xf32>) outs(%2 : tensor<4x2xf32>) -> tensor<4x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %3, %arg3, offsets = [0, 0], sizes = [4, 2], strides = [1, 1] : tensor<4x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main(%arg0: tensor<4x2xf32>, %arg1: tensor<4x2xf32>) -> tensor<4x2xf32> {
+    %w = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
+    // expected-error @+1 {{cannot fold the bias of this NPU contraction dispatch into K: the accumulator is not a broadcast of a float constant bias}}
+    %0 = flow.dispatch @dispatch_0::@acc(%arg0, %w, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<4x2xf32>, tensor<2x2xf32>, tensor<4x2xf32>) -> tensor<4x2xf32>
+    util.return %0 : tensor<4x2xf32>
+  }
+}

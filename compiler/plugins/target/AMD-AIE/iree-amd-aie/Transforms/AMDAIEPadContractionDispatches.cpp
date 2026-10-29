@@ -841,24 +841,30 @@ void AMDAIEPadPoolingDispatchesPass::runOnOperation() {
 // amd-aie backend has no DMA channel for a third input, so a matmul + bias +
 // ReLU dispatch fails without it.
 //
-// Matches a post-add bias: `fill(0) -> matmul -> generic(addf(mm, bias), ...)`
-// with a bias holding one value per output column, as an ONNX Gemm (FC layer)
-// lowers to once the bias add is fused into the contraction dispatch. The
-// rewrite grows K by one: the LHS gets a ones column at K index k (a host pad
-// dispatch with 1 as the pad value), the constant weight gets the bias as its
-// K row k (a new global, the bias rounded to the weight element type), and
-// the bias binding and its `addf` leave the executable. A consumer left with
-// nothing to do (a bias add alone) is removed. Runs right before
-// AMDAIEPadContractionDispatches, which then pads K+1 like any other K.
+// Matches a bias holding one value per output column in either of two forms:
+//   * post-add, `fill(0) -> matmul -> generic(addf(mm, bias), ...)`, as an
+//     ONNX Gemm (FC layer) lowers to once the bias add is fused into the
+//     contraction dispatch: the bias binding and its `addf` leave the
+//     executable, and a consumer left with nothing to do is removed;
+//   * accumulator, `matmul outs(bias broadcast)`, as an im2col convolution
+//     lowers to: the accumulator is a host dispatch broadcasting a constant
+//     [N] bias over M (or a global a `util.initializer` sets to one, where
+//     const-eval hoisted it); the accumulator binding leaves the executable and
+//     the matmul starts from `fill(0)`.
+// The rewrite grows K by one: the LHS gets a ones column at K index k (a host
+// pad dispatch with 1 as the pad value) and the constant weight gets the bias
+// as its K row k (a new global, the bias rounded to the weight element type).
+// Runs right before AMDAIEPadContractionDispatches, which then pads K+1 like
+// any other K.
 //
 // A matched dispatch the fold cannot rewrite (a bias or weight that is not a
 // compile-time constant, an executable with several callers) is an error: the
 // backend would fail on its third input later with a less clear message.
 
-/// A post-add bias in a dispatch executable: the matmul's only user is an
-/// elementwise generic whose payload adds a per-column bias, loaded from its
-/// own binding, to the matmul value.
-struct PostAddBiasInfo {
+/// A bias in a dispatch executable, loaded from its own binding: added to the
+/// matmul value by an elementwise consumer (post-add), or the matmul's
+/// accumulator (`consumer` null).
+struct BiasFoldInfo {
   linalg::MatmulOp matmul;
   IREE::TensorExt::DispatchTensorLoadOp lhsLoad, rhsLoad, biasLoad;
   BlockArgument lhsArg, rhsArg, biasArg;
@@ -866,6 +872,20 @@ struct PostAddBiasInfo {
   arith::AddFOp biasAdd;
   unsigned mmInput;  // the consumer input the matmul result feeds
 };
+
+/// Returns the single `linalg.matmul` of `func` with LHS and RHS from
+/// full-tensor loads of bindings, or null.
+static linalg::MatmulOp getBindingMatmul(func::FuncOp func) {
+  SmallVector<linalg::MatmulOp> matmuls;
+  func.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
+  if (matmuls.size() != 1) return {};
+  linalg::MatmulOp matmul = matmuls.front();
+  for (Value input : matmul.getInputs()) {
+    auto load = getFullTensorLoad(input);
+    if (!load || !isa<BlockArgument>(load.getSource())) return {};
+  }
+  return matmul;
+}
 
 /// Returns true if `map` reads one value per output column of an [M, N]
 /// iteration space whose M is `m`: (d0, d1) -> (d1), or a [1, N] operand read
@@ -880,20 +900,16 @@ static bool isPerColumnMap(AffineMap map, int64_t m) {
   return m == 1 && map.isIdentity();
 }
 
-static std::optional<PostAddBiasInfo> getPostAddBiasInfo(func::FuncOp func) {
-  SmallVector<linalg::MatmulOp> matmuls;
-  func.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
-  if (matmuls.size() != 1) return std::nullopt;
-  linalg::MatmulOp matmul = matmuls.front();
+static std::optional<BiasFoldInfo> getPostAddBiasInfo(func::FuncOp func) {
+  linalg::MatmulOp matmul = getBindingMatmul(func);
+  if (!matmul) return std::nullopt;
   auto fill = matmul.getDpsInits()[0].getDefiningOp<linalg::FillOp>();
   if (!fill || !matchPattern(fill.getInputs()[0], m_AnyZeroFloat()))
     return std::nullopt;
   auto lhsLoad = getFullTensorLoad(matmul.getInputs()[0]);
   auto rhsLoad = getFullTensorLoad(matmul.getInputs()[1]);
-  if (!lhsLoad || !rhsLoad) return std::nullopt;
-  auto lhsArg = dyn_cast<BlockArgument>(lhsLoad.getSource());
-  auto rhsArg = dyn_cast<BlockArgument>(rhsLoad.getSource());
-  if (!lhsArg || !rhsArg) return std::nullopt;
+  auto lhsArg = cast<BlockArgument>(lhsLoad.getSource());
+  auto rhsArg = cast<BlockArgument>(rhsLoad.getSource());
 
   Value mmResult = matmul.getResult(0);
   if (!mmResult.hasOneUse()) return std::nullopt;
@@ -921,24 +937,111 @@ static std::optional<PostAddBiasInfo> getPostAddBiasInfo(func::FuncOp func) {
   auto biasAdd = dyn_cast<arith::AddFOp>(*mmValue.getUsers().begin());
   if (!biasAdd || *biasValue.getUsers().begin() != biasAdd.getOperation())
     return std::nullopt;
-  return PostAddBiasInfo{matmul,  lhsLoad,  rhsLoad,  biasLoad, lhsArg,
-                         rhsArg,  biasArg,  consumer, biasAdd,  mmInput};
+  return BiasFoldInfo{matmul,  lhsLoad,  rhsLoad,  biasLoad, lhsArg,
+                      rhsArg,  biasArg,  consumer, biasAdd,  mmInput};
+}
+
+/// An accumulator bias: the matmul's init is loaded from its own binding.
+static std::optional<BiasFoldInfo> getAccumulatorBiasInfo(func::FuncOp func) {
+  linalg::MatmulOp matmul = getBindingMatmul(func);
+  if (!matmul) return std::nullopt;
+  auto accLoad = getFullTensorLoad(matmul.getDpsInits()[0]);
+  if (!accLoad) return std::nullopt;
+  auto accArg = dyn_cast<BlockArgument>(accLoad.getSource());
+  if (!accArg) return std::nullopt;
+  auto lhsLoad = getFullTensorLoad(matmul.getInputs()[0]);
+  auto rhsLoad = getFullTensorLoad(matmul.getInputs()[1]);
+  return BiasFoldInfo{matmul,
+                      lhsLoad,
+                      rhsLoad,
+                      accLoad,
+                      cast<BlockArgument>(lhsLoad.getSource()),
+                      cast<BlockArgument>(rhsLoad.getSource()),
+                      accArg,
+                      /*consumer=*/{},
+                      /*biasAdd=*/{},
+                      /*mmInput=*/0};
 }
 
 /// Returns the dense value of `v` when it is a compile-time constant: an
 /// `arith.constant` or a load of an immutable `util.global` with a dense
-/// initial value. Sets `global` to that global if there is one.
+/// initial value, possibly through `flow.tensor.reshape`s (row-major, so the
+/// value is only reshaped). Sets `global` to that global if there is one.
 static DenseElementsAttr getConstantValue(Value v,
                                           IREE::Util::GlobalOp *global) {
-  if (auto cstOp = v.getDefiningOp<arith::ConstantOp>())
+  auto type = dyn_cast<RankedTensorType>(v.getType());
+  if (!type || !type.hasStaticShape()) return {};
+  Value root = v;
+  while (auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>())
+    root = reshapeOp.getSource();
+  DenseElementsAttr attr;
+  if (auto cstOp = root.getDefiningOp<arith::ConstantOp>()) {
+    attr = dyn_cast<DenseElementsAttr>(cstOp.getValue());
+  } else if (auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>()) {
+    if (!loadOp.getIsImmutable()) return {};
+    auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
+        loadOp, loadOp.getGlobalAttr());
+    if (!globalOp) return {};
+    if (global) *global = globalOp;
+    attr = dyn_cast_or_null<DenseElementsAttr>(globalOp.getInitialValueAttr());
+  }
+  return attr ? attr.reshape(type) : DenseElementsAttr();
+}
+
+/// Returns the constant [N] bias that accumulator `acc` broadcasts over M:
+/// `acc` is the result of a dispatch whose executable only broadcasts a 1-D
+/// constant (inline or a constant operand) through (d0, d1) -> (d1), or a load
+/// of an immutable global a `util.initializer` sets to such a dispatch's
+/// result (const-eval hoists a small broadcast). Null otherwise.
+static DenseElementsAttr getBroadcastBias(Value acc, ModuleOp module) {
+  if (auto loadOp = acc.getDefiningOp<IREE::Util::GlobalLoadOp>()) {
+    auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
+        loadOp, loadOp.getGlobalAttr());
+    if (!loadOp.getIsImmutable() || !globalOp ||
+        globalOp.getInitialValueAttr())
+      return {};
+    std::optional<SymbolTable::UseRange> uses =
+        SymbolTable::getSymbolUses(globalOp, module);
+    if (!uses) return {};
+    IREE::Util::GlobalStoreOp store;
+    for (SymbolTable::SymbolUse use : *uses) {
+      auto candidate = dyn_cast<IREE::Util::GlobalStoreOp>(use.getUser());
+      if (!candidate) continue;
+      if (store || !candidate->getParentOfType<IREE::Util::InitializerOp>())
+        return {};
+      store = candidate;
+    }
+    if (!store) return {};
+    acc = store.getValue();
+  }
+  auto dispatch = acc.getDefiningOp<IREE::Flow::DispatchOp>();
+  if (!dispatch || dispatch.getNumResults() != 1) return {};
+  func::FuncOp func = getDispatchFunc(dispatch, module);
+  if (!func) return {};
+  SmallVector<linalg::GenericOp> generics;
+  func.walk([&](linalg::GenericOp op) { generics.push_back(op); });
+  if (generics.size() != 1) return {};
+  linalg::GenericOp broadcast = generics.front();
+  MLIRContext *ctx = broadcast.getContext();
+  if (broadcast.getNumDpsInputs() != 1 || broadcast.getNumDpsInits() != 1 ||
+      broadcast.getNumLoops() != 2 ||
+      broadcast.getIndexingMapsArray()[0] !=
+          AffineMap::get(2, 0, {getAffineDimExpr(1, ctx)}, ctx) ||
+      !broadcast.getIndexingMapsArray()[1].isIdentity())
+    return {};
+  Block &body = broadcast.getRegion().front();
+  auto yield = cast<linalg::YieldOp>(body.getTerminator());
+  if (!llvm::hasSingleElement(body) ||
+      yield.getOperand(0) != body.getArgument(0))
+    return {};
+  Value input = broadcast.getDpsInputs()[0];
+  if (auto cstOp = input.getDefiningOp<arith::ConstantOp>())
     return dyn_cast<DenseElementsAttr>(cstOp.getValue());
-  auto loadOp = v.getDefiningOp<IREE::Util::GlobalLoadOp>();
-  if (!loadOp || !loadOp.getIsImmutable()) return {};
-  auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
-      loadOp, loadOp.getGlobalAttr());
-  if (!globalOp) return {};
-  if (global) *global = globalOp;
-  return dyn_cast_or_null<DenseElementsAttr>(globalOp.getInitialValueAttr());
+  auto load = getFullTensorLoad(input);
+  auto arg = load ? dyn_cast<BlockArgument>(load.getSource()) : BlockArgument();
+  if (!arg) return {};
+  return getConstantValue(dispatch.getArguments()[arg.getArgNumber()],
+                          nullptr);
 }
 
 /// Returns `weight` ([K, N] or [N, K], K at `kPos`) with `bias` appended as K
@@ -988,7 +1091,7 @@ static DenseElementsAttr appendBiasRow(DenseElementsAttr weight,
 /// input and the bias `addf` is dropped (its uses read the matmul value). A
 /// consumer that then only yields the matmul value is removed. Erases the bias
 /// load and binding.
-static void removeBias(IRRewriter &rewriter, PostAddBiasInfo &info,
+static void removeBias(IRRewriter &rewriter, BiasFoldInfo &info,
                        func::FuncOp func) {
   linalg::GenericOp oldConsumer = info.consumer;
   Value mmResult = info.matmul.getResult(0);
@@ -1024,6 +1127,25 @@ static void removeBias(IRRewriter &rewriter, PostAddBiasInfo &info,
   (void)func.eraseArgument(info.biasArg.getArgNumber());
 }
 
+/// Starts the matmul from `fill(0)` instead of its accumulator binding, and
+/// erases that binding and its load.
+static void replaceAccumulatorWithZeroFill(IRRewriter &rewriter,
+                                           BiasFoldInfo &info,
+                                           func::FuncOp func) {
+  Location loc = info.matmul.getLoc();
+  auto accType = cast<RankedTensorType>(info.biasLoad.getResult().getType());
+  rewriter.setInsertionPoint(info.matmul);
+  Value empty = rewriter.create<tensor::EmptyOp>(loc, accType.getShape(),
+                                                 accType.getElementType());
+  Value zero = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getZeroAttr(accType.getElementType()));
+  auto fill =
+      rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{empty});
+  info.matmul.setDpsInitOperand(0, fill.getResult(0));
+  rewriter.eraseOp(info.biasLoad);
+  (void)func.eraseArgument(info.biasArg.getArgNumber());
+}
+
 class AMDAIEFoldBiasIntoContractionDispatchesPass
     : public impl::AMDAIEFoldBiasIntoContractionDispatchesBase<
           AMDAIEFoldBiasIntoContractionDispatchesPass> {
@@ -1052,7 +1174,8 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
     if (!getDispatchTarget(dispatch, module)) continue;
     func::FuncOp func = getDispatchFunc(dispatch, module);
     if (!func) continue;
-    std::optional<PostAddBiasInfo> info = getPostAddBiasInfo(func);
+    std::optional<BiasFoldInfo> info = getPostAddBiasInfo(func);
+    if (!info) info = getAccumulatorBiasInfo(func);
     if (!info) continue;
 
     // From here on the dispatch has a bias as its third input, which the
@@ -1083,10 +1206,14 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
     IREE::Util::GlobalOp weightGlobal;
     DenseElementsAttr weightAttr = getConstantValue(rhs, &weightGlobal);
     if (!weightAttr) return fail("the weight is not a constant");
+    Value biasOperand = dispatch.getArguments()[biasArgNo];
     DenseElementsAttr biasAttr =
-        getConstantValue(dispatch.getArguments()[biasArgNo], nullptr);
+        info->consumer ? getConstantValue(biasOperand, nullptr)
+                       : getBroadcastBias(biasOperand, module);
     if (!biasAttr || !isa<FloatType>(biasAttr.getElementType()))
-      return fail("the bias is not a float constant");
+      return fail(info->consumer ? "the bias is not a float constant"
+                                 : "the accumulator is not a broadcast of a "
+                                   "float constant bias");
 
     SmallVector<AffineMap> maps = info->matmul.getIndexingMapsArray();
     unsigned lhsKPos = operandDimForLoop(maps[0], /*K=*/2);
@@ -1100,7 +1227,10 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
     // Executable: K + 1 on both operands, no bias.
     growBinding(rewriter, info->lhsArg, info->lhsLoad, lhsShape);
     growBinding(rewriter, info->rhsArg, info->rhsLoad, foldedType.getShape());
-    removeBias(rewriter, *info, func);
+    if (info->consumer)
+      removeBias(rewriter, *info, func);
+    else
+      replaceAccumulatorWithZeroFill(rewriter, *info, func);
     SmallVector<Type> argTypes(llvm::map_range(
         func.getArguments(), [](BlockArgument a) { return a.getType(); }));
     func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
@@ -1128,6 +1258,17 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
     dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(
         rhsFolded.getResult());
     dispatch.getArgumentsMutable().erase(biasArgNo);
+    // The accumulator's broadcast dispatch (or global load) has no other use,
+    // nor the reshapes the old weight was read through.
+    Operation *biasProducer = biasOperand.getDefiningOp();
+    if (biasProducer && biasProducer->use_empty() &&
+        isa<IREE::Flow::DispatchOp, IREE::Util::GlobalLoadOp>(biasProducer))
+      rewriter.eraseOp(biasProducer);
+    while (auto reshapeOp = rhs.getDefiningOp<IREE::Flow::TensorReshapeOp>()) {
+      if (!reshapeOp->use_empty()) break;
+      rhs = reshapeOp.getSource();
+      rewriter.eraseOp(reshapeOp);
+    }
   }
 
   // Drop the original weights no load reads any more (they would otherwise be
