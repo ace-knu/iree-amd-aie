@@ -1591,21 +1591,14 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:           arith.truncf
 // CHECK:         iree_tensor_ext.dispatch.tensor.store %[[RELU]], %arg2
 
-// The LHS gets its 1.0 at K index 3 of the one real row, from a zero pad and
-// an elementwise generic: two chained pads with no linalg root of their own
-// do not compile on the CPU backend.
-// CHECK-LABEL: func.func @pad_ones_dispatch_
-// CHECK:         %[[PAD:.+]] = tensor.pad %{{.+}} low[0, 0] high[0, 253]
-// CHECK:         } : tensor<1x3xbf16> to tensor<1x256xbf16>
-// CHECK:         linalg.generic {{.*}} ins(%[[PAD]] : tensor<1x256xbf16>)
-// CHECK:           %[[K:.+]] = linalg.index 1
-// CHECK:           %[[M:.+]] = linalg.index 0
-// CHECK:           arith.cmpi eq, %[[K]], %c3
-// CHECK:           arith.cmpi ult, %[[M]], %c1
-// CHECK:           arith.select
-
+// The LHS gets its 1.0 at K index 3 without a padding dispatch: M stays 1,
+// so the real data is one contiguous run at the start of the padded row, and
+// a constant [1, 256] (1.0 at index 3, bf16 0x3F80) takes it through a
+// flow.tensor.update.
+// CHECK-NOT:   func.func @pad_ones_dispatch_
 // CHECK-LABEL: util.func public @main_fc
-// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_ones_executable_{{[0-9]+}}::@pad_ones_dispatch_{{[0-9]+}}(%arg0)
+// CHECK:         %[[ONES:.+]] = arith.constant dense<"0x000000000000803F0000
+// CHECK:         %[[LPAD:.+]] = flow.tensor.update %arg0, %[[ONES]][%{{.+}}, %{{.+}}] : tensor<1x3xbf16> -> %[[ONES]] as tensor<1x256xbf16>
 // CHECK:         %[[W:.+]] = util.global.load @__bias_folded_const_
 // CHECK:         %[[R:.+]] = flow.dispatch @dispatch_fc::@fc_relu(%[[LPAD]], %[[W]])
 // CHECK-SAME:      : (tensor<1x256xbf16>, tensor<256x256xbf16>) -> tensor<1x256xbf16>

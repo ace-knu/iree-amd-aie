@@ -1029,6 +1029,39 @@ static Value createPaddedConstantGlobal(IRRewriter &rewriter, ModuleOp module,
   return paddedGlobalOp.createLoadOp(loc, rewriter)->getResult(0);
 }
 
+/// Builds the bias-fold LHS without a dispatch when `v` is one contiguous run
+/// of the padded buffer: every dim other than `kDim` is 1 in both shapes (a
+/// GEMV's [1, K] LHS, which keeps M = 1). The result is a constant [1, kPad]
+/// holding 1.0 at K index `k` and 0.0 elsewhere, with `v` written over its
+/// first `k` elements by a `flow.tensor.update`. Returns null when `v` is not
+/// that shape.
+///
+/// The host padding dispatch is not an option there: its pad + ones generic
+/// does not compile on the CPU backend once the outer dim is 1
+/// (`iree-codegen-concretize-pad-result-shape` fails).
+static Value createBiasOnesPadByUpdate(IRRewriter &rewriter, Value v,
+                                       ArrayRef<int64_t> dstShape,
+                                       unsigned kDim) {
+  auto srcType = cast<RankedTensorType>(v.getType());
+  auto elemType = dyn_cast<FloatType>(srcType.getElementType());
+  if (!elemType || !srcType.hasStaticShape()) return {};
+  for (auto [i, srcSize, dstSize] :
+       llvm::enumerate(srcType.getShape(), dstShape)) {
+    if (i != kDim && (srcSize != 1 || dstSize != 1)) return {};
+  }
+  int64_t k = srcType.getDimSize(kDim);
+  auto dstType = RankedTensorType::get(dstShape, elemType);
+  const llvm::fltSemantics &sem = elemType.getFloatSemantics();
+  SmallVector<APFloat> values(dstType.getNumElements(), APFloat::getZero(sem));
+  values[k] = APFloat::getOne(sem);
+  Location loc = v.getLoc();
+  Value base = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(dstType, values));
+  Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  SmallVector<Value> offsets(dstShape.size(), zero);
+  return rewriter.create<IREE::Flow::TensorUpdateOp>(loc, base, offsets, v);
+}
+
 /// Pads `v` up to `dstShape`, preferring to fold the padding into a new
 /// constant when `v` is a weight (see `createPaddedConstantGlobal`) and
 /// falling back to a host dispatch for real runtime values.
@@ -1697,6 +1730,11 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
         rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
         biasAttr ? std::optional<unsigned>(lhsKPos) : std::nullopt,
         hostAffinity);
+    if (!lhsPadded && biasAttr) {
+      rewriter.setInsertionPoint(dispatch);
+      lhsPadded = createBiasOnesPadByUpdate(
+          rewriter, dispatch.getArguments()[lhsArgNo], lhsPad, lhsKPos);
+    }
     if (!lhsPadded) {
       rewriter.setInsertionPoint(dispatch);
       lhsPadded =
