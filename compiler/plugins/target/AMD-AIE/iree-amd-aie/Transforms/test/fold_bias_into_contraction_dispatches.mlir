@@ -3,7 +3,7 @@
 // FC layer (ONNX Gemm, transpose_b weight [N, K]) with a fused bias + ReLU +
 // truncf: the bias moves into K. The executable loses the bias binding and
 // `addf` and reads [1, K+1] x [N, K+1]; the host pads the LHS with a ones
-// column (pad value 1) and loads a new weight global whose last K column is
+// column (a splat of 1 the pad dispatch copies the LHS into) and loads a new weight global whose last K column is
 // the bias, rounded to bf16. The original weight global is dropped.
 
 // CHECK-LABEL: util.global private @__bias_folded_weight_1
@@ -20,11 +20,11 @@
 // CHECK:           arith.cmpf
 // CHECK:           arith.truncf
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 1]
-// CHECK:           tensor.yield %[[ONE]]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1, 2], strides = [1, 1] : tensor<1x2xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1x3xbf16>>
 // CHECK-LABEL: util.func public @main
-// CHECK:         %[[LHS:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<1x2xbf16>) -> tensor<1x3xbf16>
+// CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
+// CHECK:         %[[ONES:.+]] = flow.tensor.splat %[[ONE]] : tensor<1x3xbf16> attributes {stream.affinity = #hal.device.affinity<@cpu>}
+// CHECK:         %[[LHS:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %[[ONES]]) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<1x2xbf16>, tensor<1x3xbf16>) -> %[[ONES]]
 // CHECK:         %[[W:.+]] = util.global.load immutable @__bias_folded_weight_1 : tensor<2x3xbf16>
 // CHECK:         flow.dispatch @dispatch_0::@fc(%[[LHS]], %[[W]]) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<1x3xbf16>, tensor<2x3xbf16>) -> tensor<1x2xbf16>
 module {

@@ -21,16 +21,16 @@
 // The host pad dispatch pads with the fill value, the crop dispatch slices the
 // 14 valid rows back.
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         %[[NINF:.+]] = arith.constant 0xFF800000 : f32
-// CHECK:         tensor.pad %{{.+}} low[0, 0, 0] high[4, 0, 0]
-// CHECK:           tensor.yield %[[NINF]] : f32
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0, 0], sizes = [28, 28, 512], strides = [1, 1, 1] : tensor<28x28x512xf32> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<32x28x512xf32>>
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0, 0] [14, 14, 512] [1, 1, 1]
 
 // CHECK-LABEL: util.func public @main
-// CHECK:         %[[PAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0)
+// CHECK:         %[[NINF:.+]] = arith.constant 0xFF800000 : f32
+// CHECK:         %[[SPLAT:.+]] = flow.tensor.splat %[[NINF]] : tensor<32x28x512xf32>
+// CHECK:         %[[PAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %[[SPLAT]])
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@cpu>}
-// CHECK-SAME:      : (tensor<28x28x512xf32>) -> tensor<32x28x512xf32>
+// CHECK-SAME:      : (tensor<28x28x512xf32>, tensor<32x28x512xf32>) -> %{{.+}}
 // CHECK:         %[[OUT:.+]] = flow.dispatch @dispatch_0::@pool4(%[[PAD]])
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@npu>}
 // CHECK-SAME:      : (tensor<32x28x512xf32>) -> tensor<16x14x512xf32>

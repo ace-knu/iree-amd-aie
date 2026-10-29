@@ -12,20 +12,20 @@
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<256x64xf32>>
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<256x32xbf16>, tensor<32x64xbf16>) outs(%{{.+}} : tensor<256x64xf32>)
 
-// The padding dispatches zero-pad each operand to K=32 (strided insert via
-// tensor.pad inside a dispatch).
+// The padding dispatches copy each operand into the low corner of a zero
+// splat of the K=32 shape (a strided store inside a dispatch).
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [256, 27], strides = [1, 1] : tensor<256x27xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<256x32xbf16>>
 // CHECK:       flow.executable private @pad_executable_1
-// CHECK:         tensor.pad
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [27, 64], strides = [1, 1] : tensor<27x64xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<32x64xbf16>>
 
 // CHECK-LABEL: util.func public @main
-// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0)
+// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %{{[a-z0-9_]+}})
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@cpu>}
-// CHECK-SAME:      : (tensor<256x27xbf16>) -> tensor<256x32xbf16>
-// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_1::@pad_dispatch_1(%arg1)
+// CHECK-SAME:      : (tensor<256x27xbf16>, tensor<256x32xbf16>) -> %{{.+}}
+// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_1::@pad_dispatch_1(%arg1, %{{[a-z0-9_]+}})
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@cpu>}
-// CHECK-SAME:      : (tensor<27x64xbf16>) -> tensor<32x64xbf16>
+// CHECK-SAME:      : (tensor<27x64xbf16>, tensor<32x64xbf16>) -> %{{.+}}
 // CHECK:         flow.dispatch @dispatch_2::@matmul(%[[LPAD]], %[[RPAD]])
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@npu>}
 // CHECK-SAME:      : (tensor<256x32xbf16>, tensor<32x64xbf16>) -> tensor<256x64xf32>
@@ -75,15 +75,15 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // The LHS is zero-padded (M 196 -> 224); the RHS is untouched; the padded
 // result is cropped back with an extract_slice dispatch on the host.
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[28, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : tensor<196x64xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<224x64xbf16>>
 // CHECK-NOT:   flow.executable private @pad_executable_1
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [196, 128] [1, 1]
 
 // CHECK-LABEL: util.func public @main_m
-// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0)
+// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %{{[a-z0-9_]+}})
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@cpu>}
-// CHECK-SAME:      : (tensor<196x64xbf16>) -> tensor<224x64xbf16>
+// CHECK-SAME:      : (tensor<196x64xbf16>, tensor<224x64xbf16>) -> %{{.+}}
 // CHECK:         %[[MMR:.+]] = flow.dispatch @dispatch_m::@matmul_m(%[[LPAD]], %arg1)
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@npu>}
 // CHECK-SAME:      : (tensor<224x64xbf16>, tensor<64x128xbf16>) -> tensor<224x128xf32>
@@ -129,7 +129,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<208x128xf32>>
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<208x64xf32>, tensor<64x128xf32>) outs(%{{.+}} : tensor<208x128xf32>)
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[12, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : tensor<196x64xf32> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<208x64xf32>>
 // CHECK-NOT:   flow.executable private @pad_executable_1
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [196, 128] [1, 1]
@@ -175,7 +175,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<208x128xf32>>
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<208x64xf32>, tensor<64x128xf32>) outs(%{{.+}} : tensor<208x128xf32>)
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[12, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : tensor<196x64xf32> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<208x64xf32>>
 // CHECK-NOT:   flow.executable private @pad_executable_1
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [196, 128] [1, 1]
@@ -227,14 +227,14 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 
 // Only the RHS is zero-padded (N 200 -> 256); the result is cropped back on N.
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 56]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [64, 200], strides = [1, 1] : tensor<64x200xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<64x256xbf16>>
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [256, 200] [1, 1]
 
 // CHECK-LABEL: util.func public @main_n
-// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg1)
+// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg1, %{{[a-z0-9_]+}})
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@cpu>}
-// CHECK-SAME:      : (tensor<64x200xbf16>) -> tensor<64x256xbf16>
+// CHECK-SAME:      : (tensor<64x200xbf16>, tensor<64x256xbf16>) -> %{{.+}}
 // CHECK:         %[[MMR:.+]] = flow.dispatch @dispatch_n::@matmul_n(%arg0, %[[RPAD]])
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@npu>}
 // CHECK-SAME:      : (tensor<256x64xbf16>, tensor<64x256xbf16>) -> tensor<256x256xf32>
@@ -282,17 +282,17 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<224x64xbf16>, tensor<64x256xbf16>) outs(%{{.+}} : tensor<224x256xf32>)
 
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[28, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [196, 64], strides = [1, 1] : tensor<196x64xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<224x64xbf16>>
 // CHECK:       flow.executable private @pad_executable_1
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 56]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [64, 200], strides = [1, 1] : tensor<64x200xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<64x256xbf16>>
 // CHECK:       flow.executable private @crop_executable_2
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [196, 200] [1, 1]
 
 // CHECK-LABEL: util.func public @main_mn
-// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0)
-// CHECK-SAME:      : (tensor<196x64xbf16>) -> tensor<224x64xbf16>
-// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_1::@pad_dispatch_1(%arg1)
-// CHECK-SAME:      : (tensor<64x200xbf16>) -> tensor<64x256xbf16>
+// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %{{[a-z0-9_]+}})
+// CHECK-SAME:      : (tensor<196x64xbf16>, tensor<224x64xbf16>) -> %{{.+}}
+// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_1::@pad_dispatch_1(%arg1, %{{[a-z0-9_]+}})
+// CHECK-SAME:      : (tensor<64x200xbf16>, tensor<64x256xbf16>) -> %{{.+}}
 // CHECK:         %[[MMR:.+]] = flow.dispatch @dispatch_mn::@matmul_mn(%[[LPAD]], %[[RPAD]])
 // CHECK-SAME:      : (tensor<224x64xbf16>, tensor<64x256xbf16>) -> tensor<224x256xf32>
 // CHECK:         flow.dispatch @crop_executable_2::@crop_dispatch_2(%[[MMR]])
@@ -382,14 +382,14 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // Only the RHS is zero-padded (N 200 -> 256 on its dim 0); the result is cropped
 // back on N.
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[56, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [200, 64], strides = [1, 1] : tensor<200x64xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<256x64xbf16>>
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [32, 200] [1, 1]
 
 // CHECK-LABEL: util.func public @main_tb
-// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg1)
+// CHECK:         %[[RPAD:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg1, %{{[a-z0-9_]+}})
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@cpu>}
-// CHECK-SAME:      : (tensor<200x64xbf16>) -> tensor<256x64xbf16>
+// CHECK-SAME:      : (tensor<200x64xbf16>, tensor<256x64xbf16>) -> %{{.+}}
 // CHECK:         %[[MMR:.+]] = flow.dispatch @dispatch_tb::@matmul_tb(%arg0, %[[RPAD]])
 // CHECK-SAME:      {stream.affinity = #hal.device.affinity<@npu>}
 // CHECK-SAME:      : (tensor<32x64xbf16>, tensor<256x64xbf16>) -> tensor<32x256xf32>
@@ -520,13 +520,13 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x4096xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[24, 0]
-// CHECK:           tensor.yield %[[ZERO]] : bf16
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1000, 4096], strides = [1, 1] : tensor<1000x4096xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1024x4096xbf16>>
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 1000] [1, 1]
 // CHECK-LABEL: util.func public @main_gemv
-// CHECK:         %[[W:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg1)
+// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
+// CHECK:         %[[SPLAT:.+]] = flow.tensor.splat %[[ZERO]] : tensor<1024x4096xbf16>
+// CHECK:         %[[W:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg1, %[[SPLAT]])
 // CHECK:         %[[R:.+]] = flow.dispatch @dispatch_gemv::@matmul_gemv(%arg0, %[[W]])
 // CHECK-SAME:      : (tensor<1x4096xbf16>, tensor<1024x4096xbf16>) -> tensor<1x1024xf32>
 // CHECK:         flow.dispatch @crop_executable_1::@crop_dispatch_1(%[[R]])
@@ -570,16 +570,16 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x128xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 28]
-// CHECK:           tensor.yield %[[ZERO]] : bf16
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1, 100], strides = [1, 1] : tensor<1x100xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1x128xbf16>>
 // CHECK:       flow.executable private @pad_executable_1
-// CHECK:         %[[ZERO1:.+]] = arith.constant 0.000000e+00 : bf16
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[24, 28]
-// CHECK:           tensor.yield %[[ZERO1]] : bf16
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1000, 100], strides = [1, 1] : tensor<1000x100xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1024x128xbf16>>
 // CHECK:       flow.executable private @crop_executable_2
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 1000] [1, 1]
 // CHECK-LABEL: util.func public @main_gemv_k
+// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
+// CHECK:         flow.tensor.splat %[[ZERO]] : tensor<1x128xbf16>
+// CHECK:         %[[ZERO1:.+]] = arith.constant 0.000000e+00 : bf16
+// CHECK:         flow.tensor.splat %[[ZERO1]] : tensor<1024x128xbf16>
 // CHECK:         flow.dispatch @dispatch_gemv_k::@matmul_gemv_k
 // CHECK-SAME:      : (tensor<1x128xbf16>, tensor<1024x128xbf16>) -> tensor<1x1024xf32>
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
@@ -620,9 +620,9 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x128xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 32]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1, 96], strides = [1, 1] : tensor<1x96xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1x128xbf16>>
 // CHECK:       flow.executable private @pad_executable_1
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 32]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1024, 96], strides = [1, 1] : tensor<1024x96xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1024x128xbf16>>
 // CHECK-NOT:   crop_executable
 // CHECK-LABEL: util.func public @main_gemv_k_matvec
 // CHECK:         flow.dispatch @dispatch_gemv_k_matvec::@matmul_gemv_k_matvec
@@ -665,7 +665,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x4096xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[30, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [2, 4096], strides = [1, 1] : tensor<2x4096xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<32x4096xbf16>>
 // CHECK:       flow.executable private @crop_executable_2
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [2, 1000] [1, 1]
 // CHECK-LABEL: util.func public @main_m2
@@ -707,7 +707,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<256x1024xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x1024xf32>>
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[31, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1, 256], strides = [1, 1] : tensor<1x256xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<32x256xbf16>>
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 1000] [1, 1]
 // CHECK-LABEL: util.func public @main_m1_kn
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
@@ -824,7 +824,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2304x4096xbf16>>
 // CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x2304xf32>>
 // CHECK:       flow.executable private @pad_executable_0
-// CHECK:         tensor.pad %{{.+}} low[0, 0] high[160, 0]
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [2144, 4096], strides = [1, 1] : tensor<2144x4096xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<2304x4096xbf16>>
 // CHECK:       flow.executable private @crop_executable_1
 // CHECK:         tensor.extract_slice %{{.+}}[0, 0] [1, 2144] [1, 1]
 // CHECK-LABEL: util.func public @main_gemv_2144

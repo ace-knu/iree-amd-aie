@@ -54,7 +54,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
 
@@ -340,11 +339,15 @@ static int firstFreeHelperIndex(ModuleOp module) {
 }
 
 /// Creates a `flow.executable` + `flow.dispatch` that zero-pads `v` up to
-/// `dstShape` (high padding via `tensor.pad`), placed on `hostAffinity`. Returns
-/// the padded value, or `v` unchanged if `dstShape` already matches. A dispatch
-/// (unlike `flow.tensor.update`, which only copies contiguous outer-dim
-/// sub-ranges) performs the strided placement required to pad an inner
-/// dimension. `counter` uniquifies the symbol names.
+/// `dstShape` (high padding), placed on `hostAffinity`. Returns the padded
+/// value, or `v` unchanged if `dstShape` already matches. The padded tensor is
+/// a `flow.tensor.splat` of the pad value that the dispatch, tied to it, copies
+/// `v` into, the form IREE itself gives a `tensor.pad` (a dispatch, unlike
+/// `flow.tensor.update`, which only copies contiguous outer-dim sub-ranges,
+/// performs the strided placement required to pad an inner dimension). A
+/// `tensor.pad` inside the dispatch fails CPU codegen when an inner dim grows
+/// by one (`scf.if` result type mismatch). `counter` uniquifies the symbol
+/// names.
 /// `padValue`, when set, is the constant to pad with instead of 0 (the pooling
 /// pass passes its dispatch's init fill value, -inf for max).
 static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
@@ -358,25 +361,26 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
   auto inBinding = IREE::TensorExt::DispatchTensorType::get(
       IREE::TensorExt::TensorAccess::ReadOnly, srcType);
   auto outBinding = IREE::TensorExt::DispatchTensorType::get(
-      IREE::TensorExt::TensorAccess::WriteOnly, dstType);
+      IREE::TensorExt::TensorAccess::ReadWrite, dstType);
   std::string idx = std::to_string(counter++);
 
-  // Worker func: load the full input, high-pad it with zeros, store.
+  // Worker func: load the full input and store it into the low corner of the
+  // pad-value-filled output.
   auto funcOp = func::FuncOp::create(
       loc, "pad_dispatch_" + idx,
       rewriter.getFunctionType({inBinding, outBinding}, {}));
   funcOp.setPublic();
   Block *entry = funcOp.addEntryBlock();
   OpBuilder fb = OpBuilder::atBlockBegin(entry);
-  Type elemType = srcType.getElementType();
-  TypedAttr fillAttr = padValue ? padValue : fb.getZeroAttr(elemType);
-  Value zero = fb.create<arith::ConstantOp>(loc, fillAttr);
   Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
       loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
-  Value padded = tensor::createPadHighOp(dstType, loaded, zero,
-                                         /*nofold=*/false, loc, fb);
+  SmallVector<OpFoldResult> offsets(dstShape.size(), fb.getIndexAttr(0));
+  SmallVector<OpFoldResult> strides(dstShape.size(), fb.getIndexAttr(1));
+  SmallVector<OpFoldResult> sizes;
+  for (int64_t d : srcType.getShape()) sizes.push_back(fb.getIndexAttr(d));
   fb.create<IREE::TensorExt::DispatchTensorStoreOp>(
-      loc, padded, entry->getArgument(1), /*targetDynamicDims=*/ValueRange{});
+      loc, loaded, entry->getArgument(1), /*targetDynamicDims=*/ValueRange{},
+      offsets, sizes, strides);
   fb.create<func::ReturnOp>(loc);
 
   // Executable wrapping the func, with a default workgroup-count region.
@@ -397,11 +401,20 @@ static Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module,
       loc, TypeRange{indexTy, indexTy, indexTy}, /*ordinal_operands=*/ValueRange{});
   wb.create<IREE::Flow::ReturnOp>(loc, countOp.getResults());
 
-  // Host dispatch, pinned to the host device.
+  // Host splat of the pad value and the dispatch writing into it in place,
+  // both pinned to the host device.
+  Type elemType = srcType.getElementType();
+  TypedAttr fillAttr = padValue ? padValue : rewriter.getZeroAttr(elemType);
+  Value padScalar = rewriter.create<arith::ConstantOp>(loc, fillAttr);
+  auto splatOp = rewriter.create<IREE::Flow::TensorSplatOp>(
+      loc, dstType, padScalar, /*result_dims=*/ValueRange{});
+  splatOp->setAttr("stream.affinity", hostAffinity);
   auto dispatchOp = IREE::Flow::DispatchOp::create(
       rewriter, loc, exportOp, /*workload=*/ValueRange{}, TypeRange{dstType},
-      /*result_dims=*/ValueRange{}, /*arguments=*/ValueRange{v},
-      /*argument_dims=*/ValueRange{}, /*tied_operands=*/ArrayAttr{});
+      /*result_dims=*/ValueRange{},
+      /*arguments=*/ValueRange{v, splatOp.getResult()},
+      /*argument_dims=*/ValueRange{},
+      /*tied_operands=*/rewriter.getIndexArrayAttr({1}));
   dispatchOp->setAttr("stream.affinity", hostAffinity);
   return dispatchOp.getResult(0);
 }
