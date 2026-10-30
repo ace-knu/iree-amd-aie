@@ -62,11 +62,11 @@ reference) list the devices used without `--devices`.
 Defaults: `--ukernel all --vectorize off --numeric f32 --pool cpu`. `--pool accel`
 places each pooling dispatch like a contraction, round-robin over the
 accelerators in `--devices` order (with CPU + NPU, all go to the NPU). It works
-but is slower on VGG (CPU + NPU bf16 1.95 s instead of 1.62 s): each pooling
+but is slower on VGG (CPU + NPU bf16 2.04 s instead of 1.71 s): each pooling
 becomes its own dispatch, and its hardware-context and DMA cost exceed the
 pooling itself on the CPU (under 1 ms). A pooling fused with a layout transpose
 (VGG's last one) stays on the CPU. With `--numeric f32`,
-`--ukernel none` compiles faster (VGG 65 s instead of 83 s) and runs the same:
+`--ukernel none` compiles faster (VGG 65 s instead of 88 s) and runs the same:
 f32 matmuls have no ukernel, only their zero fill does, which costs a ukernel
 compile per NPU dispatch without a run-time gain. Fixed groups are always
 passed. A flag that only works around a current gap is marked `# workaround:`;

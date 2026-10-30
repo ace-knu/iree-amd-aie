@@ -4,7 +4,101 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
 - 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S10. S6·S10은 dev 통합 때 삭제)
-- **dev-POOL 통합(2026-10-28) 후 상태는 바로 아래 절을 본다.** 그 다음 절은 3devices 통합(2026-10-25) 때 상태, 0~6절은 10/20 스냅숏이다.
+- **k+1 bias fold 통합(2026-10-30) 후 상태는 바로 아래 절을 본다.** 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+
+## k+1 bias fold 통합 후 상태 (2026-10-30, 브랜치 `k1-fold-integration`)
+
+matmul 뒤 bias add와 ReLU까지를 NPU dispatch 하나에서 하도록, 상수 bias를 reduction 축 K에 접는다(y = x·W + b = [x, 1]·[W; b]). bias가 세 번째 입력으로 남으면 amd-aie backend는 DMA channel이 모자라 실패한다(`no producer DMA channel available`). 원래 브랜치 `origin/feature/k1-fold`, `origin/feature/gecv-k1fold`는 참고만 하고 dev `bdd7d47e` 위에서 다시 설계했다.
+
+### 기준과 원칙
+
+- **pass 역할**: fold는 별도 Flow pass(`AMDAIEFoldBiasIntoContractionDispatches`)로, pad pass 바로 앞에서 K를 K+1로만 늘린다. tile 배수로 맞추는 일은 pad pass가 그대로 한다(fold는 tile 정보를 쓰지 않고, pad pass는 fold를 모른다).
+- **fold는 필수**: bias/elementwise 우회 flag 2개를 지웠다. 접을 수 없는 bias는 이유를 담은 컴파일 오류로 끝낸다(다른 경로로 피하지 않음).
+- **정밀도**: bias는 weight 원소형으로 반올림한다(`--numeric bf16`이면 bf16). NPU bf16 변환이 RTZ인 차이도 받아들인다.
+- **하드웨어 정보**: pad 배수는 dispatch의 target attr, buffer 정렬은 device model, HAL의 sync 생략은 pipeline layout의 binding flag에서 읽는다.
+
+### dev 기준으로 본 변경
+
+#### 1. 추가된 부분
+
+| 영역 | 내용 | 커밋 |
+|---|---|---|
+| fold pass | 두 형태를 찾는다. post-add(FC/Gemm): `fill(0) -> matmul -> generic(addf(mm, bias), ...)`이면 bias binding과 `addf`를 빼고, 할 일이 없어진 consumer는 지운다. accumulator(im2col conv): matmul init이 상수 [N] bias를 M으로 broadcast하는 host dispatch(또는 `util.initializer`가 그 결과를 넣는 global)면 `fill(0)`으로 바꾼다. LHS에는 host pad dispatch로 1 열을, 상수 weight에는 새 global로 bias 행을 붙인다. 파일은 `AMDAIEFoldBiasIntoContractionDispatches.cpp` | `f3079605`, `dd05ed3e` |
+| fold 오류 | 비상수 bias/weight, 여러 caller의 executable, tied 결과, 동적 shape, float가 아닌 operand, bias가 아닌 accumulator(residual 등)는 이유를 담은 오류 | `f3079605`, `433b6f5b`, `7bea15aa` |
+| 상수 형식 | `dense_resource` weight/bias도 상수로 읽는다(fold와 compile-time pad 공통) | `7bea15aa` |
+| GEMV epilogue | GEMV pipeline이 unary elementwise epilogue(ReLU, truncf)를 받는다. `InsertCopyOps`가 epilogue를 contraction 결과 buffer에서 읽게 staging하고, L1 예산에 epilogue 출력을 더한다 | `33a7112e` |
+| pad pass epilogue | unary epilogue가 붙은 matmul도 pad한다(epilogue 출력도 같이 키우고 crop) | `72a730d5` |
+| 공통 판정 | GEMV 선택과 pad pass가 같은 `isUnaryElementwiseEpilogue`, 같은 matvec 판정(`hasGemvMatvecUKernel`)과 K 규칙(`getGemvMatvecKTile`, `getGemvMatvecKPadMultiple`)을 쓴다 | `8df29041`, `28bdc408` |
+| transpose pack 인식 | `isMatmulInDefChain`이 transpose_a/b matmul의 pack을 인식(transpose_b + epilogue의 `linalg.pack needs logic` 해결) | `f4cedbee` |
+| compile-time 상수 pad | pad pass가 상수 operand(weight)를 컴파일 때 0으로 pad해 새 global `__padded_constant_N`으로 만든다(runtime host pad 제거) | `5769144f` |
+| GEMV K 배수 | matvec GEMV의 K를 K ≥ 256이면 256의 배수로 pad해 K tile 256을 쓴다(fold로 K가 25089가 되면 tile 64로 떨어지던 것: FC1 22.2 → 13.95 ms) | `07d117d1` |
+| HAL 읽기 전용 sync 생략 | PDI flatbuffer에 entry point별 `binding_flags`(bit 0 READ_ONLY). amdxdna HAL이 run 뒤 읽기 전용 binding의 device→host sync를 건너뛴다. 옛 vmfb(field 없음)는 전처럼 모두 sync | `3d454250`, `477330d5` |
+| buffer 정렬 | L1/L2 buffer 주소를 upstream mlir-aie처럼 정렬(core 32 B, AIE2P에서 64 B 이상 buffer는 64 B, memtile 4 B) | `33c20094` |
+| channels-last pool | `--iree-amdaie-pooling-channels-last`를 스크립트 graph flag로 항상 켬. NPU 전용 C pad와 halo split은 `acceleratePooling`일 때만 | `05c7f6a3` |
+| 파일 구조 | fold pass를 자체 파일로, pad·pool·fold가 같이 쓰는 helper(target 조회, binding load 추적, host pad dispatch, 상수 읽기, 대체 global 생성, 정리)를 `AMDAIEDispatchRewriteUtils.h/.cpp`로 | `198651de`, `a5835c98` |
+
+#### 2. 원래 브랜치 대비
+
+| 원래 커밋 | 처리 |
+|---|---|
+| K 열 fold, matmul bias fold, 상수 weight pad, transpose_b pack 인식, GEMV epilogue, 공유 executable 거부, device gate, ones 열만 1 | 다시 설계해 반영(위 표). device gate는 dispatch별 affinity로, ones 열은 별도 pad dispatch의 pad 값으로 |
+| GEMV K tile 4-byte 정렬 `8c8365b1`, 동적 shape 제외 `b975a4d7` | 같은 내용으로 반영(`5eb5a583`, `433b6f5b`) |
+| producer grow, N-split, Preprocessing fold pass와 옵션 | 넣지 않음(설계 결정) |
+| whole-buffer init pack `a3c45db4`, ObjFifo guard | 필요 없음: accumulator를 `fill(0)`로 바꾸고 bias L2 buffer가 생기지 않음 |
+| outlining 확장, bufferDepthC 조정 | 필요 없음: program memory overflow 대응이었고 dev는 elementwise를 outline하지 않음. VGG 모든 조합에서 overflow 없음 |
+| 정수 ones 상수 `ea274ad5` | 정수 bias는 오류(float만 fold) |
+
+#### 3. 통합 중에 생긴 문제와 처리
+
+| 문제 | 원인 | 처리 | 커밋 |
+|---|---|---|---|
+| ones 열 pad(K + 1) dispatch가 CPU 컴파일 실패 | dispatch 안 `tensor.pad`의 inner dim이 1 늘면 llvm-cpu tiling이 `scf.if` 타입 불일치. pad가 31이면 통과해 dev에서는 드러나지 않았음 | host pad를 IREE 방식(`flow.tensor.splat` + tied in-place copy dispatch)으로 | `710d6b0e` |
+| f32 GEMV(K tile 172/236) N block ≥ 2 결과 틀림 | buffer 주소 정렬이 없어 `zero_fill` ukernel이 C를 일부 못 지움 | upstream 정렬 규칙 이식 | `33c20094` |
+| compile-time 상수 pad 뒤 NPU가 느려짐(126 → 162 ms) | HAL이 run마다 모든 binding을 device→host로 sync, 큰 상수 weight에서 비례 비용 | 읽기 전용 binding sync 생략(VGG bf16 기본 경로 NPU 142 → 105 ms) | `3d454250` |
+| flag를 지우자 CPU+GPU VGG 0.38 → 0.50 s | bias+ReLU가 contraction에 들어가며 transpose가 NCHW CPU pool dispatch로 옮겨감(pool1 0.5 → 46 ms) | host에서도 channels-last pool | `05c7f6a3` |
+| bf16 GEMV(ukernel 없음) K=8032 컴파일 실패 | K tile이 홀수 약수 251이 되어 `aie.dma_bd` 길이가 4 B 배수가 아님. fold가 K를 홀수로 만들어 더 쉽게 생김 | A/B slice가 4 B 배수인 tile만 고름 | `5eb5a583` |
+| 동적 M dispatch에서 컴파일러 assert | fold와 pad가 정적 shape만 만듦 | fold는 오류, pad는 건너뜀(dev에 있던 crash) | `433b6f5b`, `d9b21218` |
+| 새 field가 `source_locations` 앞에 들어감 | flatbuffer field id가 밀려 옛 runtime이 새 vmfb를 잘못 읽음 | 맨 뒤로 옮기고 길이 검증 | `477330d5` |
+
+#### 4. 지운 것
+
+| 항목 | 이유 | 커밋 |
+|---|---|---|
+| `--iree-dispatch-creation-no-fuse-into-contraction-conv-roots`, `--iree-global-opt-detach-elementwise-through-reshape`(스크립트) | bias/ReLU가 contraction dispatch에 들어와도 fold로 입력 2개를 유지. dedup off flag는 남김(W14) | `38613bbb` |
+
+### 검증 (`f938dd78`)
+
+- ctest amd-aie 232/232(lit: fold 12 케이스, pad·GEMV·insert copy·buffer 할당 케이스 추가). bf16 K=8032 GEMV probe corr 1.0. fold 확인용 FC 모델(`fc_m64`, `fc_cls`) bf16/f32 통과.
+- dev 13 조합 + CPU-only, 모두 top-1 일치(VGG):
+
+| 모델 | dev `bdd7d47e`(flag 있음) | 통합 후(flag 없음) | 정확도 |
+|---|---|---|---|
+| MLP bf16 / f32 | 0.19~0.21 / 0.20 s | 0.19 / 0.20 s | MLP는 bias가 없어 fold 없음 |
+| VGG bf16 | 1.62 s | 1.71 s | corr 0.99998 → 0.99996 |
+| VGG f32 | 31.10 s | 31.64 s | corr 1.0 |
+| VGG CPU+GPU / CPU+NPU+GPU / CPU+GPU+NPU | 0.40 / 13.73 / 17.84 s | 0.37 / 13.90 / 18.21 s | corr 1.0 |
+| VGG `--pool accel` bf16 | 1.95 s | 2.04 s | corr 0.99996 |
+| VGG bf16 `--ukernel none` | — | 6.80 s | corr 0.99999 |
+
+- 같은 브랜치에서 flag 유무만 비교하면 VGG bf16 1.60 → 1.68 s: NPU 113 → 120 ms(K + 1로 다음 32 배수), CPU 44 → 62 ms(LHS host pad 두 번). bf16 컴파일 95 → 109 s.
+
+### 알려진 제한
+
+| 항목 | 내용 |
+|---|---|
+| bias 정밀도 | bias가 weight 원소형으로 반올림된다(bf16이면 유효 8 bit). f32 경로는 그대로 |
+| 접을 수 없는 bias | 비상수 bias, 정수 contraction, 여러 caller가 공유하는 executable, tied 결과, 동적 shape, bias가 아닌 accumulator(residual, split-K 부분합)는 컴파일 오류. 외부 parameter 파일의 weight도 상수가 아니라 오류. VGG·MLP에는 없음 |
+| LHS host pad 두 번 | ones 열(fold)과 tile 배수(pad)가 host dispatch 두 개. 하나로 합치는 세 방식(두 store, insert_slice, index body `tensor.pad`)은 llvm-cpu가 거부. VGG bf16 CPU 약 18 ms |
+| 상수 weight 복제 | fold와 compile-time pad가 상수를 새 global로 다시 만든다. 컴파일 중 메모리가 늘고(FC1 weight가 단계마다 한 벌) bf16 컴파일이 약 14 s 늘었다 |
+| GEMV K pad 낭비 | matvec GEMV K가 256을 조금 넘으면 512까지 pad(최대 약 2배). tile 256 대 64의 trade-off라 측정 없이 바꾸지 않음 |
+
+### 남은 일
+
+- LHS 이중 host pad 합치기(gather 형태 generic 하나, 성능 위험 있음).
+- dispatch creation/fusion을 flag가 아니라 이를 다루는 pass로 다루기(이번에 flag를 지우며 정한 방향).
+- GEMV matvec K pad 규칙 A/B(위 제한).
+- fork(`ace-knu/iree`)의 쓰지 않게 된 option 2개(no-fuse, detach) 정리.
+- pool pad pass 분리: 공용 helper가 `AMDAIEDispatchRewriteUtils`로 나와 이제 파일을 나눌 수 있다(dev-POOL 남은 일).
 
 ## dev-POOL 통합 후 상태 (2026-10-28, 브랜치 `pool-integration`)
 
@@ -36,7 +130,7 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 |---|---|---|
 | GEMV pipeline (dev-POOL) | `tile_pipeline="gemv"`: copy-based, N을 최대 32 core 1-D forall로(core당 출력 2개 이상), K tile은 K의 256 이하 최대 약수(matvec이면 256 또는 64) | `7060d5f3`, `7854b375`, `33b86238` |
 | pool pipeline (dev-POOL) | 2-D max pooling을 spatial x channel core grid로. `--iree-amdaie-pool-core-split`, `--iree-amdaie-pool-columns-policy`(기본 `max`), OH/C pad, halo pre-split | `7060d5f3` |
-| channels-last (dev-POOL) | `--iree-amdaie-pooling-channels-last`: NCHW pooling을 transpose로 감싼 NHWC pooling으로 바꿔 NHWC conv 사이 transpose가 상쇄되게 함(기본 꺼짐) | `7060d5f3` |
+| channels-last (dev-POOL) | `--iree-amdaie-pooling-channels-last`: NCHW pooling을 transpose로 감싼 NHWC pooling으로 바꿔 NHWC conv 사이 transpose가 상쇄되게 함(기본 꺼짐. k+1 fold 후 스크립트에서 항상 켬, `05c7f6a3`) | `7060d5f3` |
 | matvec ukernel | upstream `mv_bf16.cc`를 옮긴 `uKernels/npu4/peano/matvec.cc`(f32 누적, K는 instance 값, `(ptr, offset)` 인자). bf16 GEMV tile을 이 ukernel로 lower | `69a5e8b7` |
 | aie_api 내장 | submodule `third_party/aie_api`(Xilinx/aie_api, MIT), 헤더를 바이너리에 embed하고 ukernel이 `<aie_api/aie.hpp>`나 `aie_kernels/` 헤더를 쓸 때만 꺼내 `-I`로 넘김. `aie_arch.h`, `aie_kernel_utils.h`, `common/zero.h`는 mlir-aie에서 복사 | `286008ec`, `d3486957`, `ab97d20a`, `75ebbebf` |
 | zero_fill ukernel | upstream `common/zero.h`. native vector 배수면 compile-time 커널, 아니면 runtime 길이 커널(정렬을 스스로 맞춤)이라 fill 크기 제한이 없음 | `ab97d20a`, `f0ef9de3` |
@@ -107,7 +201,7 @@ ukernel 이전의 A/B(npu4 CI Performance, i8): 커널 시간이 결과를 좌�
   - GEMV/pool pipeline 선택이 dev의 `TilePassPipeline` enum이 아니라 문자열 override(`amdaie.tile_pipeline`)로 되어 있다.
   - pool column policy가 세 경로(target config, lowering strategy 옵션, preprocessing 옵션)로 전달된다. 같은 값이어야 한다.
   - 실험용 옵션이 일반 옵션으로 노출돼 있다: `--iree-amdaie-pool-core-split`, `--iree-amdaie-pool-columns-policy`(odd/cost/full/max), `--iree-amdaie-gemv-pad-n`, `--iree-amdaie-gemv-n1`, VGG pool로 맞춘 cost model 상수(`PoolColumnCost`). 남길 것을 정한 뒤 정리.
-  - `AMDAIEPadPoolingDispatches`가 `AMDAIEPadContractionDispatches.cpp` 안에 있다. 공용 helper(target 조회, pad/crop executable 생성)를 헤더로 빼야 나눌 수 있다.
+  - `AMDAIEPadPoolingDispatches`가 `AMDAIEPadContractionDispatches.cpp` 안에 있다. 공용 helper(target 조회, pad/crop executable 생성)를 헤더로 빼야 나눌 수 있다. → k+1 fold 통합에서 공용 helper를 `AMDAIEDispatchRewriteUtils`로 뺐다(`198651de`). pool pass 분리만 남음.
 
 ## dev 통합 후 상태 (2026-10-25, 브랜치 `3devices-integration`)
 
@@ -542,9 +636,9 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 | W12 | lead 기본값(0) 유지 → CPU↔GPU 동률은 GPU 소유 | 런타임 선택 | BRIDGE 기록 시점 transient export | 코드 경로 규명 | **없음**(수정 방향만) | **기본** → 통합 후: **해결**(GPU→CPU false, `e3d86485`) | L324, L151 질문 3 |
 | W13 | `-unroll-threshold=0` | 플래그 | ① soft-float 펼침 코드 16 KB 초과 | 규명 | L313(벡터화 후 뺌) | 씀 → 통합 후: dev `-unroll-full-max-count=0`으로 대체 | L146, L314-319 |
 | W14 | dedup off | 플래그 | 정적 offset만 지원하는 `address_patch` | 규명 | **없음**(팀 백엔드 제약) | 씀(VGG) | L298 |
-| W15 | no-fuse-into-contraction | 플래그 | 융합 contraction tile 불가(팀 기록) | 팀 기록뿐 | **없음** | 씀(VGG) | L298 |
+| W15 | no-fuse-into-contraction | 플래그 | 융합 contraction tile 불가(팀 기록) | 팀 기록뿐 | **없음** | 씀(VGG) → k+1 fold 후: **제거**(bias를 K에 fold, `38613bbb`) | L298 |
 | W16 | vectorization off | 플래그 | aievec bf16/f32 미지원 | 규명(10/19 세션1) | **명시 없음**(벡터화 작업 연계 추정) | 씀(VGG) | L298 |
-| W17 | im2col·channels-last·detach | 플래그(레시피) | NPU conv 경로 | 팀 기록 | 없음(레시피) | 씀(VGG) | L298 |
+| W17 | im2col·channels-last·detach | 플래그(레시피) | NPU conv 경로 | 팀 기록 | 없음(레시피) | 씀(VGG) → k+1 fold 후: detach **제거**(`38613bbb`), im2col·channels-last 유지 | L298 |
 | W18 | `--device_lead_allocator=2` | 플래그 | Vulkan map SIGSEGV | 근본 수정됨 | — | 안 씀 | L324 |
 | W19 | `--input_device` 수동 | 플래그 | 자동 배치 전 수단 | — | 없음(비교용) | **기본**(회귀 수동 모드) | L70 |
 | W20 | `--iree-hal-external-resources-mappable=true` | 플래그(F3) | **docs에 이유 없음** | **미규명** | 없음 | **기본** → 통합 후: **제거**(불필요, `e3d86485`) | L57-65 |
@@ -589,3 +683,4 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 | 2026-10-20 | 세션 1 CP1 후·챕터 04 | 소스 변경 없음. 6절 커밋 계획 대응 추가. 명세 알려진 한계(S7 L1, S3·S9 L-fd) 추가. U1~U4 명세(`04_커밋_계획/01_…`) |
 | 2026-10-25 | dev 통합 S9 | "dev 통합 후 상태" 절 추가, 명세 경로를 `docs/specs/`로, 4·5·6절 상태 칸과 N04·N07·N09에 통합 결과를 덧붙임 |
 | 2026-10-28 | dev-POOL 통합 P9 | "dev-POOL 통합 후 상태" 절 추가, ukernel upstream 이전과 unroll 규칙 반영 |
+| 2026-10-30 | k+1 bias fold 통합 Step 7 | "k+1 bias fold 통합 후 상태" 절 추가, W15·W17과 channels-last 행에 결과를 덧붙임 |

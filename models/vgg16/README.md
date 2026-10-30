@@ -44,7 +44,7 @@ against an llvm-cpu reference. From the host:
 Measured on npu4 (default power mode):
 
 ```
-vgg16-12: compile 102.7 s | run 2.28 s (median of 3) | corr 0.99997, maxabs 0.0333, top-1 match
+vgg16-12: compile 108.3 s | run 1.71 s (median of 3) | corr 0.99996, maxabs 0.0479, top-1 match
 ```
 
 Add `--verbose` for per-dispatch times (which dispatch runs on the NPU or the
@@ -64,17 +64,22 @@ appendix for reference.
 | `--iree-amdaie-enable-ukernels=all` | Optional (`--ukernel`, default `all`). Runs bf16 matmuls with the matmul ukernel, the vector path today (VGG bf16 run 8.8 s -> 2.3 s). Element types without a ukernel template fall back to scalar code. |
 | `--iree-amdaie-enable-vectorization-passes=false` | Optional (`--vectorize`, default `off`). Vectorization through aievec is separate work; keep it off for now and use the ukernel for vector code. |
 | `--iree-preprocessing-pass-pipeline=...convert-conv-to-channels-last` | ONNX convs are NCHW; the im2col path expects NHWC. |
-| `--iree-dispatch-creation-no-fuse-into-contraction-conv-roots` | Works around a codegen gap: amd-aie cannot tile a contraction dispatch that has elementwise ops fused into it, so fusion across contraction/conv group boundaries is switched off. The real fix is on the codegen side, not here. |
-| `--iree-global-opt-detach-elementwise-through-reshape` | Detaches the bias add from the conv init through the im2col reshape, so the contraction dispatch has a plain `linalg.fill` init. |
+| `--iree-amdaie-pooling-channels-last` | Runs max pooling in NHWC like the convs, so the transposes around each pool cancel. Without it the CPU pool reads its input through a transpose (VGG pool1 ~0.5 -> 46 ms). |
 | `--iree-flow-enable-executable-deduplication=false` | Deduplicating two convs that differ only in constant-weight offset turns that offset into a runtime push constant, which `amdaie.npu.address_patch` cannot carry (it is static-only). |
 
-The last three are flags of the `ace-knu/iree` fork (see `.gitmodules`); they do
+The last one is a flag of the `ace-knu/iree` fork (see `.gitmodules`); it does
 not exist in upstream IREE.
+
+No flag is needed for the conv/FC bias: the contraction dispatches keep their
+fused bias add and ReLU, and `AMDAIEFoldBiasIntoContractionDispatches` folds
+the constant bias into the reduction dim (y = [x, 1] . [W; b]) so each NPU
+dispatch keeps two inputs. With `--numeric bf16` the folded bias is rounded to
+bf16 like the weight.
 
 ## 5. Known limitations
 
 - Batch size is fixed at 1 by the ONNX file; other batch sizes are untested.
-- The flag list is not a stable interface. Three of the flags exist only in
+- The flag list is not a stable interface. One of the flags exists only in
   the `ace-knu/iree` fork, so nothing in `--help` or in upstream documentation
   leads a reader to this combination; it is written down only here and in
   `scripts/onnx/options.py`. The flags marked `# workaround:` there work around
@@ -118,8 +123,7 @@ build/tools/iree-compile /tmp/vgg.mlir -o /tmp/vgg.vmfb \
   --iree-amdaie-enable-ukernels=all \
   --iree-amdaie-enable-vectorization-passes=false \
   --iree-preprocessing-pass-pipeline='builtin.module(iree-preprocessing-convert-conv-to-channels-last)' \
-  --iree-dispatch-creation-no-fuse-into-contraction-conv-roots \
-  --iree-global-opt-detach-elementwise-through-reshape \
+  --iree-amdaie-pooling-channels-last \
   --iree-flow-enable-executable-deduplication=false
 
 build/tools/iree-run-module --device=amdxdna --device=local-task \
@@ -130,7 +134,7 @@ build/tools/iree-run-module --device=amdxdna --device=local-task \
 The entry function name comes from the ONNX graph name; read it back with
 `grep -oE "func.func @[A-Za-z0-9_]+" /tmp/vgg.mlir | head -1`.
 
-Measured on npu4 (bf16, ukernel all): compile ~100 s, run ~2.3 s, output
+Measured on npu4 (bf16, ukernel all): compile ~110 s, run ~1.7 s, output
 `[1,1000]` correlates 0.9999x with a torch reference and the argmax matches.
 
 ## Appendix B. Check the result by hand
