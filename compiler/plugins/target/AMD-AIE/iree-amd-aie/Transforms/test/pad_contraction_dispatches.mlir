@@ -656,6 +656,51 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 
 // -----
 
+// From K = 256 on, the matvec GEMV K is padded to the full GEMV K tile of 256
+// instead: K=4097 (e.g. after a bias fold) -> 4352, not 4160, since
+// KernelDispatch takes the 256 tile only for a K it divides.
+
+// CHECK-LABEL: func.func @matmul_gemv_k256
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4352xbf16>>
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x4352xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
+// CHECK:       flow.executable private @pad_executable_0
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1, 4097], strides = [1, 1] : tensor<1x4097xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1x4352xbf16>>
+// CHECK:       flow.executable private @pad_executable_1
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %{{.+}}, %{{.+}}, offsets = [0, 0], sizes = [1024, 4097], strides = [1, 1] : tensor<1024x4097xbf16> -> !iree_tensor_ext.dispatch.tensor<readwrite:tensor<1024x4352xbf16>>
+// CHECK-NOT:   crop_executable
+// CHECK-LABEL: util.func public @main_gemv_k256
+// CHECK:         flow.dispatch @dispatch_gemv_k256::@matmul_gemv_k256
+// CHECK-SAME:      : (tensor<1x4352xbf16>, tensor<1024x4352xbf16>) -> tensor<1x1024xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "all"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_gemv_k256 {
+    flow.executable.export public @matmul_gemv_k256 workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_gemv_k256(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4097xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x4097xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [1, 4097], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x4097xbf16>> -> tensor<1x4097xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [1024, 4097], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1024x4097xbf16>> -> tensor<1024x4097xbf16>
+        %2 = tensor.empty() : tensor<1x1024xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<1x1024xf32>) -> tensor<1x1024xf32>
+        %4 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>] ins(%0, %1 : tensor<1x4097xbf16>, tensor<1024x4097xbf16>) outs(%3 : tensor<1x1024xf32>) -> tensor<1x1024xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [1, 1024], strides = [1, 1] : tensor<1x1024xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x1024xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_gemv_k256(%arg0: tensor<1x4097xbf16>, %arg1: tensor<1024x4097xbf16>) -> tensor<1x1024xf32> {
+    %0 = flow.dispatch @dispatch_gemv_k256::@matmul_gemv_k256(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<1x4097xbf16>, tensor<1024x4097xbf16>) -> tensor<1x1024xf32>
+    util.return %0 : tensor<1x1024xf32>
+  }
+}
+
+// -----
+
 // M=2 is not routed to the GEMV pipeline (only M == 1 is, see isGemvShape),
 // so it is padded to the pack-peel multiples like any other matmul: M 2 -> 32
 // with a crop back to [2, 1000], and N 1000 -> 1024.

@@ -109,11 +109,12 @@ static IREE::HAL::ExecutableTargetAttr getDispatchTarget(
 /// has its own multiples: M is left untiled, N is spread over every core in
 /// whole multiples of `kGemvNPerCoreMultiple` outputs when the target allows
 /// it (`gemv_pad_n`), and K is a multiple of the matvec ukernel's vector when
-/// the tile is lowered to it. Returns nullopt if `target` is not a recognized
-/// amd-aie target.
+/// the tile is lowered to it, or of the full GEMV K tile (`kGemvKTile`) once K
+/// reaches it: KernelDispatch picks that tile only for a K it divides. Returns
+/// nullopt if `target` is not a recognized amd-aie target.
 static std::optional<PaddingMultiples> getPaddingMultiples(
-    IREE::HAL::ExecutableTargetAttr target, int64_t m, Type lhsElemType,
-    Type rhsElemType, Type accElemType, bool transposeB) {
+    IREE::HAL::ExecutableTargetAttr target, int64_t m, int64_t k,
+    Type lhsElemType, Type rhsElemType, Type accElemType, bool transposeB) {
   std::optional<AMDAIEDevice> device = getConfigAMDAIEDevice(target);
   std::optional<int64_t> numRows = getConfigNumRows(target);
   std::optional<int64_t> numCols = getConfigNumColumns(target);
@@ -129,7 +130,7 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
         /*n=*/getConfigGemvPadN(target)
             ? *numRows * *numCols * kGemvNPerCoreMultiple
             : 1,
-        /*k=*/useMatvec ? kMatvecUKernelK
+        /*k=*/useMatvec ? (k >= kGemvKTile ? kGemvKTile : kMatvecUKernelK)
                         : getPackPeelReductionTile(/*kPackScaleL1=*/1)};
   }
   AMDAIEDeviceModel deviceModel = getDeviceModel(*device);
@@ -573,7 +574,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
             .getElementType();
 
     std::optional<PaddingMultiples> mult = getPaddingMultiples(
-        target, m, lhsType.getElementType(), rhsType.getElementType(),
+        target, m, k, lhsType.getElementType(), rhsType.getElementType(),
         outElemType, /*transposeB=*/rhsNPos < rhsKPos);
     if (!mult) continue;
 
