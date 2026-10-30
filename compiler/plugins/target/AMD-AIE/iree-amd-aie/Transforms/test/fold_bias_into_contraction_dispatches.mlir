@@ -157,6 +157,47 @@ module {
 
 // -----
 
+// A dynamic M (e.g. batch) cannot be folded: the ones column and the K+1 LHS
+// are built with static shapes.
+module {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_0 {
+    flow.executable.export public @fc_dynamic_m workgroups(%arg0: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(%arg0)
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @fc_dynamic_m(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x2xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2xf32>>, %arg3: index, %arg4: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %m = iree_tensor_ext.dispatch.workload.ordinal %arg3, 0 : index
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [%m, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x2xf32>>{%m} -> tensor<?x2xf32>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>> -> tensor<2x2xf32>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0], sizes = [2], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2xf32>> -> tensor<2xf32>
+        %3 = tensor.empty(%m) : tensor<?x2xf32>
+        %4 = linalg.fill ins(%cst : f32) outs(%3 : tensor<?x2xf32>) -> tensor<?x2xf32>
+        %5 = linalg.matmul ins(%0, %1 : tensor<?x2xf32>, tensor<2x2xf32>) outs(%4 : tensor<?x2xf32>) -> tensor<?x2xf32>
+        %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%5, %2 : tensor<?x2xf32>, tensor<2xf32>) outs(%3 : tensor<?x2xf32>) {
+        ^bb0(%in: f32, %in_0: f32, %out: f32):
+          %7 = arith.addf %in, %in_0 : f32
+          linalg.yield %7 : f32
+        } -> tensor<?x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %6, %arg4, offsets = [0, 0], sizes = [%m, 2], strides = [1, 1] : tensor<?x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x2xf32>>{%m}
+        return
+      }
+    }
+  }
+  util.func public @main(%arg0: tensor<?x2xf32>, %m: index) -> tensor<?x2xf32> {
+    %w = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
+    %b = arith.constant dense<[5.0, 6.0]> : tensor<2xf32>
+    // expected-error @+1 {{cannot fold the bias of this NPU contraction dispatch into K: the dispatch has dynamically shaped operands or results}}
+    %0 = flow.dispatch @dispatch_0::@fc_dynamic_m[%m](%arg0, %w, %b, %m) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<?x2xf32>{%m}, tensor<2x2xf32>, tensor<2xf32>, index) -> tensor<?x2xf32>{%m}
+    util.return %0 : tensor<?x2xf32>
+  }
+}
+
+// -----
+
 // im2col convolution: the matmul accumulates onto a host dispatch that
 // broadcasts a constant [N] bias over M. The matmul starts from fill(0)
 // instead, the bias becomes the weight's last K row (the weight read through a

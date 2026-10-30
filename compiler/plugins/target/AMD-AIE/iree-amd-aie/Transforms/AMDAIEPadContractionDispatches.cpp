@@ -1314,6 +1314,15 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
                        return dispatch.getTiedResultOperandIndex(r).has_value();
                      }))
       return fail("the dispatch has tied results");
+    // The ones column, the K+1 LHS and the new weight are built with static
+    // shapes.
+    auto isStatic = [](Type t) {
+      auto shaped = dyn_cast<ShapedType>(t);
+      return !shaped || shaped.hasStaticShape();
+    };
+    if (!llvm::all_of(dispatch.getOperandTypes(), isStatic) ||
+        !llvm::all_of(dispatch.getResultTypes(), isStatic))
+      return fail("the dispatch has dynamically shaped operands or results");
     unsigned lhsArgNo = info->lhsArg.getArgNumber();
     unsigned rhsArgNo = info->rhsArg.getArgNumber();
     unsigned biasArgNo = info->biasArg.getArgNumber();
