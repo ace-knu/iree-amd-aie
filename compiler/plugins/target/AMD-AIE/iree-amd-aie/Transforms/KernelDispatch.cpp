@@ -18,6 +18,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include <functional>
+#include <numeric>
 
 #define DEBUG_TYPE "kernel-dispatch"
 
@@ -671,10 +672,17 @@ static LogicalResult setRootConfigForGemvPipeline(
                          /*transposeB=*/true);
   // The matvec ukernel takes a K tile of 256 or 64: its stack at 128 and 192
   // (1024 and 1088 bytes) leaves no room for the core's own in the 1024-byte
-  // default stack.
+  // default stack. Otherwise the tile also keeps the per-core A/B slices'
+  // byte length a multiple of 4 (`aie.dma_bd`'s transfer-length constraint):
+  // a bf16 K = 8032 = 2^5 * 251 would pick the odd factor 251.
+  auto alignElems = [](int64_t nBytes) {
+    return 4 / std::gcd<int64_t>(nBytes, 4);
+  };
+  int64_t kAlign =
+      std::lcm<int64_t>(alignElems(nBytesLhs), alignElems(nBytesRhs));
   int64_t kTile =
       useMatvec ? (K % kGemvKTile == 0 ? kGemvKTile : kMatvecUKernelK)
-                : findLargestFactor(K, kGemvKTile);
+                : findLargestFactor(K, kGemvKTile, kAlign);
   // Per-core N tile and L0 N block from `chooseGemvNTiling`. The core memory
   // budget leaves the core's stack out, which the buffer allocation adds back
   // (K=4000 bf16 once picked n1 = 64 at 65512 B and failed at 66536 > 65536).
