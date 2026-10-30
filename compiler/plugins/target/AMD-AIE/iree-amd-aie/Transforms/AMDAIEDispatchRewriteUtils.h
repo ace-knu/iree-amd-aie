@@ -86,6 +86,15 @@ Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
 /// value is only reshaped). Sets `global` to that global if there is one.
 DenseElementsAttr getConstantValue(Value v, IREE::Util::GlobalOp *global);
 
+/// Creates a private immutable global `name` holding `value`, which replaces
+/// the constant read from `source` (if any): the new global takes its default
+/// affinity, and `source` is added to `replacedGlobals` for
+/// `eraseDeadGlobals`. Returns an immutable load of the new global.
+Value createReplacementConstant(
+    IRRewriter &rewriter, ModuleOp module, Location loc, StringRef name,
+    DenseElementsAttr value, IREE::Util::GlobalOp source,
+    SmallVectorImpl<IREE::Util::GlobalOp> &replacedGlobals);
+
 /// Erases `v`'s producer chain of reshapes, global loads and constants as far
 /// as nothing else reads it.
 void eraseDeadProducers(IRRewriter &rewriter, Value v);

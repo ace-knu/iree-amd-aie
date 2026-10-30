@@ -378,21 +378,10 @@ static Value createPaddedConstant(
   }
   DenseElementsAttr padded = padWithZeros(attr, dstShape);
   if (!padded) return {};
-  OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
-  auto paddedGlobal = IREE::Util::GlobalOp::create(
-      moduleBuilder, v.getLoc(),
-      "__padded_constant_" + std::to_string(counter++), /*isMutable=*/false,
-      padded.getType(), std::optional<TypedAttr>(padded));
-  paddedGlobal.setPrivate();
-  if (global) {
-    if (Attribute affinity = global->getAttr("stream.affinity.default"))
-      paddedGlobal->setAttr("stream.affinity.default", affinity);
-    replacedGlobals.push_back(global);
-  }
-  auto load = cast<IREE::Util::GlobalLoadOp>(
-      paddedGlobal.createLoadOp(v.getLoc(), rewriter).getOperation());
-  load.setIsImmutable(true);
-  return load.getResult();
+  return createReplacementConstant(
+      rewriter, module, v.getLoc(),
+      "__padded_constant_" + std::to_string(counter++), padded, global,
+      replacedGlobals);
 }
 
 class AMDAIEPadContractionDispatchesPass

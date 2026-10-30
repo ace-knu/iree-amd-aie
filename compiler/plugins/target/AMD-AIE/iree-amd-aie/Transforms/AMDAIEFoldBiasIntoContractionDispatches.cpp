@@ -416,24 +416,12 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
     Value lhsFolded =
         createPaddingDispatch(rewriter, module, lhs, lhsShape, hostAffinity,
                               counter, rewriter.getFloatAttr(lhsElemType, 1.0));
-    OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
-    auto foldedGlobal = IREE::Util::GlobalOp::create(
-        moduleBuilder, dispatch.getLoc(),
-        "__bias_folded_weight_" + std::to_string(counter++),
-        /*isMutable=*/false, foldedType, std::optional<TypedAttr>(foldedAttr));
-    foldedGlobal.setPrivate();
-    if (weightGlobal) {
-      if (Attribute affinity = weightGlobal->getAttr("stream.affinity.default"))
-        foldedGlobal->setAttr("stream.affinity.default", affinity);
-      replacedGlobals.push_back(weightGlobal);
-    }
-    auto rhsFolded = cast<IREE::Util::GlobalLoadOp>(
-        foldedGlobal.createLoadOp(dispatch.getLoc(), rewriter).getOperation());
-    rhsFolded.setIsImmutable(true);
+    Value rhsFolded = createReplacementConstant(
+        rewriter, module, dispatch.getLoc(),
+        "__bias_folded_weight_" + std::to_string(counter++), foldedAttr,
+        weightGlobal, replacedGlobals);
     dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsFolded);
-    dispatch.getArgumentsMutable()
-        .slice(rhsArgNo, 1)
-        .assign(rhsFolded.getResult());
+    dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsFolded);
     dispatch.getArgumentsMutable().erase(biasArgNo);
     // The accumulator's broadcast dispatch (or global load) has no other use,
     // nor the old weight and the reshapes it was read through.

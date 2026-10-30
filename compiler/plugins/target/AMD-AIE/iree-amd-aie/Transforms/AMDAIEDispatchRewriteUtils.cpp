@@ -204,6 +204,26 @@ DenseElementsAttr getConstantValue(Value v, IREE::Util::GlobalOp *global) {
   return attr ? attr.reshape(type) : DenseElementsAttr();
 }
 
+Value createReplacementConstant(
+    IRRewriter &rewriter, ModuleOp module, Location loc, StringRef name,
+    DenseElementsAttr value, IREE::Util::GlobalOp source,
+    SmallVectorImpl<IREE::Util::GlobalOp> &replacedGlobals) {
+  OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
+  auto global = IREE::Util::GlobalOp::create(
+      moduleBuilder, loc, name, /*isMutable=*/false, value.getType(),
+      std::optional<TypedAttr>(value));
+  global.setPrivate();
+  if (source) {
+    if (Attribute affinity = source->getAttr("stream.affinity.default"))
+      global->setAttr("stream.affinity.default", affinity);
+    replacedGlobals.push_back(source);
+  }
+  auto load = cast<IREE::Util::GlobalLoadOp>(
+      global.createLoadOp(loc, rewriter).getOperation());
+  load.setIsImmutable(true);
+  return load.getResult();
+}
+
 void eraseDeadProducers(IRRewriter &rewriter, Value v) {
   while (Operation *op = v.getDefiningOp()) {
     if (!op->use_empty() ||
