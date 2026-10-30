@@ -82,8 +82,10 @@ Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
 
 /// Returns the dense value of `v` when it is a compile-time constant: an
 /// `arith.constant` or a load of an immutable `util.global` with a dense
-/// initial value, possibly through `flow.tensor.reshape`s (row-major, so the
-/// value is only reshaped). Sets `global` to that global if there is one.
+/// initial value (inline or `dense_resource`), possibly through
+/// `flow.tensor.reshape`s (row-major, so the value is only reshaped). Sets
+/// `global` to that global if there is one. A weight read from an external
+/// parameter archive is not a compile-time constant here.
 DenseElementsAttr getConstantValue(Value v, IREE::Util::GlobalOp *global);
 
 /// Creates a private immutable global `name` holding `value`, which replaces

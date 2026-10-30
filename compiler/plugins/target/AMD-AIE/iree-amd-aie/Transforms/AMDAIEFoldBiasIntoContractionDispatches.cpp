@@ -388,8 +388,9 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
                                      : getBroadcastBias(biasOperand, module);
     if (!biasAttr || !isa<FloatType>(biasAttr.getElementType()))
       return fail(info->consumer ? "the bias is not a float constant"
-                                 : "the accumulator is not a broadcast of a "
-                                   "float constant bias");
+                                 : "its accumulator input is not a broadcast "
+                                   "of a float constant bias (a residual or "
+                                   "partial sum cannot be folded)");
 
     SmallVector<AffineMap> maps = info->matmul.getIndexingMapsArray();
     unsigned lhsKPos = operandDimForLoop(maps[0], /*K=*/2);

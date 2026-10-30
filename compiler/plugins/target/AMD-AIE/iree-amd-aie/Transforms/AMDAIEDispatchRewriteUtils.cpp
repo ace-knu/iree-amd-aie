@@ -10,6 +10,7 @@
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 
 namespace mlir::iree_compiler::AMDAIE {
 
@@ -184,6 +185,20 @@ Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
   return dispatchOp.getResult(0);
 }
 
+/// Returns `attr` as a DenseElementsAttr: as is, or the blob of a
+/// `dense_resource` (as an ONNX import stores large weights). Null for any
+/// other attr or a resource without its data (elided).
+static DenseElementsAttr toDenseElements(Attribute attr) {
+  if (auto dense = dyn_cast_if_present<DenseElementsAttr>(attr)) return dense;
+  auto resource = dyn_cast_if_present<DenseResourceElementsAttr>(attr);
+  if (!resource) return {};
+  AsmResourceBlob *blob = resource.getRawHandle().getBlob();
+  if (!blob) return {};
+  ArrayRef<char> data = blob->getData();
+  if (!DenseElementsAttr::isValidRawBuffer(resource.getType(), data)) return {};
+  return DenseElementsAttr::getFromRawBuffer(resource.getType(), data);
+}
+
 DenseElementsAttr getConstantValue(Value v, IREE::Util::GlobalOp *global) {
   auto type = dyn_cast<RankedTensorType>(v.getType());
   if (!type || !type.hasStaticShape()) return {};
@@ -192,14 +207,14 @@ DenseElementsAttr getConstantValue(Value v, IREE::Util::GlobalOp *global) {
     root = reshapeOp.getSource();
   DenseElementsAttr attr;
   if (auto cstOp = root.getDefiningOp<arith::ConstantOp>()) {
-    attr = dyn_cast<DenseElementsAttr>(cstOp.getValue());
+    attr = toDenseElements(cstOp.getValue());
   } else if (auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>()) {
     if (!loadOp.getIsImmutable()) return {};
     auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
         loadOp, loadOp.getGlobalAttr());
     if (!globalOp) return {};
     if (global) *global = globalOp;
-    attr = dyn_cast_or_null<DenseElementsAttr>(globalOp.getInitialValueAttr());
+    attr = toDenseElements(globalOp.getInitialValueAttr());
   }
   return attr ? attr.reshape(type) : DenseElementsAttr();
 }

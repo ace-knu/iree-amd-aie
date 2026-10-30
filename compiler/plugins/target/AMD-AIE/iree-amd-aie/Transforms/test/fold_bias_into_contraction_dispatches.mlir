@@ -363,8 +363,63 @@ module {
   }
   util.func public @main(%arg0: tensor<4x2xf32>, %arg1: tensor<4x2xf32>) -> tensor<4x2xf32> {
     %w = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
-    // expected-error @+1 {{cannot fold the bias of this NPU contraction dispatch into K: the accumulator is not a broadcast of a float constant bias}}
+    // expected-error @+1 {{cannot fold the bias of this NPU contraction dispatch into K: its accumulator input is not a broadcast of a float constant bias (a residual or partial sum cannot be folded)}}
     %0 = flow.dispatch @dispatch_0::@acc(%arg0, %w, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<4x2xf32>, tensor<2x2xf32>, tensor<4x2xf32>) -> tensor<4x2xf32>
     util.return %0 : tensor<4x2xf32>
   }
 }
+
+// -----
+
+// A weight and bias stored as `dense_resource` blobs (as an ONNX import stores
+// large initializers) are folded like inline constants.
+
+// CHECK-LABEL: util.global private @__bias_folded_weight_{{[0-9]+}}
+// CHECK-SAME:    dense<{{\[}}[1.000000e+00, 2.000000e+00], [3.000000e+00, 4.000000e+00], [5.000000e-01, -2.500000e-01]]> : tensor<3x2xf32>
+// CHECK-LABEL: func.func @fc_resource_weight
+// CHECK:         %[[MM:.+]] = linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<2x3xf32>, tensor<3x2xf32>)
+// CHECK-NOT:     linalg.generic
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %[[MM]]
+module {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_0 {
+    flow.executable.export public @fc_resource_weight workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @fc_resource_weight(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>>, %arg2: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2xf32>>, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>> -> tensor<2x2xf32>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>> -> tensor<2x2xf32>
+        %2 = iree_tensor_ext.dispatch.tensor.load %arg2, offsets = [0], sizes = [2], strides = [1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2xf32>> -> tensor<2xf32>
+        %3 = tensor.empty() : tensor<2x2xf32>
+        %4 = linalg.fill ins(%cst : f32) outs(%3 : tensor<2x2xf32>) -> tensor<2x2xf32>
+        %5 = linalg.matmul ins(%0, %1 : tensor<2x2xf32>, tensor<2x2xf32>) outs(%4 : tensor<2x2xf32>) -> tensor<2x2xf32>
+        %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%5, %2 : tensor<2x2xf32>, tensor<2xf32>) outs(%3 : tensor<2x2xf32>) {
+        ^bb0(%in: f32, %in_0: f32, %out: f32):
+          %7 = arith.addf %in, %in_0 : f32
+          linalg.yield %7 : f32
+        } -> tensor<2x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %6, %arg3, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : tensor<2x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+    %w = arith.constant dense_resource<w> : tensor<2x2xf32>
+    %b = arith.constant dense_resource<b> : tensor<2xf32>
+    %0 = flow.dispatch @dispatch_0::@fc_resource_weight(%arg0, %w, %b) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<2x2xf32>, tensor<2x2xf32>, tensor<2xf32>) -> tensor<2x2xf32>
+    util.return %0 : tensor<2x2xf32>
+  }
+}
+
+{-#
+  dialect_resources: {
+    builtin: {
+      w: "0x040000000000803F000000400000404000008040",
+      b: "0x040000000000003F000080BE"
+    }
+  }
+#-}
