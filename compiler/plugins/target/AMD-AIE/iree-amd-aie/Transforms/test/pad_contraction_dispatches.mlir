@@ -1,4 +1,4 @@
-// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-pad-contraction-dispatches)' %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline='builtin.module(iree-amdaie-pad-contraction-dispatches)' --mlir-print-elementsattrs-with-hex-if-larger=-1 %s | FileCheck %s
 
 // A matmul dispatch pinned to the amd-aie (npu4) device whose reduction dim
 // K=27 is not a multiple of the L2 reduction tile (32) has its operands padded
@@ -998,5 +998,88 @@ module {
   util.func public @main_m_epilogue(%arg0: tensor<196x64xbf16>, %arg1: tensor<64x128xbf16>) -> tensor<196x128xbf16> {
     %0 = flow.dispatch @dispatch_me::@matmul_m_epilogue(%arg0, %arg1) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<196x64xbf16>, tensor<64x128xbf16>) -> tensor<196x128xbf16>
     util.return %0 : tensor<196x128xbf16>
+  }
+}
+
+// -----
+
+// A constant weight (an immutable global with a dense value, read only here)
+// is padded at compile time instead: a new global holds it zero-padded,
+// K 3 -> 32 and N 2 -> 256, each [N, K] row in place, and the original global
+// is dropped. The runtime LHS still gets a host pad dispatch.
+
+// CHECK-LABEL: util.global private @__padded_constant_1
+// CHECK-SAME:    dense<{{\[}}[1.000000e+00, 2.000000e+00, 3.000000e+00, 0.000000e+00, {{.*}}], [4.000000e+00, 5.000000e+00, 6.000000e+00, 0.000000e+00, {{.*}}], [0.000000e+00, {{.*}} : tensor<256x32xbf16>
+// CHECK-NOT:   @weight
+// CHECK-LABEL: util.func public @main_const
+// CHECK:         %[[LHS:.+]] = flow.dispatch @pad_executable_0::@pad_dispatch_0(%arg0, %{{[a-z0-9_]+}})
+// CHECK:         %[[W:.+]] = util.global.load immutable @__padded_constant_1 : tensor<256x32xbf16>
+// CHECK:         flow.dispatch @dispatch_const::@matmul_const(%[[LHS]], %[[W]])
+// CHECK-NEXT:    flow.dispatch @crop_executable_2::@crop_dispatch_2
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight {stream.affinity.default = #hal.device.affinity<@cpu>} = dense<[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]> : tensor<2x3xbf16>
+  flow.executable private @dispatch_const {
+    flow.executable.export public @matmul_const workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_const(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x3xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x3xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [1, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x3xbf16>> -> tensor<1x3xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x3xbf16>> -> tensor<2x3xbf16>
+        %2 = tensor.empty() : tensor<1x2xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<1x2xf32>) -> tensor<1x2xf32>
+        %4 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>] ins(%0, %1 : tensor<1x3xbf16>, tensor<2x3xbf16>) outs(%3 : tensor<1x2xf32>) -> tensor<1x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [1, 2], strides = [1, 1] : tensor<1x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_const(%arg0: tensor<1x3xbf16>) -> tensor<1x2xf32> {
+    %w = util.global.load immutable @weight : tensor<2x3xbf16>
+    %0 = flow.dispatch @dispatch_const::@matmul_const(%arg0, %w) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<1x3xbf16>, tensor<2x3xbf16>) -> tensor<1x2xf32>
+    util.return %0 : tensor<1x2xf32>
+  }
+}
+
+// -----
+
+// A constant global something else reads too is padded at run time as before,
+// so its padded copy does not sit next to the original.
+
+// CHECK-LABEL: util.func public @main_shared_const
+// CHECK-NOT:     __padded_constant
+// CHECK:         %[[W:.+]] = util.global.load immutable @weight : tensor<2x3xbf16>
+// CHECK:         flow.dispatch @pad_executable_{{[0-9]+}}::@pad_dispatch_{{[0-9]+}}(%[[W]], %{{[a-z0-9_]+}})
+module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  util.global private @weight {stream.affinity.default = #hal.device.affinity<@cpu>} = dense<[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]> : tensor<2x3xbf16>
+  flow.executable private @dispatch_shared_const {
+    flow.executable.export public @matmul_shared_const workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @matmul_shared_const(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x3xbf16>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x3xbf16>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [1, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<1x3xbf16>> -> tensor<1x3xbf16>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x3xbf16>> -> tensor<2x3xbf16>
+        %2 = tensor.empty() : tensor<1x2xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<1x2xf32>) -> tensor<1x2xf32>
+        %4 = linalg.matmul indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>, affine_map<(d0, d1, d2) -> (d1, d2)>, affine_map<(d0, d1, d2) -> (d0, d1)>] ins(%0, %1 : tensor<1x3xbf16>, tensor<2x3xbf16>) outs(%3 : tensor<1x2xf32>) -> tensor<1x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [1, 2], strides = [1, 1] : tensor<1x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<1x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main_shared_const(%arg0: tensor<1x3xbf16>) -> (tensor<1x2xf32>, tensor<2x3xbf16>) {
+    %w = util.global.load immutable @weight : tensor<2x3xbf16>
+    %0 = flow.dispatch @dispatch_shared_const::@matmul_shared_const(%arg0, %w) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<1x3xbf16>, tensor<2x3xbf16>) -> tensor<1x2xf32>
+    %w2 = util.global.load immutable @weight : tensor<2x3xbf16>
+    util.return %0, %w2 : tensor<1x2xf32>, tensor<2x3xbf16>
   }
 }

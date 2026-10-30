@@ -23,8 +23,9 @@
 // folded into K by AMDAIEFoldBiasIntoContractionDispatches or split into its own
 // dispatch upstream. For such a dispatch pinned to an amd-aie device
 // whose M/K dims are not multiples of the target tiles, it:
-//   * zero-pads the matmul operands to the padded shape *outside* the dispatch
-//     (a host `tensor.pad` dispatch), and
+//   * zero-pads the matmul operands to the padded shape *outside* the dispatch:
+//     a constant operand (a weight) at compile time into a new global, any
+//     other on the host by a pad dispatch, and
 //   * rewrites the executable so its bindings/loads/matmul see the padded shape.
 //
 // K is a reduction dim: the padded elements are zero, so the extra products are
@@ -349,9 +350,10 @@ static IREE::HAL::DeviceAffinityAttr getHostAffinity(ModuleOp module) {
 }
 
 /// First index `i` such that no `pad_executable_i` / `crop_executable_i` /
-/// `concat_executable_i` symbol exists yet in `module`: the helper dispatch
-/// builders below number their executables from it, so the passes in this
-/// file (which run back to back on the same module) never collide.
+/// `concat_executable_i` / `__padded_constant_i` / `__bias_folded_weight_i`
+/// symbol exists yet in `module`: the helper builders below number their
+/// executables and globals from it, so the passes in this file (which run back
+/// to back on the same module) never collide.
 static int firstFreeHelperIndex(ModuleOp module) {
   int next = 0;
   for (Operation &op : module.getBody()->getOperations()) {
@@ -359,7 +361,8 @@ static int firstFreeHelperIndex(ModuleOp module) {
     if (!sym) continue;
     StringRef name = sym.getName();
     for (StringRef prefix :
-         {"pad_executable_", "crop_executable_", "concat_executable_"}) {
+         {"pad_executable_", "crop_executable_", "concat_executable_",
+          "__padded_constant_", "__bias_folded_weight_"}) {
       if (!name.consume_front(prefix)) continue;
       int idx;
       if (!name.getAsInteger(10, idx)) next = std::max(next, idx + 1);
@@ -518,6 +521,139 @@ static Value createCropDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
   return dispatchOp.getResult(0);
 }
 
+/// Returns the dense value of `v` when it is a compile-time constant: an
+/// `arith.constant` or a load of an immutable `util.global` with a dense
+/// initial value, possibly through `flow.tensor.reshape`s (row-major, so the
+/// value is only reshaped). Sets `global` to that global if there is one.
+static DenseElementsAttr getConstantValue(Value v,
+                                          IREE::Util::GlobalOp *global) {
+  auto type = dyn_cast<RankedTensorType>(v.getType());
+  if (!type || !type.hasStaticShape()) return {};
+  Value root = v;
+  while (auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>())
+    root = reshapeOp.getSource();
+  DenseElementsAttr attr;
+  if (auto cstOp = root.getDefiningOp<arith::ConstantOp>()) {
+    attr = dyn_cast<DenseElementsAttr>(cstOp.getValue());
+  } else if (auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>()) {
+    if (!loadOp.getIsImmutable()) return {};
+    auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
+        loadOp, loadOp.getGlobalAttr());
+    if (!globalOp) return {};
+    if (global) *global = globalOp;
+    attr = dyn_cast_or_null<DenseElementsAttr>(globalOp.getInitialValueAttr());
+  }
+  return attr ? attr.reshape(type) : DenseElementsAttr();
+}
+
+/// Returns `attr` zero-padded at the high end of each dim to `dstShape`. Null
+/// if it is splat or its elements are not byte-sized.
+static DenseElementsAttr padWithZeros(DenseElementsAttr attr,
+                                      ArrayRef<int64_t> dstShape) {
+  auto type = cast<RankedTensorType>(attr.getType());
+  Type elemType = type.getElementType();
+  if (attr.isSplat() || type.getRank() == 0 || !elemType.isIntOrFloat() ||
+      elemType.getIntOrFloatBitWidth() % 8 != 0)
+    return {};
+  int64_t elemBytes = elemType.getIntOrFloatBitWidth() / 8;
+  ArrayRef<int64_t> srcShape = type.getShape();
+  int64_t rank = type.getRank();
+  int64_t rowBytes = srcShape.back() * elemBytes;
+  int64_t numRows = type.getNumElements() / srcShape.back();
+  // Zero bits are a zero of every int and float type; copy each innermost
+  // source row to its place in the larger result.
+  ArrayRef<char> src = attr.getRawData();
+  SmallVector<char> dst(ShapedType::getNumElements(dstShape) * elemBytes, 0);
+  for (int64_t r = 0; r < numRows; ++r) {
+    int64_t rem = r, dstRow = 0, stride = 1;
+    for (int64_t d = rank - 2; d >= 0; --d) {
+      dstRow += (rem % srcShape[d]) * stride;
+      rem /= srcShape[d];
+      stride *= dstShape[d];
+    }
+    llvm::copy(src.slice(r * rowBytes, rowBytes),
+               dst.begin() + dstRow * dstShape.back() * elemBytes);
+  }
+  return DenseElementsAttr::getFromRawBuffer(
+      RankedTensorType::get(dstShape, elemType), dst);
+}
+
+/// Returns `v` zero-padded to `dstShape` at compile time, as a load of a new
+/// immutable global, when `v` is a dense constant (see `getConstantValue`) read
+/// only here; the constant's global, if any, is added to `replacedGlobals`.
+/// Null otherwise, for a host pad dispatch to do it at run time instead.
+static Value createPaddedConstant(
+    IRRewriter &rewriter, ModuleOp module, Value v, ArrayRef<int64_t> dstShape,
+    int &counter, SmallVectorImpl<IREE::Util::GlobalOp> &replacedGlobals) {
+  for (Value root = v;;) {
+    if (!root.hasOneUse()) return {};
+    auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>();
+    if (!reshapeOp) break;
+    root = reshapeOp.getSource();
+  }
+  IREE::Util::GlobalOp global;
+  DenseElementsAttr attr = getConstantValue(v, &global);
+  if (!attr) return {};
+  if (global) {
+    std::optional<SymbolTable::UseRange> uses =
+        SymbolTable::getSymbolUses(global, module);
+    if (!uses || !llvm::hasSingleElement(*uses)) return {};
+  }
+  DenseElementsAttr padded = padWithZeros(attr, dstShape);
+  if (!padded) return {};
+  OpBuilder moduleBuilder = OpBuilder::atBlockBegin(module.getBody());
+  auto paddedGlobal = IREE::Util::GlobalOp::create(
+      moduleBuilder, v.getLoc(),
+      "__padded_constant_" + std::to_string(counter++), /*isMutable=*/false,
+      padded.getType(), std::optional<TypedAttr>(padded));
+  paddedGlobal.setPrivate();
+  if (global) {
+    if (Attribute affinity = global->getAttr("stream.affinity.default"))
+      paddedGlobal->setAttr("stream.affinity.default", affinity);
+    replacedGlobals.push_back(global);
+  }
+  auto load = cast<IREE::Util::GlobalLoadOp>(
+      paddedGlobal.createLoadOp(v.getLoc(), rewriter).getOperation());
+  load.setIsImmutable(true);
+  return load.getResult();
+}
+
+/// Erases `v`'s producer chain of reshapes, global loads and constants as far
+/// as nothing else reads it.
+static void eraseDeadProducers(IRRewriter &rewriter, Value v) {
+  while (Operation *op = v.getDefiningOp()) {
+    if (!op->use_empty() ||
+        !isa<IREE::Flow::TensorReshapeOp, IREE::Util::GlobalLoadOp,
+             arith::ConstantOp>(op))
+      return;
+    auto reshapeOp = dyn_cast<IREE::Flow::TensorReshapeOp>(op);
+    v = reshapeOp ? reshapeOp.getSource() : Value();
+    rewriter.eraseOp(op);
+    if (!v) return;
+  }
+}
+
+/// Erases those of `globals` no load reads any more (they would otherwise be
+/// kept next to their padded or folded copies until a later cleanup).
+static void eraseDeadGlobals(IRRewriter &rewriter, ModuleOp module,
+                             ArrayRef<IREE::Util::GlobalOp> globals) {
+  for (IREE::Util::GlobalOp global : globals) {
+    SmallVector<IREE::Util::GlobalLoadOp> loads;
+    bool otherUses = false;
+    std::optional<SymbolTable::UseRange> uses =
+        SymbolTable::getSymbolUses(global, module);
+    if (!uses) continue;
+    for (SymbolTable::SymbolUse use : *uses) {
+      auto load = dyn_cast<IREE::Util::GlobalLoadOp>(use.getUser());
+      if (!load || !load.use_empty()) otherUses = true;
+      else loads.push_back(load);
+    }
+    if (otherUses) continue;
+    for (IREE::Util::GlobalLoadOp load : loads) rewriter.eraseOp(load);
+    rewriter.eraseOp(global);
+  }
+}
+
 class AMDAIEPadContractionDispatchesPass
     : public impl::AMDAIEPadContractionDispatchesBase<
           AMDAIEPadContractionDispatchesPass> {
@@ -539,6 +675,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
   // Executables rewritten already (shared by multiple dispatches): rewrite the
   // executable once, but pad/crop each caller's operands/result.
   DenseSet<Operation *> paddedExecutables;
+  SmallVector<IREE::Util::GlobalOp> replacedGlobals;
 
   for (IREE::Flow::DispatchOp dispatch : dispatches) {
     IREE::HAL::ExecutableTargetAttr target = getDispatchTarget(dispatch, module);
@@ -610,16 +747,23 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
     }
 
-    // Pad this caller's host operands to the padded shapes, then rewire.
+    // Pad this caller's operands to the padded shapes, a constant at compile
+    // time and anything else on the host, then rewire.
     rewriter.setInsertionPoint(dispatch);
-    Value lhsPadded =
-        createPaddingDispatch(rewriter, module, dispatch.getArguments()[lhsArgNo],
-                              lhsPad, hostAffinity, counter);
-    Value rhsPadded =
-        createPaddingDispatch(rewriter, module, dispatch.getArguments()[rhsArgNo],
-                              rhsPad, hostAffinity, counter);
-    dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(lhsPadded);
-    dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(rhsPadded);
+    auto pad = [&](Value v, ArrayRef<int64_t> shape) -> Value {
+      if (shape == cast<RankedTensorType>(v.getType()).getShape()) return v;
+      if (Value padded = createPaddedConstant(rewriter, module, v, shape,
+                                              counter, replacedGlobals))
+        return padded;
+      return createPaddingDispatch(rewriter, module, v, shape, hostAffinity,
+                                   counter);
+    };
+    Value lhs = dispatch.getArguments()[lhsArgNo];
+    Value rhs = dispatch.getArguments()[rhsArgNo];
+    dispatch.getArgumentsMutable().slice(lhsArgNo, 1).assign(pad(lhs, lhsPad));
+    dispatch.getArgumentsMutable().slice(rhsArgNo, 1).assign(pad(rhs, rhsPad));
+    eraseDeadProducers(rewriter, lhs);
+    eraseDeadProducers(rewriter, rhs);
 
     // Grow this caller's result to [mPad, nPad] and crop it back to [m, n] on
     // the host with an extract_slice dispatch (handles the inner N dim too).
@@ -635,6 +779,7 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       result.replaceAllUsesExcept(cropped, cropped.getDefiningOp());
     }
   }
+  eraseDeadGlobals(rewriter, module, replacedGlobals);
 }
 
 // --- AMDAIEPadPoolingDispatches ---
@@ -964,31 +1109,6 @@ static std::optional<BiasFoldInfo> getAccumulatorBiasInfo(func::FuncOp func) {
                       /*mmInput=*/0};
 }
 
-/// Returns the dense value of `v` when it is a compile-time constant: an
-/// `arith.constant` or a load of an immutable `util.global` with a dense
-/// initial value, possibly through `flow.tensor.reshape`s (row-major, so the
-/// value is only reshaped). Sets `global` to that global if there is one.
-static DenseElementsAttr getConstantValue(Value v,
-                                          IREE::Util::GlobalOp *global) {
-  auto type = dyn_cast<RankedTensorType>(v.getType());
-  if (!type || !type.hasStaticShape()) return {};
-  Value root = v;
-  while (auto reshapeOp = root.getDefiningOp<IREE::Flow::TensorReshapeOp>())
-    root = reshapeOp.getSource();
-  DenseElementsAttr attr;
-  if (auto cstOp = root.getDefiningOp<arith::ConstantOp>()) {
-    attr = dyn_cast<DenseElementsAttr>(cstOp.getValue());
-  } else if (auto loadOp = root.getDefiningOp<IREE::Util::GlobalLoadOp>()) {
-    if (!loadOp.getIsImmutable()) return {};
-    auto globalOp = SymbolTable::lookupNearestSymbolFrom<IREE::Util::GlobalOp>(
-        loadOp, loadOp.getGlobalAttr());
-    if (!globalOp) return {};
-    if (global) *global = globalOp;
-    attr = dyn_cast_or_null<DenseElementsAttr>(globalOp.getInitialValueAttr());
-  }
-  return attr ? attr.reshape(type) : DenseElementsAttr();
-}
-
 /// Returns the constant [N] bias that accumulator `acc` broadcasts over M:
 /// `acc` is the result of a dispatch whose executable only broadcasts a 1-D
 /// constant (inline or a constant operand) through (d0, d1) -> (d1), or a load
@@ -1260,35 +1380,15 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
         rhsFolded.getResult());
     dispatch.getArgumentsMutable().erase(biasArgNo);
     // The accumulator's broadcast dispatch (or global load) has no other use,
-    // nor the reshapes the old weight was read through.
+    // nor the old weight and the reshapes it was read through.
     Operation *biasProducer = biasOperand.getDefiningOp();
     if (biasProducer && biasProducer->use_empty() &&
         isa<IREE::Flow::DispatchOp, IREE::Util::GlobalLoadOp>(biasProducer))
       rewriter.eraseOp(biasProducer);
-    while (auto reshapeOp = rhs.getDefiningOp<IREE::Flow::TensorReshapeOp>()) {
-      if (!reshapeOp->use_empty()) break;
-      rhs = reshapeOp.getSource();
-      rewriter.eraseOp(reshapeOp);
-    }
+    eraseDeadProducers(rewriter, rhs);
   }
 
-  // Drop the original weights no load reads any more (they would otherwise be
-  // kept next to their folded copies until a later cleanup).
-  for (IREE::Util::GlobalOp global : replacedGlobals) {
-    SmallVector<IREE::Util::GlobalLoadOp> loads;
-    bool otherUses = false;
-    std::optional<SymbolTable::UseRange> uses =
-        SymbolTable::getSymbolUses(global, module);
-    if (!uses) continue;
-    for (SymbolTable::SymbolUse use : *uses) {
-      auto load = dyn_cast<IREE::Util::GlobalLoadOp>(use.getUser());
-      if (!load || !load.use_empty()) otherUses = true;
-      else loads.push_back(load);
-    }
-    if (otherUses) continue;
-    for (IREE::Util::GlobalLoadOp load : loads) rewriter.eraseOp(load);
-    rewriter.eraseOp(global);
-  }
+  eraseDeadGlobals(rewriter, module, replacedGlobals);
 }
 
 }  // namespace
