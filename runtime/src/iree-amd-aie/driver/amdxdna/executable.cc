@@ -285,6 +285,21 @@ iree_amd_aie_hal_amdxdna_native_executable_flatbuffer_verify(
           entry_point_count, source_loc_count);
     }
   }
+  if (iree_amd_aie_hal_amdxdna_ExecutableDef_binding_flags_is_present(
+          executable_def)) {
+    iree_host_size_t binding_flags_count =
+        iree_amd_aie_hal_amdxdna_UI32Array1dDef_vec_len(
+            iree_amd_aie_hal_amdxdna_ExecutableDef_binding_flags_get(
+                executable_def));
+    if (binding_flags_count != entry_point_count) {
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "executable binding_flags length mismatch: expected %" PRIhsz
+          ", got %" PRIhsz,
+          entry_point_count, binding_flags_count);
+    }
+  }
   iree_amd_aie_hal_amdxdna_UI32Array2dDef_vec_t asm_instr_runlists_vec =
       iree_amd_aie_hal_amdxdna_ExecutableDef_asm_instr_runlists_get(
           executable_def);
