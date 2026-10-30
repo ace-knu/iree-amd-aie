@@ -65,15 +65,19 @@ struct AMDAIESession
     // Move NCHW max pooling to NHWC so it matches the channels-last convs
     // (the upstream channels-last pass skips pooling); the transposes this
     // inserts cancel against the conv-side ones downstream.
-    // The pool pipeline splits C over the array rows, so C is padded up to a
-    // multiple of the row count here (channels are independent under max, the
-    // extra ones are sliced off the result).
+    // When pooling runs on the NPU (`acceleratePooling`), the pool pipeline
+    // splits C over the array rows, so C is padded up to a multiple of the row
+    // count here (channels are independent under max, the extra ones are
+    // sliced off the result), and an overlapping window is pre-split over the
+    // columns. A host pool only changes layout.
     if (options.poolingChannelsLast) {
-      AMDAIE::AMDAIEDeviceModel deviceModel =
-          AMDAIE::getDeviceModel(options.AMDAIETargetDevice);
       AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
-      poolOptions.channelMultiple = options.getNumRows(deviceModel);
-      poolOptions.haloSplitColumns = options.getNumCols(deviceModel);
+      if (options.acceleratePooling) {
+        AMDAIE::AMDAIEDeviceModel deviceModel =
+            AMDAIE::getDeviceModel(options.AMDAIETargetDevice);
+        poolOptions.channelMultiple = options.getNumRows(deviceModel);
+        poolOptions.haloSplitColumns = options.getNumCols(deviceModel);
+      }
       poolOptions.columnsPolicy = options.poolColumnsPolicy;
       passManager.addPass(
           AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass(poolOptions));

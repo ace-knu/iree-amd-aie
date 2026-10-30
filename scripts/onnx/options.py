@@ -64,6 +64,9 @@ OPTIONS = {
             "--iree-preprocessing-pass-pipeline="
             "builtin.module(iree-preprocessing-convert-conv-to-channels-last)",
             "--iree-global-opt-use-im2col-for-convs",
+            # NHWC max pooling, like the convs, so the transposes around each
+            # pool cancel (an NCHW pool on the CPU reads through one).
+            "--iree-amdaie-pooling-channels-last",
             # workaround: contraction dispatch needs a plain linalg.fill init.
             "--iree-global-opt-detach-elementwise-through-reshape",
         ],
@@ -113,7 +116,6 @@ OPTIONS = {
             "cpu": [],
             "accel": [
                 "--iree-amdaie-accelerate-pooling",
-                "--iree-amdaie-pooling-channels-last",
             ],
         },
     },
