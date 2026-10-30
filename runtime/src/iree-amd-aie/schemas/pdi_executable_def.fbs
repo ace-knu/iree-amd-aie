@@ -93,6 +93,12 @@ table ExecutableDef {
   // compiler; the HAL applies the table without parsing the instruction stream.
   patch_runlists: [UI32Array2dDef];
 
+  // Per entry point (same size as `entry_points`), one flag word per binding
+  // of its pipeline layout: bit 0 (READ_ONLY) marks a binding the dispatch
+  // never writes, which the HAL then skips when syncing bindings back to the
+  // host after a run. Executables without it sync every binding.
+  binding_flags: [UI32Array1dDef];
+
   source_locations:[FileLineLocDef];
 }
 

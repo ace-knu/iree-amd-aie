@@ -463,6 +463,14 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
           ? iree_amd_aie_hal_amdxdna_ExecutableDef_patch_runlists_get(
                 executable_def)
           : nullptr;
+  // Per entry point binding flags. Absent on executables produced before this
+  // field existed.
+  iree_amd_aie_hal_amdxdna_UI32Array1dDef_vec_t binding_flags_vec =
+      iree_amd_aie_hal_amdxdna_ExecutableDef_binding_flags_is_present(
+          executable_def)
+          ? iree_amd_aie_hal_amdxdna_ExecutableDef_binding_flags_get(
+                executable_def)
+          : nullptr;
   iree_host_size_t entry_point_count =
       flatbuffers_string_vec_len(entry_points_vec);
 
@@ -527,6 +535,19 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
       status = iree_amd_aie_hal_amdxdna_executable_parse_UI32Array2dDef(
           patch_runlist_def, params->patch_runlist);
       if (!iree_status_is_ok(status)) goto fail;
+    }
+
+    if (binding_flags_vec &&
+        entry_ordinal <
+            iree_amd_aie_hal_amdxdna_UI32Array1dDef_vec_len(binding_flags_vec)) {
+      flatbuffers_uint32_vec_t flags =
+          iree_amd_aie_hal_amdxdna_UI32Array1dDef_data_get(
+              iree_amd_aie_hal_amdxdna_UI32Array1dDef_vec_at(binding_flags_vec,
+                                                             entry_ordinal));
+      for (size_t i = 0; i < flatbuffers_uint32_vec_len(flags); ++i) {
+        params->binding_read_only.push_back(
+            flatbuffers_uint32_vec_at(flags, i) & 1u);
+      }
     }
 
     // Get the reconfiguration data runlist for the current entry point, and

@@ -40,8 +40,10 @@ struct iree_hal_amdxdna_chain_group {
   // from the slots, kept alive + bound for residency until the chain completes.
   std::vector<iree_hal_amdxdna_native_buffer_ptr> reconf_buffers;
   // I/O binding refs: their BOs are bound for residency and their exact ranges
-  // are synced device->host after the chain completes.
+  // are synced device->host after the chain completes, except those of
+  // read-only bindings (`binding_read_only`, parallel).
   std::vector<iree_hal_buffer_ref_t> binding_refs;
+  std::vector<bool> binding_read_only;
 };
 
 // Accumulates ERT_CMD_CHAIN sub-commands across dispatches so a whole command
@@ -66,6 +68,15 @@ struct iree_hal_amdxdna_direct_command_buffer {
   // them as ERT_CMD_CHAIN(s). Stays empty when cmd_chain is off.
   iree_hal_amdxdna_chain_accum chain_accum;
 };
+
+// Whether binding `ordinal` of `kernel_params`'s dispatch is never written by
+// it, so its range needs no device->host sync after a run.
+static bool iree_hal_amdxdna_binding_is_read_only(
+    const iree_hal_amdxdna_kernel_params& kernel_params,
+    iree_host_size_t ordinal) {
+  return ordinal < kernel_params.binding_read_only.size() &&
+         kernel_params.binding_read_only[ordinal];
+}
 
 static iree_status_t iree_hal_amdxdna_validate_live_dispatch_bindings(
     iree_hal_buffer_ref_list_t bindings) {
@@ -635,6 +646,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
   // Track I/O bindings for residency + final device->host sync at flush.
   for (iree_host_size_t j = 0; j < bindings.count; ++j) {
     group.binding_refs.push_back(bindings.values[j]);
+    group.binding_read_only.push_back(
+        iree_hal_amdxdna_binding_is_read_only(kernel_params, j));
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -746,8 +759,11 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_flush_chains(
                                         group.queue, group, begin, end);
     }
     if (!iree_status_is_ok(status)) break;
-    // Sync this group's I/O bindings back to host once its chains complete.
-    for (const iree_hal_buffer_ref_t& binding_ref : group.binding_refs) {
+    // Sync this group's written I/O bindings back to host once its chains
+    // complete.
+    for (size_t j = 0; j < group.binding_refs.size(); ++j) {
+      if (group.binding_read_only[j]) continue;
+      const iree_hal_buffer_ref_t& binding_ref = group.binding_refs[j];
       status = iree_hal_amdxdna_buffer_invalidate_range(
           binding_ref.buffer, binding_ref.offset, binding_ref.length);
       if (!iree_status_is_ok(status)) break;
@@ -772,9 +788,11 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
     iree_hal_buffer_ref_list_t& bindings,
     iree_hal_amdxdna_direct_command_buffer* command_buffer,
     iree_hal_amdxdna_native_queue_t* queue,
-    iree_hal_amdxdna_native_cu_index_t cu_idx, uint32_t n_kernel_runs,
+    iree_hal_amdxdna_native_cu_index_t cu_idx,
+    iree_hal_amdxdna_kernel_params& kernel_params,
     std::vector<uint32_t>& asm_inst, iree_const_byte_span_t constants) {
   IREE_TRACE_ZONE_BEGIN(z0);
+  uint32_t n_kernel_runs = kernel_params.n_kernel_runs;
 
   // Check if the kernel should be executed.
   if (n_kernel_runs == 0) {
@@ -843,8 +861,9 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
         z0, iree_hal_amdxdna_native_queue_submit_and_wait(queue, command.get(),
                                                           IREE_SV("dispatch")));
   }
-  // Sync the bindings back to the host.
+  // Sync the bindings the kernel may have written back to the host.
   for (iree_host_size_t j = 0; j < bindings.count; ++j) {
+    if (iree_hal_amdxdna_binding_is_read_only(kernel_params, j)) continue;
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_buffer_invalidate_range(
                 bindings.values[j].buffer, bindings.values[j].offset,
@@ -1031,9 +1050,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
     // Normal kernel dispatch.
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_direct_command_buffer_normal_run(
-                bindings, command_buffer, queue, cu_idx,
-                kernel_params.n_kernel_runs, kernel_params.asm_inst_runlist[0],
-                constants));
+                bindings, command_buffer, queue, cu_idx, kernel_params,
+                kernel_params.asm_inst_runlist[0], constants));
   } else {
     for (size_t i = 0; i < num_reconfigurations; i++) {
       // Reconfigure the device.
@@ -1046,8 +1064,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
       // Dispatch the new kernel.
       IREE_RETURN_AND_END_ZONE_IF_ERROR(
           z0, iree_hal_amdxdna_direct_command_buffer_normal_run(
-                  bindings, command_buffer, queue, cu_idx,
-                  kernel_params.n_kernel_runs,
+                  bindings, command_buffer, queue, cu_idx, kernel_params,
                   kernel_params.asm_inst_runlist[2 * i + 1], constants));
     }
   }

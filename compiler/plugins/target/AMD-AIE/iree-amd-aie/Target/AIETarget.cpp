@@ -319,7 +319,8 @@ void serializePDIToFb(FlatbufferBuilder &builder,
                       SmallVector<flatbuffers_ref_t> pdiRefs,
                       SmallVector<flatbuffers_ref_t> asmInstrRefs,
                       SmallVector<flatbuffers_ref_t> reconfDataRefs,
-                      SmallVector<flatbuffers_ref_t> patchRefs) {
+                      SmallVector<flatbuffers_ref_t> patchRefs,
+                      SmallVector<flatbuffers_ref_t> bindingFlagRefs) {
   // Add the entry points to the flatbuffer.
   iree_amd_aie_hal_amdxdna_ExecutableDef_entry_points_add(builder,
                                                           entryPointsRef);
@@ -353,6 +354,10 @@ void serializePDIToFb(FlatbufferBuilder &builder,
   flatbuffers_vec_ref_t patchRef =
       builder.createOffsetVecDestructive(patchRefs);
   iree_amd_aie_hal_amdxdna_ExecutableDef_patch_runlists_add(builder, patchRef);
+  flatbuffers_vec_ref_t bindingFlagsRef =
+      builder.createOffsetVecDestructive(bindingFlagRefs);
+  iree_amd_aie_hal_amdxdna_ExecutableDef_binding_flags_add(builder,
+                                                           bindingFlagsRef);
   iree_amd_aie_hal_amdxdna_ExecutableDef_end_as_root(builder);
 }
 
@@ -493,6 +498,8 @@ LogicalResult AIETargetBackend::serializeExecutable(
   // Map to keep track of which ordinal number belongs to which entry point,
   // typically the order is sequential but that is not gauranteed
   std::map<std::string, uint64_t> entryPointOrdinals;
+  // Per ordinal, the layout's bindings as flag words (bit 0: read-only).
+  std::map<uint64_t, std::vector<uint32_t>> bindingFlags;
   for (IREE::HAL::ExecutableExportOp exportOp : variantOp.getExportOps()) {
     uint64_t ordinal = 0;
     if (std::optional<APInt> optionalOrdinal = exportOp.getOrdinal()) {
@@ -507,6 +514,14 @@ LogicalResult AIETargetBackend::serializeExecutable(
 
     StringRef exportOpName = exportOp.getSymName();
     deviceOps.push_back(getDeviceOpWithName(moduleOp, exportOpName));
+    std::vector<uint32_t> &flags = bindingFlags[ordinal];
+    for (IREE::HAL::PipelineBindingAttr binding :
+         exportOp.getLayoutAttr().getBindings()) {
+      flags.push_back(allEnumBitsSet(binding.getFlags(),
+                                     IREE::HAL::DescriptorFlags::ReadOnly)
+                          ? 1u
+                          : 0u);
+    }
 
     // The xclbin kernel name, appended with instance name suffix (`:MLIRAIEV1`,
     // 10 chars) is required by the xclbinutil to have a length smaller or equal
@@ -754,7 +769,14 @@ LogicalResult AIETargetBackend::serializeExecutable(
                            builder, iree_amd_aie_hal_amdxdna_PdiDef_create),
                        get3dUInt32ArrayRefs(asmInstrConverter),
                        get3dUInt32ArrayRefs(reconfDataConverter),
-                       get3dUInt32ArrayRefs(patchConverter));
+                       get3dUInt32ArrayRefs(patchConverter),
+                       llvm::map_to_vector(
+                           llvm::seq<uint64_t>(0, ordinalCount),
+                           [&](uint64_t ordinal) -> flatbuffers_ref_t {
+                             return iree_amd_aie_hal_amdxdna_UI32Array1dDef_create(
+                                 builder,
+                                 builder.createInt32Vec(bindingFlags[ordinal]));
+                           }));
       break;
     }
     default:

@@ -26,6 +26,9 @@ struct iree_hal_amdxdna_kernel_params {
   // flat list of (offset, arg_idx, arg_plus) triples for the corresponding
   // control code, applied by the ERT_CMD_CHAIN path.
   std::vector<std::vector<uint32_t>> patch_runlist;
+  // Per binding of the pipeline layout, whether the dispatch never writes it
+  // (empty when the executable does not say: every binding may be written).
+  std::vector<bool> binding_read_only;
   std::string kernel_name;
   uint32_t n_kernel_runs{1};
   uint32_t n_reconfigure_runs{1};
