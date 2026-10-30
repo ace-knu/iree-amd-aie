@@ -67,15 +67,11 @@ OPTIONS = {
             # NHWC max pooling, like the convs, so the transposes around each
             # pool cancel (an NCHW pool on the CPU reads through one).
             "--iree-amdaie-pooling-channels-last",
-            # workaround: contraction dispatch needs a plain linalg.fill init.
-            "--iree-global-opt-detach-elementwise-through-reshape",
         ],
     },
     # How ops are grouped into dispatches.
     "dispatch": {
         "flags": [
-            # workaround: amd-aie cannot tile a contraction with fused elementwise.
-            "--iree-dispatch-creation-no-fuse-into-contraction-conv-roots",
             # workaround: address_patch cannot carry a runtime weight offset.
             "--iree-flow-enable-executable-deduplication=false",
         ],
