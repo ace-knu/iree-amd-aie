@@ -216,6 +216,11 @@ static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
   func.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
   if (matmuls.size() != 1) return std::nullopt;
   linalg::MatmulOp matmul = matmuls.front();
+  // Padding computes static padded shapes.
+  if (!llvm::all_of(matmul->getOperandTypes(), [](Type t) {
+        return cast<ShapedType>(t).hasStaticShape();
+      }))
+    return std::nullopt;
   auto lhsLoad = getFullTensorLoad(matmul.getInputs()[0]);
   auto rhsLoad = getFullTensorLoad(matmul.getInputs()[1]);
   if (!lhsLoad || !rhsLoad) return std::nullopt;

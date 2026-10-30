@@ -1083,3 +1083,38 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
     util.return %0, %w2 : tensor<1x2xf32>, tensor<2x3xbf16>
   }
 }
+
+// -----
+
+// A dynamic M cannot be padded to static multiples: the dispatch is left as is.
+// CHECK-LABEL: util.func public @main_dynamic_m
+// CHECK-NOT:   pad_executable
+// CHECK:       flow.dispatch @dispatch_0::@mm_dynamic_m[%{{.+}}](%arg0, %arg1, %{{.+}})
+// CHECK-NOT:   flow.dispatch
+module {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @dispatch_0 {
+    flow.executable.export public @mm_dynamic_m workgroups(%arg0: index) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice(%arg0)
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @mm_dynamic_m(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x3xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x3xf32>>, %arg2: index, %arg3: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x3xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %m = iree_tensor_ext.dispatch.workload.ordinal %arg2, 0 : index
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [%m, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<?x3xf32>>{%m} -> tensor<?x3xf32>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [3, 3], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x3xf32>> -> tensor<3x3xf32>
+        %3 = tensor.empty(%m) : tensor<?x3xf32>
+        %4 = linalg.fill ins(%cst : f32) outs(%3 : tensor<?x3xf32>) -> tensor<?x3xf32>
+        %5 = linalg.matmul ins(%0, %1 : tensor<?x3xf32>, tensor<3x3xf32>) outs(%4 : tensor<?x3xf32>) -> tensor<?x3xf32>
+        iree_tensor_ext.dispatch.tensor.store %5, %arg3, offsets = [0, 0], sizes = [%m, 3], strides = [1, 1] : tensor<?x3xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<?x3xf32>>{%m}
+        return
+      }
+    }
+  }
+  util.func public @main_dynamic_m(%arg0: tensor<?x3xf32>, %arg1: tensor<3x3xf32>, %m: index) -> tensor<?x3xf32> {
+    %0 = flow.dispatch @dispatch_0::@mm_dynamic_m[%m](%arg0, %arg1, %m) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<?x3xf32>{%m}, tensor<3x3xf32>, index) -> tensor<?x3xf32>{%m}
+    util.return %0 : tensor<?x3xf32>
+  }
+}
