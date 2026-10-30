@@ -1274,23 +1274,25 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // CHECK:         %[[FILL:.+]] = linalg.fill
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<32x32xbf16>, tensor<32x64xbf16>) outs(%[[FILL]] : tensor<32x64xf32>)
 
-// The LHS padding dispatch writes 1.0 only at K index 3 and 0.0 everywhere
-// else (a zero operand is faster on the AIE core's scalar matmul): a zero pad,
-// then an elementwise generic that selects 1.0 at K index 3 of the 32 real
-// rows.
-// CHECK-LABEL: func.func @pad_ones_dispatch_
-// CHECK:         %[[PAD:.+]] = tensor.pad %{{.+}} low[0, 0] high[0, 29]
+// The LHS (M > 1) is padded by a plain zero-pad dispatch, then a dispatch
+// tied to its result writes columns [3, 32): 1.0 at K index 3 and 0.0 after
+// it (a zero operand is faster on the AIE core's scalar matmul).
+// CHECK-LABEL: func.func @pad_dispatch_
+// CHECK:         tensor.pad %{{.+}} low[0, 0] high[0, 29]
 // CHECK:         } : tensor<32x3xbf16> to tensor<32x32xbf16>
-// CHECK:         linalg.generic {{.*}} ins(%[[PAD]] : tensor<32x32xbf16>)
+// CHECK-LABEL: func.func @bias_ones_dispatch_
+// CHECK-SAME:    (%[[BUF:.+]]: !iree_tensor_ext.dispatch.tensor<readwrite:tensor<32x32xbf16>>)
+// CHECK:         %[[COLS:.+]] = linalg.generic
 // CHECK:           %[[K:.+]] = linalg.index 1
-// CHECK:           %[[M:.+]] = linalg.index 0
-// CHECK:           arith.cmpi eq, %[[K]], %c3
-// CHECK:           arith.cmpi ult, %[[M]], %c32
+// CHECK:           arith.cmpi eq, %[[K]], %c0
 // CHECK:           arith.select
+// CHECK:         dispatch.tensor.store %[[COLS]], %[[BUF]], offsets = [0, 3], sizes = [32, 29]
 
 // CHECK-LABEL: util.func public @main_biasfold
-// CHECK:         %[[LPAD:.+]] = flow.dispatch @pad_ones_executable_{{[0-9]+}}::@pad_ones_dispatch_{{[0-9]+}}(%arg0)
+// CHECK:         %[[ZPAD:.+]] = flow.dispatch @pad_executable_{{[0-9]+}}::@pad_dispatch_{{[0-9]+}}(%arg0)
 // CHECK-SAME:      : (tensor<32x3xbf16>) -> tensor<32x32xbf16>
+// CHECK:         %[[LPAD:.+]] = flow.dispatch @bias_ones_executable_{{[0-9]+}}::@bias_ones_dispatch_{{[0-9]+}}(%[[ZPAD]])
+// CHECK-SAME:      : (tensor<32x32xbf16>) -> %[[ZPAD]]
 // CHECK:         %[[W:.+]] = util.global.load @__bias_folded_const_
 // CHECK:         %[[MM:.+]] = flow.dispatch @dispatch_biasfold::@matmul_biasfold(%[[LPAD]], %[[W]])
 // CHECK-SAME:      : (tensor<32x32xbf16>, tensor<32x64xbf16>) -> tensor<32x64xf32>
@@ -1462,36 +1464,25 @@ module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {
 // -----
 
 // The LHS is produced by a host dispatch (im2col + bf16 truncation, reshaped to
-// the 2-D matmul operand) that nothing else reads, so the padding is folded
-// into that dispatch instead of being added behind it: its output binding grows
-// to the padded shape and the `tensor.pad` -- with the bias fold's ones
-// column, since the bias is folded here too -- becomes a consumer of its
-// existing root. No
-// separate padding dispatch is created, and the intervening
-// `flow.tensor.reshape` is absorbed as a `tensor.collapse_shape`.
-//
-// This is the model's largest host write: without it the same buffer is
-// written by im2col, read back, and written again one tile wider.
+// the 2-D matmul operand) that nothing else reads. With the bias folded, the
+// padding is *not* folded into that dispatch: padding inside it folds the
+// reshape and pads into a `map_store` that recomputes every element's row and
+// column with a div/mod on the CPU backend. The im2col dispatch keeps its
+// shape, and the LHS takes a zero-pad dispatch plus a ones-column dispatch
+// tied to its result.
 
 // CHECK-LABEL: func.func @im2col_grown
-// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x32xbf16>>
-// CHECK:         %[[G:.+]] = linalg.generic
-// CHECK:         %[[C:.+]] = tensor.collapse_shape %[[G]] {{\[}}[0], [1, 2]{{\]}}
-// CHECK-SAME:      : tensor<32x3x1xbf16> into tensor<32x3xbf16>
-// CHECK:         %[[ONE:.+]] = arith.constant 1.000000e+00 : bf16
-// CHECK:         %[[P1:.+]] = tensor.pad %[[C]] low[0, 0] high[0, 1]
-// CHECK:           tensor.yield %[[ONE]]
-// CHECK:         %[[ZERO:.+]] = arith.constant 0.000000e+00 : bf16
-// CHECK:         %[[P:.+]] = tensor.pad %[[P1]] low[0, 0] high[0, 28]
-// CHECK:           tensor.yield %[[ZERO]]
-// CHECK:         iree_tensor_ext.dispatch.tensor.store %[[P]], %arg1
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<32x3x1xbf16>>
+// CHECK-NOT:     tensor.pad
+// CHECK:         return
 
 // CHECK-LABEL: util.func public @main_grown
-// CHECK-NOT:     flow.tensor.reshape
-// CHECK-NOT:     @pad_ones_executable_
-// CHECK-NOT:     @pad_executable_
-// CHECK:         %[[LHS:.+]] = flow.dispatch @dispatch_im2col::@im2col_grown(%arg0)
-// CHECK-SAME:      : (tensor<32x3x1xf32>) -> tensor<32x32xbf16>
+// CHECK:         %[[IM:.+]] = flow.dispatch @dispatch_im2col::@im2col_grown(%arg0)
+// CHECK-SAME:      : (tensor<32x3x1xf32>) -> tensor<32x3x1xbf16>
+// CHECK:         %[[R:.+]] = flow.tensor.reshape %[[IM]] : tensor<32x3x1xbf16> -> tensor<32x3xbf16>
+// CHECK:         %[[ZPAD:.+]] = flow.dispatch @pad_executable_{{[0-9]+}}::@pad_dispatch_{{[0-9]+}}(%[[R]])
+// CHECK-SAME:      : (tensor<32x3xbf16>) -> tensor<32x32xbf16>
+// CHECK:         %[[LHS:.+]] = flow.dispatch @bias_ones_executable_{{[0-9]+}}::@bias_ones_dispatch_{{[0-9]+}}(%[[ZPAD]])
 // CHECK:         flow.dispatch @dispatch_grown::@matmul_grown(%[[LHS]],
 // CHECK-SAME:      : (tensor<32x32xbf16>, tensor<32x64xbf16>) -> tensor<32x64xf32>
 module attributes {stream.affinity.default = #hal.device.affinity<@npu>} {

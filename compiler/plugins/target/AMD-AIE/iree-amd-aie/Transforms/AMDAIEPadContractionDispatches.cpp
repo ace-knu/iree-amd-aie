@@ -849,6 +849,12 @@ static Value growProducerDispatchToPadded(
   Type elemType = srcType.getElementType();
   if (!isa<FloatType>(elemType)) return {};
   if (srcType.getRank() != 2 || dstShape.size() != 2) return {};
+  // A bias-fold LHS with M > 1 (a convolution's im2col) is left to the
+  // caller's zero-pad + ones-column dispatches: padding it inside the
+  // producer folds the reshape and pads into a `map_store` that recomputes
+  // every element's row and column with a div/mod (VGG16's 13 im2col
+  // dispatches: 13 ms -> 37 ms).
+  if (onesKDim && srcType.getDimSize(0) != 1) return {};
   // Nothing to fold in: this operand is already the padded shape (only the
   // other operand's dims grew). Rewriting the producer anyway would flatten
   // its output binding for no reason.
@@ -1027,6 +1033,90 @@ static Value createPaddedConstantGlobal(IRRewriter &rewriter, ModuleOp module,
     paddedGlobalOp->setAttr("stream.affinity.default", affinity);
 
   return paddedGlobalOp.createLoadOp(loc, rewriter)->getResult(0);
+}
+
+/// Creates a host dispatch that writes the bias fold's constant LHS columns
+/// into `buffer` in place (the dispatch is tied to it): over every row, the
+/// columns [k, kPad) of the last dim are 1.0 at k and 0.0 after it, with rows
+/// at linear index >= `m` (M padding, only in a 2-D buffer) all zero. The
+/// rest of `buffer` is left as it is.
+static Value createBiasOnesColumnsDispatch(
+    IRRewriter &rewriter, ModuleOp module, Value buffer, int64_t k, int64_t m,
+    IREE::HAL::DeviceAffinityAttr hostAffinity, int &counter) {
+  Location loc = buffer.getLoc();
+  auto bufType = cast<RankedTensorType>(buffer.getType());
+  Type elemType = bufType.getElementType();
+  int64_t rank = bufType.getRank();
+  SmallVector<int64_t> colsShape(bufType.getShape());
+  colsShape.back() -= k;
+  auto binding = IREE::TensorExt::DispatchTensorType::get(
+      IREE::TensorExt::TensorAccess::ReadWrite, bufType);
+  std::string idx = std::to_string(counter++);
+
+  auto funcOp = func::FuncOp::create(loc, "bias_ones_dispatch_" + idx,
+                                     rewriter.getFunctionType({binding}, {}));
+  funcOp.setPublic();
+  Block *entry = funcOp.addEntryBlock();
+  OpBuilder fb = OpBuilder::atBlockBegin(entry);
+  Value init = fb.create<tensor::EmptyOp>(loc, colsShape, elemType);
+  AffineMap identity = AffineMap::getMultiDimIdentityMap(rank, fb.getContext());
+  bool maskRows = rank == 2 && m < bufType.getDimSize(0);
+  auto generic = fb.create<linalg::GenericOp>(
+      loc, TypeRange{init.getType()}, ValueRange{}, ValueRange{init},
+      ArrayRef<AffineMap>{identity},
+      SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
+      [&](OpBuilder &nb, Location nloc, ValueRange) {
+        Value col = nb.create<linalg::IndexOp>(nloc, rank - 1);
+        Value isOne = nb.create<arith::CmpIOp>(
+            nloc, arith::CmpIPredicate::eq, col,
+            nb.create<arith::ConstantIndexOp>(nloc, 0));
+        if (maskRows) {
+          Value row = nb.create<linalg::IndexOp>(nloc, 0);
+          isOne = nb.create<arith::AndIOp>(
+              nloc, isOne,
+              nb.create<arith::CmpIOp>(
+                  nloc, arith::CmpIPredicate::ult, row,
+                  nb.create<arith::ConstantIndexOp>(nloc, m)));
+        }
+        Value out = nb.create<arith::SelectOp>(
+            nloc, isOne,
+            nb.create<arith::ConstantOp>(nloc, nb.getOneAttr(elemType)),
+            nb.create<arith::ConstantOp>(nloc, nb.getZeroAttr(elemType)));
+        nb.create<linalg::YieldOp>(nloc, out);
+      });
+  SmallVector<OpFoldResult> offsets(rank, fb.getIndexAttr(0));
+  offsets.back() = fb.getIndexAttr(k);
+  SmallVector<OpFoldResult> sizes, strides(rank, fb.getIndexAttr(1));
+  for (int64_t s : colsShape) sizes.push_back(fb.getIndexAttr(s));
+  fb.create<IREE::TensorExt::DispatchTensorStoreOp>(
+      loc, generic.getResult(0), entry->getArgument(0),
+      /*targetDims=*/ValueRange{}, offsets, sizes, strides);
+  fb.create<func::ReturnOp>(loc);
+
+  OpBuilder mb(&module.getBody()->back());
+  auto exeOp =
+      IREE::Flow::ExecutableOp::create(mb, loc, "bias_ones_executable_" + idx);
+  exeOp.setPrivate();
+  OpBuilder exeBuilder = OpBuilder::atBlockBegin(&exeOp.getBlock());
+  auto innerModule = mlir::ModuleOp::create(exeBuilder, loc);
+  innerModule.push_back(funcOp);
+  OpBuilder exportBuilder(exeOp.getBody());
+  auto exportOp = IREE::Flow::ExecutableExportOp::create(
+      exportBuilder, loc, funcOp.getName(), SymbolRefAttr::get(funcOp));
+  Block *wcBlock = &exportOp.getWorkgroupCount().emplaceBlock();
+  OpBuilder wb = OpBuilder::atBlockBegin(wcBlock);
+  Type indexTy = wb.getIndexType();
+  auto countOp = wb.create<IREE::TensorExt::DispatchWorkgroupCountFromSliceOp>(
+      loc, TypeRange{indexTy, indexTy, indexTy}, /*ordinal_operands=*/ValueRange{});
+  wb.create<IREE::Flow::ReturnOp>(loc, countOp.getResults());
+
+  auto dispatchOp = IREE::Flow::DispatchOp::create(
+      rewriter, loc, exportOp, /*workload=*/ValueRange{}, TypeRange{bufType},
+      /*result_dims=*/ValueRange{}, /*arguments=*/ValueRange{buffer},
+      /*argument_dims=*/ValueRange{},
+      /*tied_operands=*/rewriter.getIndexArrayAttr({0}));
+  dispatchOp->setAttr("stream.affinity", hostAffinity);
+  return dispatchOp.getResult(0);
 }
 
 /// Builds the bias-fold LHS without a dispatch when `v` is one contiguous run
@@ -1725,7 +1815,8 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
     rewriter.setInsertionPoint(dispatch);
     // Prefer growing the LHS's own producer dispatch over adding a padding
     // dispatch behind it: for a convolution that turns im2col's 155 MiB
-    // write + read + wider re-write into a single write.
+    // write + read + wider re-write into a single write. A bias-fold
+    // convolution LHS is the exception (see `growProducerDispatchToPadded`).
     Value lhsPadded = growProducerDispatchToPadded(
         rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
         biasAttr ? std::optional<unsigned>(lhsKPos) : std::nullopt,
@@ -1734,6 +1825,27 @@ void AMDAIEPadContractionDispatchesPass::runOnOperation() {
       rewriter.setInsertionPoint(dispatch);
       lhsPadded = createBiasOnesPadByUpdate(
           rewriter, dispatch.getArguments()[lhsArgNo], lhsPad, lhsKPos);
+    }
+    if (!lhsPadded) {
+      rewriter.setInsertionPoint(dispatch);
+      auto lhsType =
+          cast<RankedTensorType>(dispatch.getArguments()[lhsArgNo].getType());
+      // A bias-fold LHS with M > 1 (a convolution's im2col): a plain zero-pad
+      // dispatch, as without the fold, then a small dispatch tied to its
+      // result that writes the ones column. Not the pad + ones generic of
+      // `createBiasOnesPadByGeneric`: that one fails
+      // `iree-codegen-concretize-pad-result-shape` on the CPU backend
+      // whenever M is not a multiple of its tile (VGG16: 3136x1152,
+      // 784x4608, ...).
+      if (biasAttr && lhsKPos == 1 && lhsType.getRank() == 2 &&
+          lhsType.getDimSize(0) != 1) {
+        Value zeroPadded = createPaddingDispatch(
+            rewriter, module, dispatch.getArguments()[lhsArgNo], lhsPad,
+            hostAffinity, counter);
+        lhsPadded = createBiasOnesColumnsDispatch(
+            rewriter, module, zeroPadded, lhsType.getDimSize(1),
+            lhsType.getDimSize(0), hostAffinity, counter);
+      }
     }
     if (!lhsPadded) {
       rewriter.setInsertionPoint(dispatch);
