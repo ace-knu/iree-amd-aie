@@ -35,6 +35,7 @@ iree_cc_library(
   NAME
     Transforms
   HDRS
+    "AMDAIEDispatchRewriteUtils.h"
     "KernelDispatch.h"
     "Passes.h"
     "AMDAIECreateAIEWorkgroup.h"
@@ -70,6 +71,7 @@ iree_cc_library(
     "AMDAIEConvertDeviceToControlPackets.cpp"
     "AMDAIECreateAIEWorkgroup.cpp"
     "AMDAIECreateReferenceToAllocation.cpp"
+    "AMDAIEDispatchRewriteUtils.cpp"
     "AMDAIEDistributeCoresAndObjectFifos.cpp"
     "AMDAIEDistributeL1Allocations.cpp"
     "AMDAIEReplicateCalls.cpp"
@@ -79,6 +81,7 @@ iree_cc_library(
     "AMDAIEDmaToCircularDma.cpp"
     "AMDAIEFlattenLogicalObjectFifo.cpp"
     "AMDAIELinalgFunctionOutlining.cpp"
+    "AMDAIEFoldBiasIntoContractionDispatches.cpp"
     "AMDAIEFoldDmaWaits.cpp"
     "AMDAIEFuseConsumerIntoLoop.cpp"
     "AMDAIEFuseFillIntoForall.cpp"
