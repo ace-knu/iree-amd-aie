@@ -603,18 +603,19 @@ int64_t getGemvMatvecKPadMultiple(int64_t k) {
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
 /// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim)
 /// with M == 1 and an [N, K] weight (see `isGemvShape`), with at most a fused
-/// unary elementwise consumer (ReLU, truncf) as its epilogue.
+/// unary elementwise consumer (ReLU, truncf) as its epilogue (see
+/// `isUnaryElementwiseEpilogue`).
 static bool isGemvLike(linalg::LinalgOp linalgOp) {
   if (!is2DMatmulLikeOp(linalgOp) || isa<linalg::BatchMatmulOp>(linalgOp))
     return false;
-  // A consumer with a second operand (a bias add) is rejected: the GEMV L1
-  // budget and copy staging have no place for it; a constant bias is to be
-  // folded into K in Flow instead.
+  // Any other elementwise consumer, such as one with a second operand (a bias
+  // add), is rejected: the GEMV L1 budget and copy staging have no place for
+  // it; a constant bias is to be folded into K in Flow instead.
   for (Operation *userOp : linalgOp->getUsers()) {
     if (auto linalgUser = dyn_cast<linalg::LinalgOp>(userOp)) {
       if (isElementwise(linalgUser) &&
           !isa<linalg::FillOp, linalg::CopyOp>(linalgUser) &&
-          linalgUser.getNumDpsInputs() != 1)
+          !isUnaryElementwiseEpilogue(linalgUser, linalgOp->getResult(0)))
         return false;
     }
   }

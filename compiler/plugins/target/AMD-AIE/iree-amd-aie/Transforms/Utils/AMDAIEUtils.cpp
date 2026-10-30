@@ -134,6 +134,15 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
 
 bool isGemvShape(int64_t m, bool transposeB) { return m == 1 && transposeB; }
 
+bool isUnaryElementwiseEpilogue(Operation *op, Value result) {
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  return genericOp && linalg::isElementwise(genericOp) &&
+         genericOp.getNumDpsInputs() == 1 && genericOp.getNumDpsInits() == 1 &&
+         genericOp.getDpsInputs()[0] == result &&
+         llvm::all_of(genericOp.getIndexingMapsArray(),
+                      [](AffineMap map) { return map.isIdentity(); });
+}
+
 int64_t choosePoolColumns(int64_t oh, int64_t numCols) {
   if (oh <= 0 || numCols <= 0) return 1;
   int64_t odd = oh;

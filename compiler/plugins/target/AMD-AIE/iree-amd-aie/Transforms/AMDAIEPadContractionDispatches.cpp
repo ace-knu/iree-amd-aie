@@ -187,13 +187,10 @@ static std::optional<MatmulInfo> getMatmulInfo(func::FuncOp func) {
   linalg::GenericOp epilogue;
   if (store.getValue() != matmul.getResult(0)) {
     epilogue = store.getValue().getDefiningOp<linalg::GenericOp>();
-    if (!epilogue || !isElementwise(epilogue) ||
-        epilogue.getNumDpsInputs() != 1 || epilogue.getNumDpsInits() != 1 ||
-        epilogue.getDpsInputs()[0] != matmul.getResult(0) ||
+    if (!epilogue ||
+        !isUnaryElementwiseEpilogue(epilogue, matmul.getResult(0)) ||
         !matmul.getResult(0).hasOneUse() ||
-        !epilogue.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() ||
-        !llvm::all_of(epilogue.getIndexingMapsArray(),
-                      [](AffineMap map) { return map.isIdentity(); }))
+        !epilogue.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>())
       return std::nullopt;
   }
   auto outArg = dyn_cast<BlockArgument>(store.getTarget());

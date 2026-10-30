@@ -85,6 +85,13 @@ bool hasUKernelTemplate(AMDAIEDevice device, StringRef ukernelName,
 /// on which dispatches are GEMV.
 bool isGemvShape(int64_t m, bool transposeB);
 
+/// Returns true if `op` is a unary elementwise epilogue of `result`: a
+/// `linalg.generic` whose only input is `result`, with one init and identity
+/// indexing maps (ReLU, truncf). The GEMV pipeline (`KernelDispatch`) takes a
+/// matmul with such an epilogue, and the Flow pad pass grows it with the
+/// matmul, so both use this to agree on which epilogues are supported.
+bool isUnaryElementwiseEpilogue(Operation *op, Value result);
+
 /// Whether the Flow pad pass may pad a GEMV's N up to a multiple of
 /// `numRows * numCols * kGemvNPerCoreMultiple` so the GEMV pipeline reaches
 /// every core (`gemv_pad_n` in the executable target config; absent means
