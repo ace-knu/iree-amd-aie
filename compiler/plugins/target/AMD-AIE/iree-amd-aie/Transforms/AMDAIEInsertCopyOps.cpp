@@ -235,6 +235,9 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
   // contraction result in the buffer it is computed in, and only the
   // epilogue's result moves out level by level. Staging the epilogue as a
   // standalone op would chain same-memory-space copies around it instead.
+  // Not gated by an option: of the pipelines running this pass (GEMV, pool,
+  // general copy) only the GEMV one has a contraction, so the staging only
+  // ever applies to a GEMV epilogue.
   for (Operation *targetOp : targetOps) {
     // Captured before the init is replaced by its promoted copy.
     Value initDest;
