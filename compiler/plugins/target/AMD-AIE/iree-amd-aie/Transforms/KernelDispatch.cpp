@@ -583,6 +583,23 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
 // 8x pack-peel's 32: 1/8 the DMA programmings and, for bf16, 512 B contiguous
 // DRAM runs instead of 64 B.
 
+bool hasGemvMatvecUKernel(AMDAIEDevice device, DictionaryAttr config,
+                          Type lhsElemType, Type rhsElemType,
+                          Type outElemType) {
+  return isAie2P(device) && hasUkernel(config, "matvec") &&
+         hasUKernelTemplate(device, "matvec",
+                            {lhsElemType, rhsElemType, outElemType},
+                            /*transposeB=*/true);
+}
+
+int64_t getGemvMatvecKTile(int64_t k) {
+  return k % kGemvKTile == 0 ? kGemvKTile : kMatvecUKernelK;
+}
+
+int64_t getGemvMatvecKPadMultiple(int64_t k) {
+  return k >= kGemvKTile ? kGemvKTile : kMatvecUKernelK;
+}
+
 /// Returns true if `linalgOp` is a shape the GEMV pipeline takes instead of
 /// pack-peel: a static, plain 2-D matmul (optionally transposed, no batch dim)
 /// with M == 1 and an [N, K] weight (see `isGemvShape`), with at most a fused
@@ -665,23 +682,19 @@ static LogicalResult setRootConfigForGemvPipeline(
   Type rhsElemType = getElementTypeOrSelf(linalgOp.getDpsInputOperand(1)->get());
   Type outElemType = getElementTypeOrSelf(linalgOp.getDpsInitOperand(0)->get());
   bool useMatvec =
-      K % kMatvecUKernelK == 0 && isAie2P(deviceModel.device) &&
-      hasUkernel(ukernelConfig, "matvec") &&
-      hasUKernelTemplate(deviceModel.device, "matvec",
-                         {lhsElemType, rhsElemType, outElemType},
-                         /*transposeB=*/true);
-  // The matvec ukernel takes a K tile of 256 or 64: its stack at 128 and 192
-  // (1024 and 1088 bytes) leaves no room for the core's own in the 1024-byte
-  // default stack. Otherwise the tile also keeps the per-core A/B slices'
-  // byte length a multiple of 4 (`aie.dma_bd`'s transfer-length constraint):
-  // a bf16 K = 8032 = 2^5 * 251 would pick the odd factor 251.
+      K % kMatvecUKernelK == 0 &&
+      hasGemvMatvecUKernel(deviceModel.device, ukernelConfig, lhsElemType,
+                           rhsElemType, outElemType);
+  // Without the matvec ukernel the tile keeps the per-core A/B slices' byte
+  // length a multiple of 4 (`aie.dma_bd`'s transfer-length constraint): a
+  // bf16 K = 8032 = 2^5 * 251 would pick the odd factor 251.
   auto alignElems = [](int64_t nBytes) {
     return 4 / std::gcd<int64_t>(nBytes, 4);
   };
   int64_t kAlign =
       std::lcm<int64_t>(alignElems(nBytesLhs), alignElems(nBytesRhs));
   int64_t kTile =
-      useMatvec ? (K % kGemvKTile == 0 ? kGemvKTile : kMatvecUKernelK)
+      useMatvec ? getGemvMatvecKTile(K)
                 : findLargestFactor(K, kGemvKTile, kAlign);
   // Per-core N tile and L0 N block from `chooseGemvNTiling`. The core memory
   // budget leaves the core's stack out, which the buffer allocation adds back

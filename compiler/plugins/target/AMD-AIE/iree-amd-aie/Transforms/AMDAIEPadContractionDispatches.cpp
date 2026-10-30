@@ -99,17 +99,15 @@ static std::optional<PaddingMultiples> getPaddingMultiples(
   std::optional<int64_t> numCols = getConfigNumColumns(target);
   if (!device || !numRows || !numCols) return std::nullopt;
   if (isGemvShape(m, transposeB)) {
-    bool useMatvec = isAie2P(*device) &&
-                     hasUkernel(target.getConfiguration(), "matvec") &&
-                     hasUKernelTemplate(*device, "matvec",
-                                        {lhsElemType, rhsElemType, accElemType},
-                                        /*transposeB=*/true);
+    bool useMatvec =
+        hasGemvMatvecUKernel(*device, target.getConfiguration(), lhsElemType,
+                             rhsElemType, accElemType);
     return PaddingMultiples{
         /*m=*/1,
         /*n=*/getConfigGemvPadN(target)
             ? *numRows * *numCols * kGemvNPerCoreMultiple
             : 1,
-        /*k=*/useMatvec ? (k >= kGemvKTile ? kGemvKTile : kMatvecUKernelK)
+        /*k=*/useMatvec ? getGemvMatvecKPadMultiple(k)
                         : getPackPeelReductionTile(/*kPackScaleL1=*/1)};
   }
   AMDAIEDeviceModel deviceModel = getDeviceModel(*device);

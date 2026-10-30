@@ -8,6 +8,7 @@
 #define IREE_AMD_AIE_TRANSFORMS_KERNELDISPATCH_H_
 
 #include "iree-amd-aie/aie_runtime/AMDAIEEnums.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 
@@ -51,6 +52,23 @@ constexpr int64_t kGemvKTile = 256;
 /// K elements the matvec ukernel reads per vector; with it the GEMV K tile is a
 /// multiple of this.
 constexpr int64_t kMatvecUKernelK = 64;
+
+/// Returns true if a GEMV tile with these element types is lowered to the
+/// matvec ukernel on `device` under the ukernel `config` (`ukernels` entry),
+/// for a K that is a multiple of `kMatvecUKernelK`.
+bool hasGemvMatvecUKernel(AMDAIEDevice device, DictionaryAttr config,
+                          Type lhsElemType, Type rhsElemType, Type outElemType);
+
+/// The GEMV pipeline's K tile with the matvec ukernel, for a K that is a
+/// multiple of `kMatvecUKernelK`: the full `kGemvKTile` when it divides K, else
+/// one ukernel vector. The ukernel's stack at 128 and 192 (1024 and 1088 bytes)
+/// leaves no room for the core's own in the 1024-byte default stack.
+int64_t getGemvMatvecKTile(int64_t k);
+
+/// The multiple the Flow pad pass pads a matvec GEMV's K to, so that
+/// `getGemvMatvecKTile` of the padded K is the full `kGemvKTile` once K reaches
+/// it.
+int64_t getGemvMatvecKPadMultiple(int64_t k);
 
 /// The Flow pad pass grows a GEMV's N to a multiple of this many outputs per
 /// core, so the per-core N always has a divisor of at least this size.
