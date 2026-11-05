@@ -4,7 +4,55 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
 - 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S11. S6·S10은 dev 통합 때 삭제)
-- **Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이 맨 위 절이다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+- **CPU·GPU 공유 버퍼 + 링크 표 GPU → CPU true(2026-11-03·11-05, 브랜치 `feature/cpu-gpu-shared-buffer`, dev 미반영)가 맨 위 절이고, 그다음이 Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+
+## CPU·GPU 공유 버퍼: Vulkan 가져오는 순서 + 링크 표 GPU → CPU true (2026-11-03·11-05, 브랜치 `feature/cpu-gpu-shared-buffer`)
+
+CPU가 GPU 소유 공유 버퍼를 읽을 때 매우 느린 문제(GoogLeNet CPU+GPU가 CPU 단독보다 느림)에서 출발했다. 링크 표 GPU → CPU 칸을 장치가 실제로 할 수 있는 것(true)에 맞춘다. 경위는 로컬 세션 기록 `docs/2026-11-03/3_CPU_GPU_공유버퍼/`, `docs/2026-11-05/1_BRIDGE경로_링크true_캐시/`(팀 git 미포함)에 있다. **dev 반영은 단계 3(가져온 버퍼 캐시·방식 비교)이 끝난 뒤 박사형 확인을 받고 정한다.**
+
+### 기준과 원칙
+
+- 박사형 판단(11/03): 메모리 종류를 CPU 캐시 되는 쪽으로 바꾸는 것은 통합 GPU 특화라 채택하지 않는다(비교 기준). Vulkan이 다른 장치를 기다린 뒤 가져오도록 순서를 고치는 것이 장치와 상관없이 맞는 설계다.
+- 버퍼 소유자는 링크 표로 정한다(S8). 지금 표에서는 CPU ↔ GPU 두 칸이 모두 true라 CPU·GPU 공유 버퍼는 동률이고 lead 장치가 할당한다.
+
+### dev 기준으로 본 변경
+
+| 영역 | 내용 | 커밋 |
+|---|---|---|
+| Vulkan 가져오는 순서(A+B) | `queue_execute`가 남의 장치 semaphore를 호스트에서 먼저 기다리고 그 뒤에 명령을 기록한다. one-shot command buffer와 queue fill/copy/update도 deferred로 만들어 `queue_execute`에서 기록한다. transient CPU 버퍼를 메모리가 생긴 뒤 가져온다(S3) | fork `210f677`, 포인터 `f9d7da66` |
+| 회귀 v10 | `cg_softmax_lead0`(CPU softmax → GPU matmul → CPU softmax → GPU matmul, 512×512, CPU·GPU 공유 transient 경합) 추가, 28 케이스 | `af534b16` |
+| 완료 공개 전 해제 합치기 | `fix/vulkan-completion-release-order`(S11) merge. fork는 `210f677`에 브랜치를 만들어 merge(같은 커밋 해시 공유) | fork `cd34cf2`, 상위 `0d306f4e` |
+| 링크 표 GPU → CPU true | `AMDAIEDevicePlacementUtils.cpp` `linkFlags` false → true, 주석(두 전제: 가져오는 순서, S11), lit 2줄 | `cb41b711` |
+
+### 검증 (링크 표 true, 2026-11-05, 전원 모드 default)
+
+| 시험 | 회수 | 결과 | 11/03(A+B만) |
+|---|---|---|---|
+| GoogLeNet CPU+GPU lead CPU | 3,000 | 0 오류, 멈춤 0 | 2,100회 중 8회 정리 단계 abort |
+| 경합 `cg_softmax` / `softmax_first` N=512 lead CPU | 300 / 300 | 0 / 0 | 0 / 0 |
+| 최소 재현 2종 | 1,000 / 1,000 | 0 / 0 | — |
+| GPU 단독 GoogLeNet | 100 | 0 | — |
+| GoogLeNet lead GPU | 300 | 0 오류, 멈춤 2 | 50 회 0 |
+| 회귀 v10 28 × manual·auto(lead 조합, NPU 3장치 포함) | 56 | 28/28 × 2 | 28/28 × 2 |
+| VGG16 CPU+NPU+GPU f32 | 3 | corr 1.00000, top-1 일치 | — |
+| 지연 진단(완료 감시 지연·정지, BRIDGE 지연, 조회 경로 조건) 9가지 | 1,150 | 0 오류, 멈춤 0 | — |
+
+- **판단 근거**: abort·잘못된 출력·실패 종료가 0이다. 멈춤은 lead GPU 2건뿐이다. 둘 다 원래 Vulkan `queue_alloca` 호스트 대기 자리(P2, 원인 미규명)이고, 같은 날 링크 false lead GPU와 같은 빈도(2/300)다. BRIDGE 대기 자리 멈춤은 0이다.
+- 링크 true 적용 확인: GoogLeNet 1회에 Vulkan이 CPU 소유 버퍼를 가져오기 170회(링크 false 0회), 출력 비트 같음.
+- 성능(참고, 단계 3에서 같은 조건으로 다시 잼): GoogLeNet lead CPU 벽시계 중앙 205 ms(링크 false) → 106 ms(링크 true).
+
+### 알려진 제한
+
+| 항목 | 내용 |
+|---|---|
+| host 포인터 import 전제 | GPU → CPU true는 Vulkan이 CPU 메모리를 host 포인터로 가져올 수 있는 장치(통합 GPU)를 전제한다. 외장 GPU 등에서 안 되면 이 칸은 false여야 한다 |
+| 가져오기 반복 | 명령마다 가져온다(캐시 없음). GoogLeNet 1회 170회 약 7–8 ms, 기록 9–10 ms(단계 3 대상) |
+| Vulkan `queue_alloca` 대기 | 링크 true에서 가장 큰 비용(GoogLeNet 45–58 ms)이고 P2 멈춤 자리다(별도 Task 후보) |
+
+### 남은 일
+
+- 단계 3: 가져온 버퍼 캐시, 메모리 종류·링크 true·캐시 방식 비교.
+- dev 반영 여부 결정(박사형 확인).
 
 ## Vulkan 완료 공개 전 해제 수정 후 상태 (2026-11-04 첫 판, 2026-11-05 갱신, 브랜치 `fix/vulkan-completion-release-order`)
 

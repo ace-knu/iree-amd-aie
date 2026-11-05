@@ -32,7 +32,7 @@ CPU + NPU, CPU + GPU, CPU + NPU + GPU 구성을 지원한다(3devices-f32 통합
 | CPU → NPU | true | amdxdna BO는 host-local·device-visible이라 CPU dispatch가 host-map한다 |
 | NPU → CPU | false | amdxdna HAL allocator에 `import_buffer`가 없어 NPU가 CPU heap 할당을 바인딩하지 못한다 |
 | CPU → GPU | true | 이 장비(UMA)의 Vulkan dispatch 메모리는 DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT라 CPU가 host-map한다. 외장 GPU면 false여야 한다 |
-| GPU → CPU | false | Vulkan BRIDGE는 명령을 기록할 때 CPU 버퍼를 host 포인터로 import하는데, queue 순서 할당(transient)은 그때 아직 메모리가 없다. BRIDGE가 실행 시점에 import하게 되면 true로 되돌릴 수 있다 |
+| GPU → CPU | true | Vulkan BRIDGE가 CPU 버퍼를 host 포인터로 import한다. Vulkan은 남의 장치 semaphore를 호스트에서 기다린 뒤에 명령을 기록하므로 queue 순서 할당(transient)도 그때 메모리가 있다(fork `210f677`). 함수가 GPU dispatch 직후 CPU에서 끝나도 정리 단계가 안전하도록 Vulkan은 완료를 보이기 전에 끝난 제출의 자원을 놓는다(S11). CPU·GPU 공유 버퍼는 동률이라 lead가 할당한다. **전제**: host 포인터 import가 되는 장치(통합 GPU). 외장 GPU 등에서 안 되면 이 칸은 false여야 한다. 이력: 통합 때 false(`e3d86485`) → 2026-11-05 true(`cb41b711`, 이 브랜치) |
 | GPU → NPU | true | amdxdna가 BO를 dma-buf fd로 export하고 Vulkan이 import한다(BRIDGE가 자동으로 처리) |
 | NPU → GPU | false | amdxdna에 import가 없고 Vulkan allocator는 export하지 않는다 |
 
