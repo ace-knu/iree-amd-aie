@@ -17,3 +17,4 @@ CLAUDE.md 1-4의 2(구현 명세) 형식의 주제별 명세다. 변경 장부�
 | S8 | 전임자 `ResolveBufferOwner` + stream hook + 링크 표 | 인수인계 기준선 |
 | S9 | 전임자 런타임 공유 경로 | 인수인계 기준선 |
 | S10 | (삭제) ukernel bf16 반올림 | dev에 반영됨(`cff1e56e`, 반올림 모드 저장·복원 포함) |
+| S11 | Vulkan: 완료가 보이기 전에 끝난 제출의 자원을 놓음(완료 감시·BRIDGE·semaphore 조회) | 런타임(업스트림 코드·전임자 BRIDGE 수정) |

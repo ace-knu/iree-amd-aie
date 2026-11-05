@@ -60,24 +60,31 @@ LinkCapability linkFlags(StringRef srcBackend, StringRef dstBackend) {
     return {/*unifiedMemory=*/false, /*transparentAccess=*/false};
 
   // ---- CPU <-> GPU --------------------------------------------------------
-  //  - llvm-cpu -> vulkan-spirv is true. Vulkan dispatch allocations are
-  //    selected as DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT on this platform,
-  //    so a CPU dispatch host-maps them directly.
+  //  - llvm-cpu -> vulkan-spirv is true. Every Vulkan dispatch allocation is
+  //    host-visible on this platform: on an integrated GPU the Vulkan
+  //    allocator drops DEVICE_LOCAL and takes the first HOST_VISIBLE memory
+  //    type (vulkan/base_buffer.c), here HOST_VISIBLE|HOST_COHERENT without
+  //    HOST_CACHED. A CPU dispatch host-maps such a buffer directly; its CPU
+  //    reads are uncached and slow.
   //    Covered by regression cg_topo_lead0/lead1.
   //    NOTE: on a discrete GPU whose dispatch memory is not host-visible this
   //    row must be false.
   if (srcBackend == "llvm-cpu" && dstBackend == "vulkan-spirv")
     return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
-  //  - vulkan-spirv -> llvm-cpu is false. The shared buffer bridge
+  //  - vulkan-spirv -> llvm-cpu is true. The shared buffer bridge
   //    (resolve_buffer_ref in vulkan/direct_command_buffer.cc) imports a
-  //    local-task buffer by its host pointer when the command is recorded,
-  //    but a queue-ordered (transient) CPU allocation has no memory until its
-  //    alloca executes, so the import fails ("transient buffer has not been
-  //    committed"). Already allocated host buffers do import, but the owner
-  //    choice cannot tell the two apart, so a buffer shared by the two must
-  //    be GPU-owned. Set back to true once the bridge imports at execution.
+  //    local-task buffer by its host pointer. Vulkan records every command
+  //    buffer in queue_execute after the waits on other devices' semaphores
+  //    are satisfied (vulkan/vulkan_device.cc), so a queue-ordered (transient)
+  //    CPU allocation already has its memory when it is imported. A buffer
+  //    shared by the two is a tie and the lead device allocates it.
+  //    The row also relies on Vulkan releasing completed submissions before a
+  //    completion becomes visible (vulkan/completion_watcher.cc,
+  //    docs/specs/S11): when the CPU finishes the program right after a GPU
+  //    dispatch, module teardown otherwise found rodata still referenced.
+  //    Covered by regression cg_topo_lead0/lead1 and cg_softmax_lead0.
   if (srcBackend == "vulkan-spirv" && dstBackend == "llvm-cpu")
-    return {/*unifiedMemory=*/false, /*transparentAccess=*/false};
+    return {/*unifiedMemory=*/false, /*transparentAccess=*/true};
 
   // ---- GPU <-> NPU --------------------------------------------------------
   //  - vulkan-spirv -> amd-aie is true. The amdxdna allocator exports a BO as
