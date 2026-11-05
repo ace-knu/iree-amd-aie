@@ -30,7 +30,7 @@
 // Without the flag: round-robin npu, gpu, (host), npu. The topology over all
 // three devices follows the link table in AMDAIEDevicePlacementUtils.cpp.
 // OFF: module attributes {
-// OFF-SAME: stream.topology = #hal.device.topology<links = [(@npu -> @gpu = {}), (@npu -> @cpu = {}), (@gpu -> @npu = {transparent_access = true}), (@gpu -> @cpu = {}), (@cpu -> @npu = {transparent_access = true}), (@cpu -> @gpu = {transparent_access = true})]>
+// OFF-SAME: stream.topology = #hal.device.topology<links = [(@npu -> @gpu = {}), (@npu -> @cpu = {}), (@gpu -> @npu = {transparent_access = true}), (@gpu -> @cpu = {transparent_access = true}), (@cpu -> @npu = {transparent_access = true}), (@cpu -> @gpu = {transparent_access = true})]>
 // OFF-LABEL: util.func public @model
 // OFF: flow.dispatch @model_dispatch_0::@model_dispatch_0_matmul_4x4x4_f32
 // OFF-SAME: stream.affinity = #hal.device.affinity<@npu>
@@ -82,7 +82,7 @@
 // List and direct device symbols; only @gpu and @cpu are used, so the
 // injected topology covers just those two.
 // LST: module attributes {
-// LST-SAME: stream.topology = #hal.device.topology<links = [(@gpu -> @cpu = {}), (@cpu -> @gpu = {transparent_access = true})]>
+// LST-SAME: stream.topology = #hal.device.topology<links = [(@gpu -> @cpu = {transparent_access = true}), (@cpu -> @gpu = {transparent_access = true})]>
 // LST-LABEL: util.func public @model
 // LST: flow.dispatch @model_dispatch_0::
 // LST-SAME: stream.affinity = #hal.device.affinity<@gpu>
