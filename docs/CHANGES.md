@@ -3,8 +3,58 @@
 git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러그인·IREE 서브모듈)를 고치는 세션은 끝날 때 이 파일을 갱신한다(CLAUDE.md 1-4의 4, 3-1-2).
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
-- 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S11. S6·S10은 dev 통합 때 삭제)
-- **링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정(2026-11-03·11-05)이 맨 위 절이고, 그다음이 Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이다. 두 절은 함께 dev 통합 브랜치 `integrate/vulkan-order-link-true`(2026-11-05)로 들어간다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+- 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S12. S6·S10은 dev 통합 때 삭제)
+- **맨 위 절은 Vulkan semaphore 호스트 쪽 값 단조 수정(2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`, 통합 브랜치 기준)이다.** 그 아래로 링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정(2026-11-03·11-05)이 있고, 그다음이 Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이다. 두 절은 함께 dev 통합 브랜치 `integrate/vulkan-order-link-true`(2026-11-05)로 들어간다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+
+## Vulkan semaphore 호스트 쪽 값 단조 수정 — 드문 멈춤(P2) (2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`)
+
+- 기준: dev 통합 브랜치 `integrate/vulkan-order-link-true`(상위 `0a779024`, fork `cd34cf2`).
+  - dev를 쓰는 모두가 겪는 멈춤 버그라서, Vulkan alloca 대기 제거(보류)를 기다리지 않고 먼저 넣을 수 있게 따로 둔다.
+- 명세: `docs/specs/S12_Vulkan_semaphore_호스트값_단조.md`. 경위는 로컬 세션 기록 `docs/2026-11-05/2_Vulkan_alloca_대기/`(팀 git 미포함)에 있다.
+  - 챕터 01: 원인 확정
+  - 챕터 02: 설계
+  - 챕터 03: 구현·검증
+
+### 기준과 원칙
+- **원인**: Vulkan semaphore의 호스트 쪽 값(`iree_async_semaphore_t::timeline_value`)이 뒤로 갔다(1 → 0).
+  - 조회·대기·완료 감시가 Vulkan에서 읽은 값을 그대로 덮어썼다(업스트림 `d7f5aba`, #23695).
+  - 그래서 늦게 돌아온 조회가 이미 올라간 값을 되돌리면, 그 직후 등록한 대기자를 아무도 깨우지 않았다.
+  - 증상: CPU+GPU에서 드물게(GoogLeNet 0.02–0.08%) 메인 스레드가 Vulkan `queue_alloca`·BRIDGE·VM fence 대기에서 끝나지 않음.
+- **업스트림을 따른다.** 업스트림 main의 새 Vulkan 드라이버가 같은 경합을 닫은 두 규칙(`9e2ac9142e`)을 옛 드라이버의 같은 자리에 옮긴다. HIP도 같은 규칙이다.
+  - 관찰은 앞으로만(CAS)
+  - 호스트 신호는 호스트 쪽 값 먼저
+- 공용 코드(`iree/async/`)는 바꾸지 않는다. 업스트림 새 드라이버를 들여오면 이 수정은 파일과 함께 사라지고, 같은 동작이 유지된다(다시 넣을 것 없음).
+
+### dev 기준으로 본 변경
+| 파일(`third_party/iree/runtime/src/iree/hal/drivers/vulkan/`) | 변경 |
+|---|---|
+| `native_semaphore.cc` | 새 함수 `iree_hal_vulkan_native_semaphore_observe_value`(더 클 때만 CAS로 올리고, 올린 쪽만 대기자를 깨움). 조회·대기가 이 함수를 씀(조회 반환값 = 반영 뒤 호스트 쪽 값). 호스트 신호 순서를 "호스트 쪽 CAS → `vkSignalSemaphore` → 깨움"으로 |
+| `native_semaphore.h` | 위 함수 선언 |
+| `completion_watcher.cc` | scan 3단계가 위 함수를 씀 |
+- fork 커밋 `d79945b` 1개(+71/−38줄), 상위 포인터 `fdeae865`.
+
+### 검증 (2026-11-06, 전원 모드 default)
+| 항목 | 수정 전 | 수정 뒤 |
+|---|---|---|
+| 조회 읽기→반영 사이 2 ms 지연(GoogLeNet CPU+GPU) | 19/19 멈춤 | **600/600 통과**(lead CPU·GPU 각 300, 지난 값을 읽은 경합이 600회차 모두에서 일어나 무시됨) |
+| 호스트 신호 두 단계 사이 2 ms 지연 | — | 600/600 통과, 신호 실패 0 |
+| 자연 반복 | 46,500회 중 멈춤 18 | **18,000회 멈춤 0**(기대 7.5건) + 계측 없는 빌드 3,000회 0 |
+| 회귀 v10 × 2 | 28/28 × 2 | 수동 28/28·자동 28/28, 2회 |
+| 12조합(MLP·VGG16 × 6장치 조합) 출력 sha256 | — | 12/12 dev와 같음 |
+| dispatch별 장치 배정(12조합) | — | 12/12 dev와 같음 |
+| ctest amd-aie·SPIR-V·Vulkan | 232·65·12 | 232/232·65/65·12/12 |
+| ctest 전체 실패·미실행 목록 | dev 1,303개 | dev와 같음(diff 0) |
+| 성능(한 프로세스 20회 × 5회차) | — | 수정/수정 전 0.97–1.03(흔들림 범위) |
+
+### 알려진 제한
+- 평소의 Vulkan `queue_alloca` 호스트 대기 시간은 그대로다.
+  - GoogLeNet lead CPU에서 48–61 ms다. 대부분 CPU 작업을 기다리는 의존 대기라 alloca만 고쳐서는 줄지 않는다(S12 L-time).
+- `vkGetSemaphoreCounterValue`가 GPU 완료 순간 늦게 돌아오는 이유는 조사하지 않았다(S12 L-slowq). 수정 뒤에는 멈춤과 무관하다.
+- 업스트림 Metal(`shared_event.m`)에도 같은 덮어쓰기가 있다. 이 장비와 무관하다.
+
+### 남은 일
+- Vulkan `queue_alloca` 대기 제거(Feature 2)는 보류("필요할 때")다. 설계는 로컬 `02_설계/B_대기제거_비교.md`.
+- 비차단 BRIDGE(VM 스레드가 남의 semaphore를 호스트에서 기다리지 않게)는 Task 2 시작 때 형 판단을 받는다.
 
 ## 링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정 (2026-11-03·11-05, 브랜치 `feature/cpu-gpu-shared-buffer` → dev 통합 브랜치 `integrate/vulkan-order-link-true`)
 
