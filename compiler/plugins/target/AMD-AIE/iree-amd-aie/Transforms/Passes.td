@@ -104,7 +104,7 @@ def AMDAIEAssignDeviceAffinities :
 
 def AMDAIEResolveBufferOwner :
     Pass<"iree-amdaie-resolve-buffer-owner", "ModuleOp"> {
-  let summary = "Resolve #hal.device.optimal allocation affinities to a single owner using stream.topology (all other candidates must have transparent access to the owner).";
+  let summary = "Resolve #hal.device.optimal allocation affinities to a single owner using stream.topology (all other candidates must have transparent access to the owner); on a tie, the qualifier that is the only device using the resource outside initializers owns it.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEResolveBufferOwnerPass()";
 }

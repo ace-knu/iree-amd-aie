@@ -103,6 +103,7 @@ iree_lit_test_suite(
     "propagate_data_layout.mlir"
     "remove_memory_space.mlir"
     "remove_wrap_flag_from_gep.mlir"
+    "resolve_buffer_owner.mlir"
     "sink_into_core.mlir"
     "split_control_packet_data.mlir"
     "split_logicalobjfifos.mlir"
