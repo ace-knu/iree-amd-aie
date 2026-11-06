@@ -71,8 +71,12 @@ CPU + NPU, CPU + GPU, CPU + NPU + GPU 구성을 지원한다(3devices-f32 통합
 
 - `scripts/onnx/`는 CPU(`local-host`)를 첫 장치로 강제한다. CPU가 host 코드를 실행하므로 기본 장치이자 lead가 된다.
 - **소유자 규칙**: 후보 X는 다른 모든 후보 Y에 대해 `(Y → X)`가 transparent일 때만 소유자가 될 수 있다. 자격자가 정확히
-  하나면 그 장치로 정하고, 0개나 여럿이면 `#hal.device.optimal`을 그대로 두어 런타임이 고른다. 위 링크 표로는 CPU+NPU는
-  NPU, CPU+GPU는 GPU, GPU+NPU는 NPU, 세 장치가 함께 쓰면 NPU가 소유한다.
+  하나면 그 장치로 정하고, 0개면 `#hal.device.optimal`을 그대로 두어 런타임이 고른다. 위 링크 표로는 CPU+NPU는
+  NPU, GPU+NPU는 NPU, 세 장치가 함께 쓰면 NPU가 소유한다. CPU+GPU는 두 칸(CPU → GPU, GPU → CPU)이 모두 true라
+  둘 다 자격자다(동률, 2026-11-05 GPU → CPU true 이후).
+- **동률 규칙**(2026-11-06): 자격자가 여럿이면, 실행 함수(initializer가 아닌 함수)에서 그 버퍼를 쓰는 장치가 자격자
+  하나뿐일 때 그 장치가 소유한다(예: CPU initializer가 한 번 만들고 GPU만 실행마다 읽는 hoisted 상수 → GPU). 그 밖에는
+  `optimal`로 두어 런타임 lead가 할당한다(예: CPU와 GPU가 실행마다 함께 쓰는 활성값 → lead CPU). 명세 S8 7절.
 - **입력 배치**: `AMDAIEAnnotateInputDevices`가 같은 규칙으로 입력별 장치를 reflection에 기록하고, `iree-run-module`이
   `--input_device` 없이 그 장치로 입력을 옮긴다.
 

@@ -4,7 +4,56 @@ git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러�
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
 - 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S12. S6·S10은 dev 통합 때 삭제)
-- **맨 위 절은 Vulkan semaphore 호스트 쪽 값 단조 수정(2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`, 통합 브랜치 기준)이다.** 그 아래로 링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정(2026-11-03·11-05)이 있고, 그다음이 Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이다. 두 절은 함께 dev 통합 브랜치 `integrate/vulkan-order-link-true`(2026-11-05)로 들어간다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+- **맨 위 절은 소유자 동률 규칙(2026-11-06, 브랜치 `feature/gpu-dispatch-fixed-cost`, dev `f51ef857` 기준, dev 반영은 형 확인 뒤 결정)이다.** 그 아래가 Vulkan semaphore 호스트 쪽 값 단조 수정(2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`, 통합 브랜치 기준)이다. 그 아래로 링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정(2026-11-03·11-05)이 있고, 그다음이 Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이다. 두 절은 함께 dev 통합 브랜치 `integrate/vulkan-order-link-true`(2026-11-05)로 들어간다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+
+## 소유자 동률 규칙 — CPU가 만들고 GPU가 읽는 상수를 GPU 소유로 (2026-11-06, 브랜치 `feature/gpu-dispatch-fixed-cost`)
+
+- 기준: dev `f51ef857`(fork `d79945b`). fork는 바꾸지 않았다. 코드 커밋 `3a0c5892`. **dev 반영은 결과를 형께 확인받고 정한다.**
+- 명세: `docs/specs/S8_전임자_ResolveBufferOwner_stream_hook_배정표.md` 7절. 경위는 로컬 세션 기록 `docs/2026-11-06/2_GPU_고정비용/`(팀 git 미포함)에 있다.
+  - 챕터 01: 원인 확정
+  - 챕터 02: 설계
+  - 챕터 03: 구현·검증
+
+### 기준과 원칙
+- **원인**
+  - CPU+GPU에서 Vulkan BRIDGE는 Vulkan이 아닌 버퍼를 쓸 때마다 할당 전체를 새 Vulkan 버퍼로 import한다(`direct_command_buffer.cc` `resolve_buffer_ref`).
+  - 새로 import한 버퍼는 처음 쓰는 제출에서 크기에 비례하는 준비 비용(GPU 시작 전)을 낸다. 시험 프로그램 64 MiB 0.4–17 ms, 프로세스마다 흔들림.
+  - Inception-v4는 호출당 447회 5.4 GB를 import했다. 그중 87%가 **CPU initializer가 만든 hoisted 상수**(conv bias broadcast 묶음, 34.5 MiB)를 GPU dispatch 136개가 읽을 때마다 다시 import한 것이었다.
+  - 그 상수가 CPU 소유가 된 이유: 링크 표의 CPU → GPU, GPU → CPU 칸이 모두 true라 소유 자격자가 둘(동률)이고, 동률이면 런타임 lead(CPU)가 할당한다.
+- **원칙**
+  - 링크 표(자격)는 바꾸지 않는다.
+  - 동률일 때만 쓰임새로 정한다. 실행 함수에서 그 버퍼를 쓰는 장치가 자격자 하나뿐이면 그 장치가 소유한다.
+  - 장치 이름은 보지 않는다. 모르는 사용이 있으면 지금처럼 lead로 둔다.
+  - 더 넓은 규칙(실행마다 참조 수가 많은 쪽)은 일부 활성값을 GPU 소유로 바꿔 CPU가 GPU 메모리를 읽게 하므로 넣지 않았다.
+
+### dev 기준으로 본 변경
+| 파일(`compiler/plugins/target/AMD-AIE/iree-amd-aie/`) | 변경 |
+|---|---|
+| `Transforms/AMDAIEResolveBufferOwner.cpp` | 동률(자격자 2명 이상)인 `stream.resource.alloca`의 자원을 `stream.timepoint.await`·`util.global` store/load로 추적한다. initializer 밖 `stream.cmd.execute` 사용 장치가 자격자 하나면 그 장치로 alloca·dealloca affinity를 정한다(53 → 168줄) |
+| `Transforms/Passes.td` | pass 설명 한 줄(동률 규칙) |
+| `Transforms/test/resolve_buffer_owner.mlir`(새 lit), `Transforms/test/CMakeLists.txt`(lit 목록에 한 줄 등록) | 5가지: initializer 상수 + global → GPU / 두 장치 사용 → optimal 유지 / 자격자 1명 → 표대로 / 한 장치·await·dealloca → GPU / 반환으로 새어 나감 → 유지 |
+| 문서 | S8 7절, `docs/device_placement.md` 소유자 문단(동률·CPU+GPU 동률 문구 정정), 이 절 |
+
+### 검증 (2026-11-06, 전원 모드 default)
+| 항목 | 결과 |
+|---|---|
+| 새 lit `resolve_buffer_owner.mlir` 5가지(ctest `iree/target/amd-aie/Transforms/test/resolve_buffer_owner.mlir.test`) | 통과(수정 전 바이너리로는 initializer 상수·한 장치 사용 두 경우가 실패) |
+| 회귀 v10 × 2(수동·자동) | 28/28 × 2(수정 전과 같음) |
+| ctest 부분(`iree/target/amd-aie/\|iree-amd-aie/\|SPIRV\|iree/hal/drivers/vulkan`) | 수정 전 309/309 → 수정 후 310/310(새 lit 1개 더함) |
+| MLP·VGG16 × 장치 조합 6(12조합) | 출력 sha 12/12, dispatch별 장치 12/12가 dev와 같다. 바뀐 소유자: GPU가 낀 VGG16 세 조합의 initializer 상수 하나씩(`optimal` → Vulkan) |
+| 성능용 4모델 소유자 | hoisted 상수 하나만 바뀜(GoogLeNet 6.95, Inception-v3 17.39, v4 34.48, v3 입력 846 15.60 MiB) |
+| 성능(CPU+GPU, 한 프로세스 20회 × 5회차, dev와 번갈아, 회차별 중앙) | Inception-v4 906–1,048 → **289–302 ms**(CPU only 108–111), Inception-v3 270–385 → **146–170**(42–46), GoogLeNet 78–119 → **57–77**(7.8–7.9), v3 입력 846 907–1,018 → 887–1,013(314–316). 출력 sha 모두 같음. CPU only를 이기는 모델은 없다 |
+| v4 import(trace) | 호출당 447 → 311회, host 103–109 → 18–19 ms, GPU 제출~완료 643–712 → 141–143 ms |
+| 반복 | GoogLeNet CPU+GPU 1,000/1,000, Inception-v4 300/300. hang·abort·실패 종료 0, 출력 한 가지 |
+
+### 알려진 제한
+- 활성값(CPU와 GPU가 실행마다 함께 쓰는 transient)은 그대로 lead(CPU) 소유라 GPU가 계속 import한다(v4 호출당 311회 709 MiB, 비용 약 120 ms). 줄이려면 import 캐시(캐시 C)가 필요하다. 64 MiB 넘는 활성값은 CPU 풀이 호출마다 새로 받으므로 캐시로도 줄지 않는다(Inception-v3 입력 846: 호출당 활성값 2.1 GB, 이 수정으로 −5%).
+- 자원이 함수 밖으로 나가거나 block argument로 넘어가면 규칙을 적용하지 않는다(보수적).
+- import와 무관한 GPU dispatch당 비용(VM 스레드 막힘·handoff·제출)은 그대로다. v4에서 남은 비용은 GPU dispatch당 1.67 ms(import 관련 0.79 / 무관 0.78)이고, CPU only를 이기려면 약 0.32 ms 아래여야 한다. 그래서 어느 모델도 CPU only를 아직 이기지 못한다.
+
+### 남은 일
+- 형 확인 뒤 dev 반영 여부 결정
+- 다음 순서(사용자 결정): 비차단 BRIDGE·Task 2(import와 무관한 0.78 ms/dispatch + concurrent execution) → 캐시 C(별도 Feature·브랜치, v4 약 297 → 180–200 ms 추정) → CPU 풀 정책(64 MiB 넘는 요청)
 
 ## Vulkan semaphore 호스트 쪽 값 단조 수정 — 드문 멈춤(P2) (2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`)
 
