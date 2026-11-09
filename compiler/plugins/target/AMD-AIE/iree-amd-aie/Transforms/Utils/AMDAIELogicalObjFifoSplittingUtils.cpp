@@ -563,6 +563,30 @@ struct OffsetConfig {
   OpFoldResult newOffset;
 };
 
+/// Returns true if loop induction variable `iv` stays in the first of the new
+/// objectFifos of a split: below `splitDimSize` (the split dim's size per new
+/// objectFifo) for a unit `splitStride`, and 0 otherwise, where the offset
+/// itself selects the objectFifo. False if its range is not static.
+static bool ivStaysInFirstSplit(BlockArgument iv, int64_t splitDimSize,
+                                int64_t splitStride) {
+  auto loop = cast<LoopLikeOpInterface>(iv.getOwner()->getParentOp());
+  std::optional<SmallVector<Value>> ivs = loop.getLoopInductionVars();
+  std::optional<SmallVector<OpFoldResult>> lbs = loop.getLoopLowerBounds();
+  std::optional<SmallVector<OpFoldResult>> ubs = loop.getLoopUpperBounds();
+  std::optional<SmallVector<OpFoldResult>> steps = loop.getLoopSteps();
+  if (!ivs || !lbs || !ubs || !steps) return false;
+  auto it = llvm::find(*ivs, Value(iv));
+  if (it == ivs->end()) return false;
+  size_t i = std::distance(ivs->begin(), it);
+  std::optional<int64_t> lb = getConstantIntValue((*lbs)[i]);
+  std::optional<int64_t> ub = getConstantIntValue((*ubs)[i]);
+  std::optional<int64_t> step = getConstantIntValue((*steps)[i]);
+  if (!lb || !ub || !step || *lb < 0 || *step <= 0) return false;
+  if (*ub <= *lb) return true;
+  int64_t maxIv = *lb + (*ub - *lb - 1) / *step * *step;
+  return splitStride == 1 ? maxIv < splitDimSize : maxIv == 0;
+}
+
 /// Utility to new offset configuration to be used for updating
 /// consumer/producer DMA operations.
 /// First, find the dimension for which the `stride` is equal to
@@ -670,6 +694,16 @@ FailureOr<OffsetConfig> getNewOffsetConfig(
     } else if (auto blockArg = dyn_cast<BlockArgument>(offsetValue);
                blockArg &&
                isa<LoopLikeOpInterface>(blockArg.getOwner()->getParentOp())) {
+      // The access keeps its offset and goes to the first new objectFifo. An
+      // induction variable that reaches past it would silently read or write
+      // the wrong objectFifo (wrong results on hardware, no compile error).
+      if (splitFactor > 1 &&
+          !ivStaysInFirstSplit(blockArg, splitDimSize, splitStride)) {
+        return emitError() << "the offset on index " << offsetIdx
+                           << " is a loop induction variable that reaches "
+                              "past the first of "
+                           << splitFactor << " split objectFifos";
+      }
       objFifoIndex = 0;
       newOffsetValue = offsetValue;
     } else {

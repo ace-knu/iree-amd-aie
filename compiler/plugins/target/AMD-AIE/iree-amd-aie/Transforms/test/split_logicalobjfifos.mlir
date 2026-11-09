@@ -726,3 +726,34 @@ module attributes {hal.executable.target = #executable_target_amdaie_pdi_fb} {
     return
   }
 }
+
+// -----
+
+// A consumer reading the split dim at a bare loop induction variable that
+// reaches past the first split objectFifo is an error: the split would route it
+// to the first objectFifo in every iteration.
+
+#map = affine_map<(d0) -> (d0 * 64)>
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-pdi-fb", {num_cols = 2 : i32, num_rows = 2 : i32, target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @split_L2_input_iv_offset(%arg0: memref<128x128xi32>) {
+    %alloc = memref.alloc() : memref<1x1x4x8x4x8xi32, 2 : i32>
+    %alloc_1 = memref.alloc() : memref<1x1x4x8x4x8xi32, 2 : i32>
+    %alloc_0 = memref.alloc() : memref<2x1x32x32xi32, 1 : i32>
+    %0 = amdaie.logicalobjectfifo.from_memref %arg0, {} : memref<128x128xi32> -> !amdaie.logicalobjectfifo<memref<128x128xi32>>
+    %1 = amdaie.logicalobjectfifo.from_memref %alloc_0, {} : memref<2x1x32x32xi32, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2x1x32x32xi32, 1 : i32>>
+    scf.forall (%arg1, %arg2) in (2, 2) {
+      %2 = affine.apply #map(%arg1)
+      %3 = amdaie.dma_cpy_nd(%1[0, 0, 0, 0] [2, 32, 1, 32] [1024, 32, 1024, 1], %0[%2, 0] [64, 32] [128, 1]) : (!amdaie.logicalobjectfifo<memref<2x1x32x32xi32, 1 : i32>>, !amdaie.logicalobjectfifo<memref<128x128xi32>>)
+      %4 = amdaie.logicalobjectfifo.from_memref %alloc, {} : memref<1x1x4x8x4x8xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<1x1x4x8x4x8xi32, 2 : i32>>
+      %5 = amdaie.logicalobjectfifo.from_memref %alloc_1, {} : memref<1x1x4x8x4x8xi32, 2 : i32> -> !amdaie.logicalobjectfifo<memref<1x1x4x8x4x8xi32, 2 : i32>>
+      // expected-error @+2 {{the offset on index 0 is a loop induction variable that reaches past the first of 2 split objectFifos}}
+      // expected-error @+1 {{failed to find an offset index and offset}}
+      %6 = amdaie.dma_cpy_nd(%4[0, 0, 0, 0, 0, 0] [1, 1, 8, 4, 4, 8] [1024, 1024, 32, 8, 256, 1], %1[%arg2, 0, 0, 0] [1, 1, 32, 32] [1024, 1024, 32, 1]) : (!amdaie.logicalobjectfifo<memref<1x1x4x8x4x8xi32, 2 : i32>>, !amdaie.logicalobjectfifo<memref<2x1x32x32xi32, 1 : i32>>)
+      %7 = amdaie.dma_cpy_nd(%5[0, 0, 0, 0, 0, 0] [1, 1, 8, 4, 4, 8] [1024, 1024, 32, 8, 256, 1], %1[1, 0, 0, 0] [1, 1, 32, 32] [1024, 1024, 32, 1]) : (!amdaie.logicalobjectfifo<memref<1x1x4x8x4x8xi32, 2 : i32>>, !amdaie.logicalobjectfifo<memref<2x1x32x32xi32, 1 : i32>>)
+    } {mapping = [#gpu.block<y>, #gpu.block<x>]}
+    memref.dealloc %alloc_0 : memref<2x1x32x32xi32, 1 : i32>
+    memref.dealloc %alloc : memref<1x1x4x8x4x8xi32, 2 : i32>
+    return
+  }
+}
