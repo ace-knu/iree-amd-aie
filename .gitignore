@@ -7,8 +7,10 @@
 *-install/
 kernel-doc
 
-# lit test outputs written next to source tests when run in-tree (transient)
+# lit test outputs written next to source tests when run in-tree (transient),
+# and root-owned ones renamed aside so a non-root run can write Output/ again
 **/test/Output/
+**/test/Output.rootbak.*/
 
 # Python
 .env
@@ -30,8 +32,9 @@ kernel-doc
 # macOS files
 .DS_Store
 
-# CMake artifacts (root build tree only; unanchored `build/` also hid scripts/build/)
-/build/
+# CMake artifacts (root build tree only; unanchored `build/` also hid scripts/build/).
+# No trailing slash, so a root `build` symlink to another build tree is ignored too.
+/build
 build-*/
 Testing/
 
@@ -114,6 +117,8 @@ artifacts/
 
 # Claude Code (operator's host tool only; must never be committed)
 .claude/
+/.claude.json
+/CLAUDE.md
 
 # Peano/llvm-aie is a downloaded artifact (build_tools/download_peano.sh), not source
 /llvm-aie/
@@ -136,7 +141,18 @@ artifacts/
 /models/*/*.npy
 /models/vgg16/*.onnx
 
-# The dev container uses HOME=/workspace (the repo root), so shell and git
-# config files land here.
+# Inputs, outputs and modules a run leaves in the repo root (the model dirs
+# have their own rules above).
+/*.npy
+/*.vmfb
+/sources.mlir
+
+# The dev container uses HOME=/workspace (the repo root), so shell, git and
+# tool files land here.
 /.bash_history
+/.config/
+/.dotnet/
 /.gitconfig
+/.local/
+/.python_history
+/.vscode-server/
