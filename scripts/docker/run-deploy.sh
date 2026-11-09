@@ -5,9 +5,15 @@
 #   run-deploy.sh <compile|run|e2e> <args...>   ONNX script (scripts/onnx/README.md)
 #   run-deploy.sh [command...]                  command (default bash)
 #   e.g. ./run-deploy.sh e2e vgg16-12.onnx --numeric bf16
+# Serialized cluster-wide via npu.lock: the NPU is one physical device, and concurrent real
+# runs from different users can race/hang it (docs/2026-07-06_env_setup/DEV_CONTAINER.md §5).
+# This whole session holds the lock, so keep it short-lived (run, don't idle in the shell).
+# Check who's using it without waiting: scripts/lock/status.sh.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/../config.sh"
+. "$here/../lock/lock-common.sh"
+lock_ensure_dir
 
 args=(--rm)
 [ -t 0 ] && args+=(-it)
@@ -30,13 +36,14 @@ if [ -n "$gpu" ]; then
   gid="$(gpu_gid "$gpu")"
   [ -n "$gid" ] && args+=(--group-add "$gid")
 fi
+args+=(-v "$LOCK_ROOT:$LOCK_ROOT")
 args+=(-v "$PWD:/work" -w /work -e HOME=/work)
 
 case "${1:-}" in
   compile|run|e2e)
     cmd="$1"; shift
-    exec docker run "${args[@]}" "$IMAGE_DEPLOY" \
+    lock_run "$NPU_LOCK_FILE" "npu" -- docker run "${args[@]}" "$IMAGE_DEPLOY" \
       python3 "/opt/iree-amd-aie/scripts/onnx/$cmd.py" "$@" ;;
   *)
-    exec docker run "${args[@]}" "$IMAGE_DEPLOY" "${@:-bash}" ;;
+    lock_run "$NPU_LOCK_FILE" "npu" -- docker run "${args[@]}" "$IMAGE_DEPLOY" "${@:-bash}" ;;
 esac

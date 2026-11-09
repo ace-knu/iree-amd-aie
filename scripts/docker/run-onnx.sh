@@ -4,9 +4,13 @@
 # NPU passthrough + repo mounted at /workspace (same as run-dev.sh), non-interactive.
 # The ONNX file and output directory must be inside the repo (only it is mounted).
 #   e.g. ./scripts/docker/run-onnx.sh e2e models/vgg16/vgg16-12.onnx --numeric bf16
+# run/e2e that put work on the NPU are serialized cluster-wide via npu.lock, like
+# run-debug.sh and run-deploy.sh (docs/2026-07-06_env_setup/DEV_CONTAINER.md §5);
+# compile and CPU/GPU-only runs do not take it. Check the holder: scripts/lock/status.sh.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/../config.sh"
+. "$here/../lock/lock-common.sh"
 root="$(git -C "$here" rev-parse --show-toplevel)"
 
 cmd="${1:-}"
@@ -40,9 +44,31 @@ if [ -n "$gpu" ]; then
 fi
 args+=(-v "$root:/workspace" -w /workspace -e HOME=/workspace -e PEANO_INSTALL_DIR=/workspace/llvm-aie)
 
-exec docker run "${args[@]}" "$IMAGE_DEV" bash -lc '
+# Does this invocation run anything on the NPU? compile never does. e2e uses the
+# devices of --devices (default local-host,amdxdna-npu4); run uses the devices
+# recorded in <outdir>/config.json.
+uses_npu=0
+if [ "$cmd" = e2e ]; then
+  uses_npu=1; prev=""
+  for a in "$@"; do
+    case "$a" in --devices=*) case "${a#--devices=}" in *amdxdna*) uses_npu=1 ;; *) uses_npu=0 ;; esac ;; esac
+    if [ "$prev" = "--devices" ]; then case "$a" in *amdxdna*) uses_npu=1 ;; *) uses_npu=0 ;; esac; fi
+    prev="$a"
+  done
+elif [ "$cmd" = run ]; then
+  uses_npu=1
+  cfg="${1:-}/config.json"
+  if [ -f "$cfg" ] && ! grep -q amdxdna "$cfg"; then uses_npu=0; fi
+fi
+
+run=(docker run "${args[@]}" "$IMAGE_DEV" bash -lc '
   source /opt/venv/bin/activate
   export PYTHONPATH=/workspace/build/compiler/bindings/python
   cmd="$1"; shift
   exec python3 "scripts/onnx/$cmd.py" "$@"
-' _ "$cmd" "$@"
+' _ "$cmd" "$@")
+if [ "$uses_npu" = 1 ]; then
+  lock_run "$NPU_LOCK_FILE" "npu" -- "${run[@]}"
+else
+  exec "${run[@]}"
+fi
