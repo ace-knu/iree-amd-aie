@@ -53,13 +53,13 @@ reference) list the devices used without `--devices`.
 | Group | Holds |
 |---|---|
 | `backend` | NPU generation, core compiler (Peano) |
-| `graph` | model-level transforms before dispatch formation |
+| `graph` | model-level transforms before dispatch formation; user option `--conv {im2col,native}`: a conv becomes a CPU gather + matmul, or stays one conv dispatch for the AIE conv pipeline (in development) |
 | `dispatch` | how ops are grouped into dispatches |
 | `vector` | user options `--ukernel {none,all}`, `--vectorize {off,on}` |
 | `numeric` | user option `--numeric {f32,bf16}`: what f32 contraction inputs become |
 | `placement` | user option `--pool {cpu,accel}`: whether max pooling runs on the CPU or on the accelerators |
 
-Defaults: `--ukernel all --vectorize off --numeric f32 --pool cpu`. `--pool accel`
+Defaults: `--conv im2col --ukernel all --vectorize off --numeric f32 --pool cpu`. `--pool accel`
 places each pooling dispatch like a contraction, round-robin over the
 accelerators in `--devices` order (with CPU + NPU, all go to the NPU). It works
 but is slower on VGG (CPU + NPU bf16 2.04 s instead of 1.71 s): each pooling

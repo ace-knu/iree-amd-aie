@@ -63,11 +63,23 @@ OPTIONS = {
         "flags": [
             "--iree-preprocessing-pass-pipeline="
             "builtin.module(iree-preprocessing-convert-conv-to-channels-last)",
-            "--iree-global-opt-use-im2col-for-convs",
             # NHWC max pooling, like the convs, so the transposes around each
             # pool cancel (an NCHW pool on the CPU reads through one).
             "--iree-amdaie-pooling-channels-last",
         ],
+        # User choice: how a convolution reaches the accelerators. im2col turns
+        # it into a CPU gather and a matmul; native keeps it one conv dispatch,
+        # lowered by the AIE native conv tile pipeline (bias folded into the
+        # input channels and output rows split into chunks over the columns at
+        # Flow, ReLU in the core).
+        "conv": {
+            "im2col": [
+                "--iree-global-opt-use-im2col-for-convs",
+            ],
+            "native": [
+                "--iree-amdaie-enable-native-conv",
+            ],
+        },
     },
     # How ops are grouped into dispatches.
     "dispatch": {
@@ -119,6 +131,7 @@ OPTIONS = {
 
 # Default choice of each user option.
 DEFAULTS = {
+    "conv": "im2col",
     "ukernel": "all",
     "vectorize": "off",
     "numeric": "f32",
