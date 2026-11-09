@@ -77,6 +77,13 @@ void addGemvPassPipeline(OpPassManager &passManager);
 /// op. Selected per dispatch by the lowering strategy (`"pool"` override).
 void addPoolPassPipeline(OpPassManager &passManager);
 
+/// Populates passes needed to lower a 2-D convolution natively: the GEMV
+/// pipeline's structure (block forall > input-channel scf.for > core forall,
+/// operands moved as copies, the accumulator kept in local memory), with the
+/// filter window inside the core op. Selected per dispatch by the lowering
+/// strategy (`"conv"` override).
+void addConvPassPipeline(OpPassManager &passManager);
+
 /// Populates passes needed to link HAL executables across AIE targets.
 void buildAMDAIELinkingPassPipeline(OpPassManager &passManager);
 
@@ -119,6 +126,14 @@ std::unique_ptr<Pass> createAMDAIEPadPoolingDispatchesPass();
 /// Create a pass to fold the constant bias of NPU contraction dispatches into
 /// K at the Flow dispatch boundary, so they keep two inputs.
 std::unique_ptr<Pass> createAMDAIEFoldBiasIntoContractionDispatchesPass();
+
+/// Create a pass to split the output rows of NPU native conv dispatches into
+/// halo chunks over the array columns at the Flow dispatch boundary.
+std::unique_ptr<Pass> createAMDAIEChunkConvDispatchesPass();
+
+/// Create a pass that lays out the L2 output buffer of a conv tile pipeline
+/// function as one contiguous slice per writing core, in core order.
+std::unique_ptr<Pass> createAMDAIEConvOutputSlicesInOrderPass();
 
 /// Create a pass to assign types to `amdaie.connection` ops.
 std::unique_ptr<Pass> createAMDAIEAssignConnectionTypesPass(

@@ -95,6 +95,8 @@ void AMDAIELowerExecutableTargetPass::runOnOperation() {
           addGemvPassPipeline(executableLoweringPipeline);
         } else if (pipelineOverride.getValue() == kPoolPipelineName) {
           addPoolPassPipeline(executableLoweringPipeline);
+        } else if (pipelineOverride.getValue() == kConvPipelineName) {
+          addConvPassPipeline(executableLoweringPipeline);
         } else {
           funcOp.emitOpError("unknown tile pipeline override '")
               << pipelineOverride.getValue() << "'";

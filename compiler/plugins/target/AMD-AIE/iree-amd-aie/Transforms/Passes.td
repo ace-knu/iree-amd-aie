@@ -123,6 +123,13 @@ def AMDAIEFoldBiasIntoContractionDispatches :
       "mlir::iree_compiler::AMDAIE::createAMDAIEFoldBiasIntoContractionDispatchesPass()";
 }
 
+def AMDAIEChunkConvDispatches :
+    Pass<"iree-amdaie-chunk-conv-dispatches", "ModuleOp"> {
+  let summary = "Split the output rows of NPU native conv dispatches into halo chunks over the array columns at the Flow dispatch boundary (host gather of the input chunks, FHWC filter constant, chunked output read back as rows).";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEChunkConvDispatchesPass()";
+}
+
 def AMDAIEPadContractionDispatches :
     Pass<"iree-amdaie-pad-contraction-dispatches", "ModuleOp"> {
   let summary = "Pad NPU contraction dispatch operands up to the target pack-peel tile multiples at the Flow dispatch boundary (target-known, via each dispatch's device affinity).";
@@ -842,6 +849,13 @@ def AMDAIEPackAndTranspose :
     Option<"packLevel", "pack-level", "int64_t", /*default=*/"-1",
       "Set the packing level number">
   ];
+}
+
+def AMDAIEConvOutputSlicesInOrder :
+    Pass<"iree-amdaie-conv-output-slices-in-order", "func::FuncOp"> {
+  let summary = "On the conv tile pipeline, lay out the L2 output buffer as one contiguous slice per writing core (in core order), so the join gets a lock pair per core instead of a racy counting pair.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEConvOutputSlicesInOrderPass()";
 }
 
 def AMDAIEConvertToDma :

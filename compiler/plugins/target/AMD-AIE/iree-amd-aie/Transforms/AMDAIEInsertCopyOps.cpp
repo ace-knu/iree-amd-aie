@@ -158,9 +158,20 @@ LogicalResult promoteInputs(IRRewriter &rewriter, Operation *op) {
   return success();
 }
 
-/// Promotes the operands of an elementwise `epilogue` of a contraction: the
-/// contraction's result is read where it is computed, so that input gets no
-/// copy; an init the payload never reads gets a fresh buffer, not a copy of its
+/// Returns true if `v` is the result of an op whose fused elementwise epilogue
+/// is staged in place (see `isContractionEpilogue`): a contraction (the GEMV
+/// pipeline) or a 2-D conv (the native conv pipeline, see `getConvDims`).
+bool isEpilogueSource(Value v) {
+  Operation *def = v.getDefiningOp();
+  if (!def) return false;
+  if (isa<linalg::ContractionOpInterface>(def)) return true;
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(def);
+  return linalgOp && succeeded(getConvDims(linalgOp));
+}
+
+/// Promotes the operands of an elementwise `epilogue` of a contraction or conv:
+/// that op's result is read where it is computed, so that input gets no copy;
+/// an init the payload never reads gets a fresh buffer, not a copy of its
 /// contents.
 LogicalResult promoteEpilogueOperands(IRRewriter &rewriter,
                                       linalg::LinalgOp epilogue) {
@@ -168,7 +179,7 @@ LogicalResult promoteEpilogueOperands(IRRewriter &rewriter,
   Location loc = epilogue.getLoc();
   rewriter.setInsertionPoint(epilogue);
   for (OpOperand *input : epilogue.getDpsInputOperands()) {
-    if (input->get().getDefiningOp<linalg::ContractionOpInterface>()) continue;
+    if (isEpilogueSource(input->get())) continue;
     FailureOr<Value> maybeReplacement = promoteValue(rewriter, loc, input->get());
     if (failed(maybeReplacement))
       return epilogue.emitError() << "failed to promote input";
@@ -192,14 +203,12 @@ LogicalResult promoteEpilogueOperands(IRRewriter &rewriter,
   return success();
 }
 
-/// Returns true if `op` is an elementwise generic fed by a contraction, i.e.
-/// the contraction's fused epilogue (not a `linalg.copy` of its result).
+/// Returns true if `op` is an elementwise generic fed by a contraction or a
+/// conv, i.e. that op's fused epilogue (not a `linalg.copy` of its result).
 bool isContractionEpilogue(Operation *op) {
   auto genericOp = dyn_cast<linalg::GenericOp>(op);
   if (!genericOp || !isElementwise(genericOp)) return false;
-  return llvm::any_of(genericOp.getDpsInputs(), [](Value input) {
-    return input.getDefiningOp<linalg::ContractionOpInterface>();
-  });
+  return llvm::any_of(genericOp.getDpsInputs(), isEpilogueSource);
 }
 
 class AMDAIEInsertCopyOpsPass
@@ -235,9 +244,10 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
   // contraction result in the buffer it is computed in, and only the
   // epilogue's result moves out level by level. Staging the epilogue as a
   // standalone op would chain same-memory-space copies around it instead.
-  // Not gated by an option: of the pipelines running this pass (GEMV, pool,
-  // general copy) only the GEMV one has a contraction, so the staging only
-  // ever applies to a GEMV epilogue.
+  // Not gated by an option: of the pipelines running this pass (GEMV, conv,
+  // pool, general copy) only the GEMV and conv ones have a contraction or conv
+  // producer, so the staging only ever applies to their epilogues. The conv
+  // pipeline stages a conv epilogue the same way.
   for (Operation *targetOp : targetOps) {
     // Captured before the init is replaced by its promoted copy.
     Value initDest;
@@ -256,7 +266,8 @@ void AMDAIEInsertCopyOpsPass::runOnOperation() {
     } else if (failed(promoteInputs(rewriter, targetOp))) {
       return signalPassFailure();
     }
-    if (isa<linalg::ContractionOpInterface>(targetOp) &&
+    if (targetOp->getNumResults() == 1 &&
+        isEpilogueSource(targetOp->getResult(0)) &&
         llvm::any_of(targetOp->getUsers(), isContractionEpilogue))
       continue;
     if (failed(promoteResults(rewriter, targetOp, initDest)))

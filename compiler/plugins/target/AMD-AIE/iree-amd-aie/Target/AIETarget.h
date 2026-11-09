@@ -124,6 +124,10 @@ struct AMDAIEOptions {
   // contractions/convs (the NPU lowers it with the pool tile pipeline). See the
   // `accelerate-pooling` option of AMDAIEAssignDeviceAffinities. Default off.
   bool acceleratePooling{false};
+  // Lower 2-D convolutions that reach the backend (no im2col) with the native
+  // conv tile pipeline (`native_conv` in the executable target config; see
+  // `getConvDims` and `chooseConvTiling`). Default off.
+  bool enableNativeConv{false};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
 
   // How the pool pipeline lays max pooling out on the core array (see
@@ -248,6 +252,17 @@ struct AMDAIEOptions {
                        "on the accelerators like contractions/convs (the NPU "
                        "lowers it with the copy-based pool tile pipeline). "
                        "Default false (pooling stays on the host)."));
+
+    binder.opt<bool>(
+        "iree-amdaie-enable-native-conv", enableNativeConv,
+        llvm::cl::cat(category),
+        llvm::cl::desc("Lower 2-D convolutions that reach the backend (no "
+                       "im2col) with the copy-based native conv tile "
+                       "pipeline: chunks of output rows on array columns, "
+                       "output-channel tiles on array rows (a conv without "
+                       "chunks spreads only output channels, over the rows of "
+                       "one column), input channels streamed through local "
+                       "memory. Default false."));
 
     binder.opt<bool>(
         "iree-amdaie-pooling-channels-last", poolingChannelsLast,

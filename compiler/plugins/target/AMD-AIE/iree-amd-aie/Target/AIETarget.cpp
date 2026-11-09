@@ -195,6 +195,10 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     addConfig("pool_columns_policy",
               StringAttr::get(context, stringifyPoolColumnsPolicy(
                                            options.poolColumnsPolicy)));
+    // The native conv tile pipeline, read by the lowering strategy. Only
+    // present when enabled, so the default target config stays as it was.
+    if (options.enableNativeConv)
+      addConfig("native_conv", BoolAttr::get(context, true));
     // Set number of rows/cols used in an AIE array.
     addConfig("num_rows",
               IntegerAttr::get(IntegerType::get(context, 32), nRows));

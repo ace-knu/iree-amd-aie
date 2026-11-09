@@ -141,6 +141,7 @@ enum class AllocScheme { Sequential, BankAware, None };
 constexpr llvm::StringLiteral kTilePipelineOverrideName = "amdaie.tile_pipeline";
 constexpr llvm::StringLiteral kGemvPipelineName = "gemv";
 constexpr llvm::StringLiteral kPoolPipelineName = "pool";
+constexpr llvm::StringLiteral kConvPipelineName = "conv";
 
 LogicalResult initAIELaunchConfig(FunctionOpInterface funcOp,
                                   TilePassPipeline useTilePipeline,

@@ -448,6 +448,145 @@ void addGemvPassPipeline(OpPassManager &funcPassManager) {
   funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
 }
 
+void addConvPassPipeline(OpPassManager &funcPassManager) {
+  // The GEMV pipeline's loop structure -- forall (block) > scf.for (input
+  // channels) > forall (core) -- with operands moved as `linalg.copy`. The root
+  // config (`setRootConfigForConvPipeline`) tiles the outputs at both forall
+  // levels and only the input channels in the scf.for; KH and KW stay inside
+  // the core op, so tiling the outputs gives each level the input window it
+  // needs (the halo rows and columns) by itself. The accumulator of a block
+  // lives in local memory across the channel loop, each core slicing it, so no
+  // partial sum goes back to shared memory between channel chunks.
+  auto addCleanups = [&]() {
+    funcPassManager.addPass(createAMDAIECleanupPass());
+    funcPassManager.addPass(createCanonicalizerPass());
+    funcPassManager.addPass(createCSEPass());
+  };
+
+  // First level tiling (block) using scf.forall.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.hardwareMapping = HardwareMapping::Block;
+    tileFuseOptions.tilingLevel = 0;
+    tileFuseOptions.useSCFFor = false;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  addCleanups();
+
+  // First copy level: input, filter and output at the block.
+  funcPassManager.addPass(createAMDAIEInsertCopyOpsPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote the conv output to shared memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Likewise a fused elementwise epilogue's output (no-op without one): its
+  // result, not the conv's, leaves the cores (see `AMDAIEInsertCopyOps`), so
+  // it gathers the per-core tiles in shared memory for the L2 -> L3 copy.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeElementwise = true;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgOutput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Second copy level, before the channel loop exists, so that the loop
+  // carries the block's accumulator in local memory (see the GEMV pipeline).
+  {
+    AMDAIEInsertCopyOpsOptions copyOptions;
+    copyOptions.useInitAsResultDest = true;
+    funcPassManager.addPass(createAMDAIEInsertCopyOpsPass(copyOptions));
+  }
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Tile the input channels using scf.for.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.tilingLevel = 1;
+    tileFuseOptions.useSCFFor = true;
+    tileFuseOptions.tileElementwise = false;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  addCleanups();
+
+  // Fuse both copy levels of the input and the filter into the channel loop.
+  {
+    AMDAIEFuseProducerIntoLoopOptions fuseProducerOptions;
+    fuseProducerOptions.fuseDepth = 2;
+    fuseProducerOptions.useSCFFor = true;
+    funcPassManager.addPass(
+        createAMDAIEFuseProducerIntoLoopPass(fuseProducerOptions));
+  }
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote the first-level input/filter copy results (one channel chunk of
+  // the block) to shared memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 1;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::PackOrCopyInput;
+    bufferizeOptions.inputDepth = 2;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Second level tiling (core) using scf.forall: chunks on array columns and
+  // output channels on rows, the reverse of TileAndFuse's default for a 2-D
+  // forall, hence `swapThreadXY` (see `ConvTiling`). A 1-D core forall (output
+  // channels only) keeps the default and lands on rows.
+  {
+    AMDAIETileAndFuseOptions tileFuseOptions;
+    tileFuseOptions.hardwareMapping = HardwareMapping::Core;
+    tileFuseOptions.tilingLevel = 2;
+    tileFuseOptions.useSCFFor = false;
+    tileFuseOptions.tileElementwise = false;
+    tileFuseOptions.swapThreadXY = true;
+    funcPassManager.addPass(createAMDAIETileAndFusePass(tileFuseOptions));
+  }
+  addCleanups();
+
+  // Fuse the second-level copies into the core forall.
+  {
+    AMDAIEFuseProducerIntoLoopOptions fuseProducerOptions;
+    fuseProducerOptions.fuseDepth = 1;
+    fuseProducerOptions.useSCFFor = false;
+    funcPassManager.addPass(
+        createAMDAIEFuseProducerIntoLoopPass(fuseProducerOptions));
+  }
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+
+  // Promote the conv inputs to local memory.
+  {
+    AMDAIEBufferizeToAllocationOptions bufferizeOptions;
+    bufferizeOptions.memorySpace = 2;
+    bufferizeOptions.bufferizeOperand = BufferizeOperand::LinalgInput;
+    funcPassManager.addPass(
+        createAMDAIEBufferizeToAllocationPass(bufferizeOptions));
+  }
+
+  // Peel the channel loop and fuse the fill into its first iteration and the
+  // output write-out into its last.
+  addPeelAndFusePasses(funcPassManager);
+
+  // Comprehensive bufferization. There is no conv microkernel, so no
+  // LowerToUKernels: the core runs the conv op as scalar loops.
+  addAMDAIEBufferizePasses(funcPassManager,
+                           TilePassPipeline::GeneralCopyPipeline);
+  funcPassManager.addPass(createHoistStaticallyBoundAllocationsPass());
+}
+
 void addPoolPassPipeline(OpPassManager &funcPassManager) {
   // The general-copy structure without a reduction loop: forall (block) >
   // forall (core), operands moved as `linalg.copy` (L3 -> L2 -> L1). The root
@@ -974,6 +1113,11 @@ void addAMDAIEObjectFifoLoweringPasses(
     dmaOptions.unpackTransposeOnSource = true;
     passManager.addPass(createAMDAIEConvertToDmaPass(dmaOptions));
   }
+  // The conv tile pipeline's cores write interleaved channel tiles of one L2
+  // output buffer; store them as contiguous slices instead, so the join gets a
+  // lock pair per core (no-op for other pipelines).
+  passManager.addNestedPass<func::FuncOp>(
+      createAMDAIEConvOutputSlicesInOrderPass());
 
   passManager.addPass(createAMDAIENormalizeLoopBoundsPass());
   passManager.addPass(createAMDAIEInsertCoresPass({coreStackSize}));

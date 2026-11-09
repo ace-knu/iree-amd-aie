@@ -13,6 +13,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/TensorExt/IR/TensorExtOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -735,6 +736,137 @@ static LogicalResult setRootConfigForGemvPipeline(
       /*workgroupSize=*/{}, /*subgroupSize=*/{}, pipelineConfig);
 }
 
+/// Root config of the native conv tile pipeline (the `"conv"` override, see
+/// `addConvPassPipeline`): the block covers `nCores` chunks, an output tile and
+/// `ocCores` output-channel tiles; the scf.for level streams the input channels
+/// `icTile` at a time; each core takes one chunk (array column) and one
+/// output-channel tile (array row).
+static LogicalResult setRootConfigForConvPipeline(
+    mlir::FunctionOpInterface entryPointFn, linalg::LinalgOp linalgOp,
+    const ConvDims &dims, AMDAIEDeviceModel deviceModel, uint32_t numRows,
+    uint32_t numCols, uint32_t stackSize) {
+  SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
+  if (llvm::any_of(bounds, ShapedType::isDynamic))
+    return linalgOp.emitOpError("native conv needs static loop bounds");
+  // The pipeline starts the accumulator from a fill and fuses at most a unary
+  // elementwise epilogue (see AMDAIEInsertCopyOps). Anything else would fail
+  // in a later pass with a message that does not say why.
+  if (!linalgOp.getDpsInitOperand(0)->get().getDefiningOp<linalg::FillOp>()) {
+    return linalgOp.emitOpError(
+        "native conv pipeline: the output must start from a linalg.fill (a "
+        "bias or partial sum as the init is not supported; the Flow bias "
+        "fold handles a constant bias add)");
+  }
+  // One output path: the result is stored, or read by one epilogue whose
+  // result is stored. AMDAIEInsertCopyOps copies the accumulator out only when
+  // no epilogue reads it, so a second reader (another epilogue, or a store of
+  // the raw result next to the epilogue) has nowhere to go. Readers are ops,
+  // not uses: an in-place epilogue takes the result as input and init.
+  auto readersOf = [](Value v) {
+    return SmallPtrSet<Operation *, 2>(v.getUsers().begin(),
+                                       v.getUsers().end());
+  };
+  Value convResult = linalgOp->getResult(0);
+  SmallPtrSet<Operation *, 2> convReaders = readersOf(convResult);
+  if (convReaders.size() != 1) {
+    return linalgOp.emitOpError("native conv pipeline: its result has ")
+           << convReaders.size()
+           << " readers (one store or one unary elementwise epilogue is "
+              "supported)";
+  }
+  Operation *user = *convReaders.begin();
+  if (!isa<IREE::TensorExt::DispatchTensorStoreOp>(user)) {
+    if (!isUnaryElementwiseEpilogue(user, convResult)) {
+      return linalgOp.emitOpError(
+                 "native conv pipeline: its result is read by '")
+             << user->getName()
+             << "', which is not a unary elementwise epilogue with identity "
+                "maps (a residual or bias add, or a transposed output, is not "
+                "supported)";
+    }
+    // The epilogue computes a core tile of its own from the accumulator and
+    // goes straight to the output, so it may not read its init and its result
+    // may only be stored.
+    auto epilogue = cast<linalg::GenericOp>(user);
+    if (epilogue.payloadUsesValueFromOperand(epilogue.getDpsInitOperand(0))) {
+      return linalgOp.emitOpError(
+          "native conv pipeline: its epilogue reads its own init (only an "
+          "epilogue of the conv result alone is supported)");
+    }
+    SmallPtrSet<Operation *, 2> epilogueReaders =
+        readersOf(epilogue->getResult(0));
+    if (epilogueReaders.size() != 1) {
+      return linalgOp.emitOpError(
+                 "native conv pipeline: its epilogue's result has ")
+             << epilogueReaders.size() << " readers (one store is supported)";
+    }
+    Operation *epilogueUser = *epilogueReaders.begin();
+    if (!isa<IREE::TensorExt::DispatchTensorStoreOp>(epilogueUser)) {
+      return linalgOp.emitOpError(
+                 "native conv pipeline: its epilogue's result is read by '")
+             << epilogueUser->getName()
+             << "' (a chain of epilogues is not supported; fuse them into one "
+                "linalg.generic)";
+    }
+  }
+  auto bytesOf = [](Value v) {
+    return cast<ShapedType>(v.getType()).getElementTypeBitWidth() / 8;
+  };
+  // A fused elementwise epilogue writes its own core tile next to the
+  // accumulator (see `AMDAIEInsertCopyOps`), one tile even when it is in place.
+  int64_t bytesEpilogue = 0;
+  if (auto epilogue = dyn_cast<linalg::GenericOp>(user))
+    bytesEpilogue = bytesOf(epilogue.getDpsInitOperand(0)->get());
+  int64_t l1Limit = deviceModel.getCoreTileLocalMemorySize() - stackSize;
+  FailureOr<ConvTiling> tiling = chooseConvTiling(
+      bounds, dims, bytesOf(linalgOp.getDpsInputOperand(0)->get()),
+      bytesOf(linalgOp.getDpsInputOperand(1)->get()),
+      bytesOf(linalgOp.getDpsInitOperand(0)->get()), numRows, numCols,
+      l1Limit, bytesEpilogue);
+  if (failed(tiling)) {
+    return linalgOp.emitOpError("no native conv tiling fits in ")
+           << l1Limit << " bytes of core memory";
+  }
+
+  unsigned numLoops = linalgOp.getNumLoops();
+  SmallVector<int64_t> blockTiles(numLoops, 0);
+  SmallVector<int64_t> channelTiles(numLoops, 0);
+  SmallVector<int64_t> coreTiles(numLoops, 0);
+  if (dims.n) {
+    blockTiles[*dims.n] = tiling->nCores;
+    // With one chunk per block the chunk dim stays out of the core forall,
+    // which then only spreads output channels, over rows.
+    if (tiling->nCores > 1) coreTiles[*dims.n] = 1;
+  }
+  blockTiles[dims.oh] = tiling->ohTile;
+  blockTiles[dims.ow] = tiling->owTile;
+  blockTiles[dims.oc] = tiling->ocCores * tiling->ocTile;
+  channelTiles[dims.ic] = tiling->icTile;
+  coreTiles[dims.oc] = tiling->ocTile;
+
+  MLIRContext *context = entryPointFn.getContext();
+  auto pipelineConfig = DictionaryAttr::get(
+      context, {NamedAttribute(StringAttr::get(context, kTilePipelineOverrideName),
+                               StringAttr::get(context, kConvPipelineName))});
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPointFn, linalgOp,
+      TileSizesListType{blockTiles, channelTiles, coreTiles},
+      IREE::Codegen::DispatchLoweringPassPipeline::Custom,
+      /*workgroupSize=*/{}, /*subgroupSize=*/{}, pipelineConfig);
+}
+
+/// Returns the conv dims of `linalgOp` when it takes the native conv tile
+/// pipeline: the target config enables it (`native_conv`) and the op is a conv
+/// `getConvDims` accepts. A conv-decompose global pipeline keeps its convs.
+static FailureOr<ConvDims> takesConvPipeline(mlir::FunctionOpInterface fn,
+                                              linalg::LinalgOp linalgOp,
+                                              TilePassPipeline passPipeline) {
+  if (passPipeline == TilePassPipeline::ConvDecomposePipeline ||
+      !getConfigNativeConv(IREE::HAL::ExecutableTargetAttr::lookup(fn)))
+    return failure();
+  return getConvDims(linalgOp);
+}
+
 /// Returns true if `linalgOp` takes the GEMV pipeline under `passPipeline`, i.e.
 /// the shape qualifies (`isGemvLike`) and the global pipeline is one of the
 /// pack-peel variants that pad M otherwise. Checked before the pipeline switch
@@ -1178,6 +1310,14 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
                                         poolColumnsPolicy);
   }
 
+  if (FailureOr<ConvDims> conv =
+          takesConvPipeline(entryPointFn, genericOp, passPipeline);
+      succeeded(conv)) {
+    return setRootConfigForConvPipeline(entryPointFn, genericOp, *conv,
+                                        getDeviceModel(targetDevice), numRows,
+                                        numCols, stackSize);
+  }
+
   if (isMatmul(genericOp) || isMatmulTransposeA(genericOp) ||
       isMatmulTransposeB(genericOp)) {
     // M == 1 shapes leave the pack-peel variants here; see `isGemvLike`.
@@ -1617,10 +1757,23 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
 static LogicalResult setConvRootConfig(mlir::FunctionOpInterface entryPointFn,
                                        linalg::ConvolutionOpInterface convOp,
                                        TilePassPipeline passPipeline,
-                                       AMDAIEDevice targetDevice) {
+                                       AMDAIEDevice targetDevice,
+                                       uint32_t numRows, uint32_t numCols,
+                                       uint32_t stackSize) {
   assert(!getLoweringConfig<IREE::Codegen::LoweringConfigAttr>(convOp) &&
          "expected lowering_config is not set");
   auto linalgOp = cast<linalg::LinalgOp>(convOp.getOperation());
+
+  if (FailureOr<ConvDims> conv =
+          takesConvPipeline(entryPointFn, linalgOp, passPipeline);
+      succeeded(conv)) {
+    // The pipeline's copy insertion and producer fusion handle the generic
+    // form only, which is what iree-compile hands the backend (named convs
+    // are generalized before dispatch formation).
+    return linalgOp.emitOpError(
+        "native conv pipeline: needs the conv as a linalg.generic (generalize "
+        "the named op first)");
+  }
 
   // Current tiling strategy is based on llvm-cpu ConvTileAndDecomposeExpert.
   if (passPipeline == TilePassPipeline::ConvDecomposePipeline)
@@ -1645,7 +1798,7 @@ static LogicalResult setRootConfigImpl(
         .Case<linalg::Conv2DNhwcHwcfOp, linalg::Conv2DNchwFchwOp,
               linalg::DepthwiseConv2DNhwcHwcOp>([&](auto op) {
           return setConvRootConfig(entryPointFn, op, passPipeline,
-                                   targetDevice);
+                                   targetDevice, numRows, numCols, stackSize);
         })
         .Case<linalg::GenericOp>([&](auto op) {
           return setRootConfig(entryPointFn, op, passPipeline,

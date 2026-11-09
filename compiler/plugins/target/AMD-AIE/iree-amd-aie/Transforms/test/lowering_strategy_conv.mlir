@@ -79,3 +79,33 @@ func.func @conv_depthwise_channel_last_i8(){
   iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0, 0, 0], sizes = [2, 12, 12, 64], strides = [1, 1, 1, 1] : tensor<2x12x12x64xi32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x12x12x64xi32>>
   return
 }
+
+// -----
+
+// `native_conv` in the target config does not take a conv away from a global
+// conv-decompose pipeline: same config as the first case, no "conv" override.
+// CHECK{LITERAL}: #config = #iree_codegen.lowering_config<tile_sizes = [[1, 4, 4, 4, 0, 0, 0], [1, 1, 4, 4, 0, 0, 0], [0, 0, 0, 0, 1, 1, 1, 0, 0]]>
+// CHECK-NOT:      amdaie.tile_pipeline
+// CHECK-LABEL:    func.func @conv_native_conv_under_conv_decompose
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  <storage_buffer>,
+  <storage_buffer>,
+  <storage_buffer>
+]>
+#target = #hal.executable.target<"amd-aie", "amdaie-pdi-fb", {native_conv = true}>
+module attributes {hal.executable.target = #target} {
+  func.func @conv_native_conv_under_conv_decompose() {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x14x14x32xbf16>>
+    %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x3x32x64xbf16>>
+    %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x12x12x64xf32>>
+    %3 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0, 0, 0], sizes = [2, 14, 14, 32], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x14x14x32xbf16>> -> tensor<2x14x14x32xbf16>
+    %4 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0, 0, 0], sizes = [3, 3, 32, 64], strides = [1, 1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<3x3x32x64xbf16>> -> tensor<3x3x32x64xbf16>
+    %5 = tensor.empty() : tensor<2x12x12x64xf32>
+    %6 = linalg.fill ins(%cst : f32) outs(%5 : tensor<2x12x12x64xf32>) -> tensor<2x12x12x64xf32>
+    %7 = linalg.conv_2d_nhwc_hwcf {dilations = dense<1> : vector<2xi64>, strides = dense<1> : vector<2xi64>} ins(%3, %4 : tensor<2x14x14x32xbf16>, tensor<3x3x32x64xbf16>) outs(%6 : tensor<2x12x12x64xf32>) -> tensor<2x12x12x64xf32>
+    iree_tensor_ext.dispatch.tensor.store %7, %2, offsets = [0, 0, 0, 0], sizes = [2, 12, 12, 64], strides = [1, 1, 1, 1] : tensor<2x12x12x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<2x12x12x64xf32>>
+    return
+  }
+}

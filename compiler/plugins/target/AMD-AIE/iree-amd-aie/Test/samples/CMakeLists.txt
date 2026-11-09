@@ -9,6 +9,7 @@ iree_lit_test_suite(
     lit
   SRCS
     "conv2d_nhwc_objectfifo_e2e.mlir"
+    "conv_native_objectfifo_e2e.mlir"
     "flow_pipeline_hook.mlir"
     "matmul_pack_peel_air_e2e.mlir"
     "matmul_elementwise_pack_peel_air_e2e.mlir"

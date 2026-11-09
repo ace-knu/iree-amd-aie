@@ -118,6 +118,12 @@ struct AMDAIESession
     // No-op without such a dispatch.
     passManager.addPass(
         AMDAIE::createAMDAIEFoldBiasIntoContractionDispatchesPass());
+    // Spread native conv dispatches (`native_conv`) over the array columns:
+    // their output rows are split into chunks with a host gather of the input
+    // rows each chunk reads (merged with the fold's ones-channel pad), the
+    // filter constant becomes FHWC, and the chunked output is read back as
+    // rows. No-op without such a dispatch.
+    passManager.addPass(AMDAIE::createAMDAIEChunkConvDispatchesPass());
     // With affinity known per-dispatch, pad NPU contraction operands up to the
     // target's pack-peel tile multiples so divisibility holds inside the
     // dispatch. No-op for dispatches already divisible / not on amd-aie.
