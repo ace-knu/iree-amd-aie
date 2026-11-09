@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <tuple>
 
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "llvm/ADT/StringExtras.h"
@@ -221,6 +222,12 @@ int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr) {
   std::optional<IntegerAttr> attr =
       getConfigAttr<IntegerAttr>(targetAttr, "gemv_n1");
   return attr ? attr->getInt() : 32;
+}
+
+bool getConfigNativeConv(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr =
+      getConfigAttr<BoolAttr>(targetAttr, "native_conv");
+  return attr && attr->getValue();
 }
 
 llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy) {
@@ -954,6 +961,206 @@ FailureOr<MaxPoolingDims> getMaxPoolingDims(linalg::LinalgOp linalgOp) {
 
 bool isMaxPoolingOp(linalg::LinalgOp linalgOp) {
   return succeeded(getMaxPoolingDims(linalgOp));
+}
+
+FailureOr<ConvDims> getConvDims(linalg::LinalgOp linalgOp) {
+  if (linalgOp.getNumDpsInputs() != 2 || linalgOp.getNumDpsInits() != 1)
+    return failure();
+  if (linalgOp.getNumReductionLoops() != 3) return failure();
+  unsigned numPar = linalgOp.getNumParallelLoops();
+  if (numPar != 3 && numPar != 4) return failure();
+  Block *body = linalgOp.getBlock();
+  if (!body) return failure();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(body->getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1 ||
+      !bodyMatcherForMatmulLikeOps(yieldOp.getOperand(0), body))
+    return failure();
+
+  SmallVector<utils::IteratorType> iters = linalgOp.getIteratorTypesArray();
+  AffineMap inMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(0));
+  AffineMap filterMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInputOperand(1));
+  AffineMap outMap =
+      linalgOp.getMatchingIndexingMap(linalgOp.getDpsInitOperand(0));
+  auto dimPos = [](AffineExpr e) -> std::optional<unsigned> {
+    if (auto d = dyn_cast<AffineDimExpr>(e)) return d.getPosition();
+    return std::nullopt;
+  };
+
+  // Output: identity over the parallel loops, which come first.
+  if (outMap.getNumResults() != numPar) return failure();
+  for (auto [i, e] : llvm::enumerate(outMap.getResults())) {
+    if (dimPos(e) != i || iters[i] != utils::IteratorType::parallel)
+      return failure();
+  }
+  ConvDims dims;
+  unsigned first = numPar - 3;
+  if (first == 1) dims.n = 0;
+  dims.oh = first;
+  dims.ow = first + 1;
+  dims.oc = first + 2;
+
+  // Input: (n, oh + kh, ow + kw, ic), unit strides and dilations.
+  if (inMap.getNumResults() != numPar) return failure();
+  if (dims.n && dimPos(inMap.getResult(0)) != dims.n) return failure();
+  unsigned outDim, winDim;
+  int64_t stride;
+  if (!matchStridedDimExpr(inMap.getResult(first), iters, outDim, winDim,
+                           stride) ||
+      outDim != dims.oh || stride != 1)
+    return failure();
+  dims.kh = winDim;
+  if (!matchStridedDimExpr(inMap.getResult(first + 1), iters, outDim, winDim,
+                           stride) ||
+      outDim != dims.ow || stride != 1)
+    return failure();
+  dims.kw = winDim;
+  std::optional<unsigned> ic = dimPos(inMap.getResult(first + 2));
+  if (!ic || iters[*ic] != utils::IteratorType::reduction ||
+      *ic == dims.kh || *ic == dims.kw || dims.kh == dims.kw)
+    return failure();
+  dims.ic = *ic;
+
+  // Filter: (kh, kw, ic, oc) or (oc, kh, kw, ic).
+  if (filterMap.getNumResults() != 4) return failure();
+  SmallVector<std::optional<unsigned>> f;
+  for (AffineExpr e : filterMap.getResults()) f.push_back(dimPos(e));
+  using Dims = SmallVector<std::optional<unsigned>>;
+  if (f == Dims{dims.kh, dims.kw, dims.ic, dims.oc}) {
+    dims.filterOcFirst = false;
+  } else if (f == Dims{dims.oc, dims.kh, dims.kw, dims.ic}) {
+    dims.filterOcFirst = true;
+  } else {
+    return failure();
+  }
+  return dims;
+}
+
+/// Bytes a core buffer takes with its start aligned the way the buffer
+/// allocator places it on an npu4 core tile (64 B for buffers of 64 bytes or
+/// more, else 32 B; see `AMDAIEAssignBufferAddresses`).
+static int64_t alignedCoreBufferBytes(int64_t nBytes) {
+  int64_t alignment = nBytes >= 64 ? 64 : 32;
+  return llvm::divideCeil(nBytes, alignment) * alignment;
+}
+
+FailureOr<ConvTiling> chooseConvTiling(ArrayRef<int64_t> bounds,
+                                       const ConvDims &dims, int64_t bytesIn,
+                                       int64_t bytesFilter, int64_t bytesOut,
+                                       int64_t numRows, int64_t numCols,
+                                       int64_t l1Limit,
+                                       int64_t bytesEpilogue) {
+  int64_t N = dims.n ? bounds[*dims.n] : 1;
+  int64_t OH = bounds[dims.oh], OW = bounds[dims.ow], OC = bounds[dims.oc];
+  int64_t KH = bounds[dims.kh], KW = bounds[dims.kw], IC = bounds[dims.ic];
+  auto divisors = [](int64_t n) {
+    SmallVector<int64_t> d;
+    for (int64_t i = 1; i <= n; ++i)
+      if (n % i == 0) d.push_back(i);
+    return d;
+  };
+  // Chunks on columns (the largest divisor of N that fits), output channels
+  // on rows.
+  int64_t nCores = 1;
+  for (int64_t c : divisors(N))
+    if (c <= numCols) nCores = c;
+  int64_t maxOcCores = numRows;
+  // A (kh, kw, ic, oc) filter has its output channels innermost, so the
+  // output-channel tiles of the cores of a column interleave in it: their reads
+  // of the shared-memory filter are not contiguous in-order slices of it, and
+  // the objectFifo falls back to a single counting lock pair for them, which
+  // is racy (AMDAIEObjFifoBufferization.cpp). Split over the columns' memtiles
+  // it would also be cut by kernel row (AMDAIESplitLogicalObjFifos takes the
+  // first non-unit dim). Such a filter is therefore not spread: every core
+  // reads the block's whole filter tile, and only chunks go to columns.
+  // (AMDAIEChunkConvDispatches gives constant filters the FHWC layout.)
+  if (!dims.filterOcFirst) maxOcCores = 1;
+  constexpr int64_t kDepth = 2;
+  constexpr int64_t kShimMaxIterations = 63;
+  int64_t IH = OH + KH - 1, IW = OW + KW - 1;
+  // Every DMA transfer starts on a 4-byte boundary and moves whole 4-byte
+  // words (BD address and length granularity). A tile of `t` elements along a
+  // dim of `extent` whose consecutive elements are `stride` bytes apart cuts
+  // the tensor at multiples of t * stride bytes (no cut if t == extent).
+  auto wordAligned = [](int64_t t, int64_t extent, int64_t stride) {
+    return t == extent || (t * stride) % 4 == 0;
+  };
+  SmallVector<int64_t> outBytes = {bytesOut};
+  if (bytesEpilogue) outBytes.push_back(bytesEpilogue);
+  // The cuts of a tiling other than the input-channel chunk's (checked in the
+  // innermost loop): NHWC output and epilogue tiles (core tile in the block,
+  // block in the output, one chunk per column), NHWC input windows (block
+  // starts along OW and OH, chunks), and an HWCF filter's output channels
+  // (innermost there; FHWC keeps them outermost).
+  auto cutsAligned = [&](int64_t ocCores, int64_t ocTile, int64_t ohTile,
+                         int64_t owTile) {
+    int64_t ocBlock = ocCores * ocTile;
+    for (int64_t b : outBytes) {
+      if (!wordAligned(ocTile, ocBlock, b) || !wordAligned(ocBlock, OC, b) ||
+          !wordAligned(owTile, OW, OC * b) ||
+          !wordAligned(ohTile, OH, OW * OC * b))
+        return false;
+      if (nCores > 1 && (ohTile * owTile * ocBlock * b) % 4) return false;
+      if (N > 1 && (OH * OW * OC * b) % 4) return false;
+    }
+    if (!wordAligned(owTile, OW, IC * bytesIn) ||
+        !wordAligned(ohTile, OH, IW * IC * bytesIn) ||
+        (N > 1 && (IH * IW * IC * bytesIn) % 4))
+      return false;
+    if (!dims.filterOcFirst && (!wordAligned(ocTile, ocBlock, bytesFilter) ||
+                                !wordAligned(ocBlock, OC, bytesFilter)))
+      return false;
+    return true;
+  };
+
+  SmallVector<int64_t> ocCoreCounts = divisors(OC);
+  for (int64_t ocCores : llvm::reverse(ocCoreCounts)) {
+    if (ocCores > maxOcCores) continue;
+    std::optional<ConvTiling> best;
+    auto rank = [&](const ConvTiling &t) {
+      double macs =
+          static_cast<double>(t.ohTile * t.owTile * t.ocTile * KH * KW);
+      double bytes = static_cast<double>(
+          KH * KW * t.ocTile * bytesFilter +
+          (t.ohTile + KH - 1) * (t.owTile + KW - 1) * bytesIn);
+      return std::make_tuple(IC / t.icTile <= kShimMaxIterations, macs / bytes,
+                             t.icTile, t.owTile);
+    };
+    for (int64_t ocTile : divisors(OC / ocCores)) {
+      for (int64_t ohTile : divisors(OH)) {
+        for (int64_t owTile : divisors(OW)) {
+          if (ohTile * owTile * ocTile < 2) continue;
+          if (!cutsAligned(ocCores, ocTile, ohTile, owTile)) continue;
+          for (int64_t icTile : divisors(IC)) {
+            if ((icTile * bytesIn) % 4 || (icTile * bytesFilter) % 4) continue;
+            // An HWCF filter's channel chunk starts every icTile * OC
+            // elements.
+            if (!dims.filterOcFirst &&
+                !wordAligned(icTile, IC, OC * bytesFilter))
+              continue;
+            if (icTile % std::min<int64_t>(8, IC)) continue;
+            int64_t in = alignedCoreBufferBytes(
+                (ohTile + KH - 1) * (owTile + KW - 1) * icTile * bytesIn);
+            int64_t filter =
+                alignedCoreBufferBytes(KH * KW * icTile * ocTile * bytesFilter);
+            int64_t acc =
+                alignedCoreBufferBytes(ohTile * owTile * ocTile * bytesOut);
+            int64_t epilogue =
+                bytesEpilogue ? alignedCoreBufferBytes(ohTile * owTile *
+                                                       ocTile * bytesEpilogue)
+                              : 0;
+            int64_t l1 = kDepth * (in + filter + acc + epilogue);
+            if (l1 > l1Limit) continue;
+            ConvTiling t{nCores, ocCores, ohTile, owTile, ocTile, icTile, l1};
+            if (!best || rank(t) > rank(*best)) best = t;
+          }
+        }
+      }
+    }
+    if (best) return *best;
+  }
+  return failure();
 }
 
 bool isUndefinedTensor(Value v) {

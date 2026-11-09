@@ -9,7 +9,6 @@
 #include "iree-amd-aie/Transforms/Utils/AMDAIEDevicePlacementUtils.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/DialectResourceBlobManager.h"
 
 namespace mlir::iree_compiler::AMDAIE {
@@ -50,11 +49,13 @@ func::FuncOp getDispatchFunc(IREE::Flow::DispatchOp dispatch, ModuleOp module) {
 IREE::TensorExt::DispatchTensorLoadOp getFullTensorLoad(Value operand) {
   auto load = operand.getDefiningOp<IREE::TensorExt::DispatchTensorLoadOp>();
   if (!load) return nullptr;
-  // Only a plain full-tensor load (unit strides, zero offsets) is supported.
-  for (OpFoldResult o : load.getMixedOffsets())
-    if (!isConstantIntValue(o, 0)) return nullptr;
-  for (OpFoldResult s : load.getMixedStrides())
-    if (!isConstantIntValue(s, 1)) return nullptr;
+  // Only a plain full-tensor load is supported: zero offsets, unit strides and
+  // the binding's whole shape, not rank-reduced. The callers grow or replace
+  // the binding and reload all of it, which would change what a smaller or
+  // rank-reducing slice reads.
+  if (!load.isLoadOfWholeSource() ||
+      load.getType() != load.getSourceType().asRankedTensorType())
+    return nullptr;
   return load;
 }
 
@@ -106,7 +107,8 @@ int firstFreeHelperIndex(ModuleOp module) {
     StringRef name = sym.getName();
     for (StringRef prefix :
          {"pad_executable_", "crop_executable_", "concat_executable_",
-          "__padded_constant_", "__bias_folded_weight_"}) {
+          "halo_executable_", "insert_executable_", "__padded_constant_",
+          "__bias_folded_weight_", "__conv_fhwc_weight_"}) {
       if (!name.consume_front(prefix)) continue;
       int idx;
       if (!name.getAsInteger(10, idx)) next = std::max(next, idx + 1);
@@ -115,43 +117,12 @@ int firstFreeHelperIndex(ModuleOp module) {
   return next;
 }
 
-Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
-                            ArrayRef<int64_t> dstShape,
-                            IREE::HAL::DeviceAffinityAttr hostAffinity,
-                            int &counter, TypedAttr padValue) {
-  Location loc = v.getLoc();
-  auto srcType = cast<RankedTensorType>(v.getType());
-  if (dstShape == srcType.getShape()) return v;
-  auto dstType = RankedTensorType::get(dstShape, srcType.getElementType());
-  auto inBinding = IREE::TensorExt::DispatchTensorType::get(
-      IREE::TensorExt::TensorAccess::ReadOnly, srcType);
-  auto outBinding = IREE::TensorExt::DispatchTensorType::get(
-      IREE::TensorExt::TensorAccess::ReadWrite, dstType);
-  std::string idx = std::to_string(counter++);
-
-  // Worker func: load the full input and store it into the low corner of the
-  // pad-value-filled output.
-  auto funcOp = func::FuncOp::create(
-      loc, "pad_dispatch_" + idx,
-      rewriter.getFunctionType({inBinding, outBinding}, {}));
-  funcOp.setPublic();
-  Block *entry = funcOp.addEntryBlock();
-  OpBuilder fb = OpBuilder::atBlockBegin(entry);
-  Value loaded = fb.create<IREE::TensorExt::DispatchTensorLoadOp>(
-      loc, srcType, entry->getArgument(0), /*sourceDynamicDims=*/ValueRange{});
-  SmallVector<OpFoldResult> offsets(dstShape.size(), fb.getIndexAttr(0));
-  SmallVector<OpFoldResult> strides(dstShape.size(), fb.getIndexAttr(1));
-  SmallVector<OpFoldResult> sizes;
-  for (int64_t d : srcType.getShape()) sizes.push_back(fb.getIndexAttr(d));
-  fb.create<IREE::TensorExt::DispatchTensorStoreOp>(
-      loc, loaded, entry->getArgument(1), /*targetDynamicDims=*/ValueRange{},
-      offsets, sizes, strides);
-  fb.create<func::ReturnOp>(loc);
-
-  // Executable wrapping the func, with a default workgroup-count region.
+IREE::Flow::ExecutableExportOp createExecutable(ModuleOp module,
+                                                func::FuncOp funcOp,
+                                                StringRef name) {
+  Location loc = funcOp.getLoc();
   OpBuilder mb(&module.getBody()->back());
-  auto exeOp =
-      IREE::Flow::ExecutableOp::create(mb, loc, "pad_executable_" + idx);
+  auto exeOp = IREE::Flow::ExecutableOp::create(mb, loc, name);
   exeOp.setPrivate();
   OpBuilder exeBuilder = OpBuilder::atBlockBegin(&exeOp.getBlock());
   auto innerModule = mlir::ModuleOp::create(exeBuilder, loc);
@@ -162,27 +133,89 @@ Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
   Block *wcBlock = &exportOp.getWorkgroupCount().emplaceBlock();
   OpBuilder wb = OpBuilder::atBlockBegin(wcBlock);
   Type indexTy = wb.getIndexType();
-  auto countOp = wb.create<IREE::TensorExt::DispatchWorkgroupCountFromSliceOp>(
-      loc, TypeRange{indexTy, indexTy, indexTy},
+  auto countOp = IREE::TensorExt::DispatchWorkgroupCountFromSliceOp::create(
+      wb, loc, TypeRange{indexTy, indexTy, indexTy},
       /*ordinal_operands=*/ValueRange{});
-  wb.create<IREE::Flow::ReturnOp>(loc, countOp.getResults());
+  IREE::Flow::ReturnOp::create(wb, loc, countOp.getResults());
+  return exportOp;
+}
 
-  // Host splat of the pad value and the dispatch writing into it in place,
-  // both pinned to the host device.
-  Type elemType = srcType.getElementType();
-  TypedAttr fillAttr = padValue ? padValue : rewriter.getZeroAttr(elemType);
-  Value padScalar = rewriter.create<arith::ConstantOp>(loc, fillAttr);
-  auto splatOp = rewriter.create<IREE::Flow::TensorSplatOp>(
-      loc, dstType, padScalar, /*result_dims=*/ValueRange{});
-  splatOp->setAttr("stream.affinity", hostAffinity);
+/// Creates a host dispatch, `<prefix>_executable_<i>::<prefix>_dispatch_<i>`,
+/// that copies `v` into `dest` at `offsets`, tied to `dest`.
+static Value createCopyIntoDispatch(IRRewriter &rewriter, ModuleOp module,
+                                    Value v, Value dest,
+                                    ArrayRef<int64_t> offsets,
+                                    IREE::HAL::DeviceAffinityAttr hostAffinity,
+                                    StringRef prefix, int &counter) {
+  Location loc = v.getLoc();
+  auto srcType = cast<RankedTensorType>(v.getType());
+  auto dstType = cast<RankedTensorType>(dest.getType());
+  auto inBinding = IREE::TensorExt::DispatchTensorType::get(
+      IREE::TensorExt::TensorAccess::ReadOnly, srcType);
+  auto outBinding = IREE::TensorExt::DispatchTensorType::get(
+      IREE::TensorExt::TensorAccess::ReadWrite, dstType);
+  std::string idx = std::to_string(counter++);
+
+  // Worker func: load the full input and store it into the output at
+  // `offsets`.
+  auto funcOp = func::FuncOp::create(
+      loc, (prefix + "_dispatch_" + idx).str(),
+      rewriter.getFunctionType({inBinding, outBinding}, {}));
+  funcOp.setPublic();
+  Block *entry = funcOp.addEntryBlock();
+  OpBuilder fb = OpBuilder::atBlockBegin(entry);
+  Value loaded = IREE::TensorExt::DispatchTensorLoadOp::create(
+      fb, loc, srcType, entry->getArgument(0),
+      /*sourceDynamicDims=*/ValueRange{});
+  SmallVector<OpFoldResult> offsetAttrs, sizes;
+  SmallVector<OpFoldResult> strides(dstType.getRank(), fb.getIndexAttr(1));
+  for (int64_t o : offsets) offsetAttrs.push_back(fb.getIndexAttr(o));
+  for (int64_t d : srcType.getShape()) sizes.push_back(fb.getIndexAttr(d));
+  IREE::TensorExt::DispatchTensorStoreOp::create(
+      fb, loc, loaded, entry->getArgument(1),
+      /*targetDynamicDims=*/ValueRange{}, offsetAttrs, sizes, strides);
+  func::ReturnOp::create(fb, loc);
+  IREE::Flow::ExecutableExportOp exportOp =
+      createExecutable(module, funcOp, (prefix + "_executable_" + idx).str());
+
   auto dispatchOp = IREE::Flow::DispatchOp::create(
       rewriter, loc, exportOp, /*workload=*/ValueRange{}, TypeRange{dstType},
       /*result_dims=*/ValueRange{},
-      /*arguments=*/ValueRange{v, splatOp.getResult()},
+      /*arguments=*/ValueRange{v, dest},
       /*argument_dims=*/ValueRange{},
       /*tied_operands=*/rewriter.getIndexArrayAttr({1}));
   dispatchOp->setAttr("stream.affinity", hostAffinity);
   return dispatchOp.getResult(0);
+}
+
+Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
+                            ArrayRef<int64_t> dstShape,
+                            IREE::HAL::DeviceAffinityAttr hostAffinity,
+                            int &counter, TypedAttr padValue) {
+  Location loc = v.getLoc();
+  auto srcType = cast<RankedTensorType>(v.getType());
+  if (dstShape == srcType.getShape()) return v;
+  auto dstType = RankedTensorType::get(dstShape, srcType.getElementType());
+
+  // Host splat of the pad value and the dispatch writing into its low corner
+  // in place, both pinned to the host device.
+  Type elemType = srcType.getElementType();
+  TypedAttr fillAttr = padValue ? padValue : rewriter.getZeroAttr(elemType);
+  Value padScalar = arith::ConstantOp::create(rewriter, loc, fillAttr);
+  auto splatOp = IREE::Flow::TensorSplatOp::create(
+      rewriter, loc, dstType, padScalar, /*result_dims=*/ValueRange{});
+  splatOp->setAttr("stream.affinity", hostAffinity);
+  SmallVector<int64_t> offsets(dstShape.size(), 0);
+  return createCopyIntoDispatch(rewriter, module, v, splatOp.getResult(),
+                                offsets, hostAffinity, "pad", counter);
+}
+
+Value createInsertDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
+                           Value dest, ArrayRef<int64_t> offsets,
+                           IREE::HAL::DeviceAffinityAttr hostAffinity,
+                           int &counter) {
+  return createCopyIntoDispatch(rewriter, module, v, dest, offsets,
+                                hostAffinity, "insert", counter);
 }
 
 /// Returns `attr` as a DenseElementsAttr: as is, or the blob of a
@@ -254,7 +287,11 @@ void eraseDeadProducers(IRRewriter &rewriter, Value v) {
 
 void eraseDeadGlobals(IRRewriter &rewriter, ModuleOp module,
                       ArrayRef<IREE::Util::GlobalOp> globals) {
+  // A global replaced for several dispatches is listed once for each of them;
+  // it must be looked at (and erased) only once.
+  llvm::SmallPtrSet<Operation *, 8> visited;
   for (IREE::Util::GlobalOp global : globals) {
+    if (!visited.insert(global.getOperation()).second) continue;
     SmallVector<IREE::Util::GlobalLoadOp> loads;
     bool otherUses = false;
     std::optional<SymbolTable::UseRange> uses =

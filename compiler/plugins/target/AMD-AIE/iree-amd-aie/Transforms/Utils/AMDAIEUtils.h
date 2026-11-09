@@ -125,6 +125,10 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
 /// target config; absent means 32).
 int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr);
 
+/// Whether 2-D convolutions that reach the backend take the native conv tile
+/// pipeline (`native_conv` in the executable target config; absent means no).
+bool getConfigNativeConv(IREE::HAL::ExecutableTargetAttr targetAttr);
+
 /// The pool column policy (`pool_columns_policy` in the executable target
 /// config, one of "odd" | "cost" | "full" | "max"; absent means `Max`). Read
 /// per dispatch by the Flow pooling pad pass so it pads OH exactly when the
@@ -190,6 +194,67 @@ bool isReductionOp(linalg::LinalgOp linalgOp);
 bool isConv2DNhwcHwcfOp(Operation *linalgOp);
 bool isDepthwiseConv2DNhwcHwcOp(Operation *linalgOp);
 bool isConvOp(linalg::GenericOp linalgOp);
+
+/// Loop dims of a 2-D convolution written as a multiply-accumulate linalg op
+/// (named or generic) with unit strides and dilations, the form the native
+/// conv tile pipeline takes: the output indexes the parallel loops in order as
+/// (n, oh, ow, oc), the input as (n, oh + kh, ow + kw, ic), and the filter as
+/// (kh, kw, ic, oc) (HWCF) or (oc, kh, kw, ic) (FHWC). The leading `n` is
+/// optional: a batch-1 conv reaches the backend with its unit batch folded
+/// away (6 loops), while a conv whose output rows were split into halo chunks
+/// keeps the chunks there (7 loops).
+struct ConvDims {
+  std::optional<unsigned> n;
+  unsigned oh, ow, oc, kh, kw, ic;
+  /// True for an (oc, kh, kw, ic) filter, false for (kh, kw, ic, oc).
+  bool filterOcFirst;
+};
+FailureOr<ConvDims> getConvDims(linalg::LinalgOp linalgOp);
+
+/// Core tiling of a native conv on the `conv` tile pipeline, which has the
+/// GEMV pipeline's structure: a block forall over the outputs, an scf.for that
+/// streams the input channels through local memory `icTile` at a time while
+/// every core keeps its accumulator there, and a core forall. With more than
+/// one chunk on the conv's `n` dim, `nCores` chunks go to array columns and
+/// `ocCores` output-channel tiles to array rows: the shared-memory input and
+/// output keep the chunk as their first dim, which is the dim
+/// AMDAIESplitLogicalObjFifos splits over the columns' memtiles, so each
+/// memtile holds one column's input chunk and joins only that column's
+/// outputs. (Output channels on columns would split the NHWC output by chunk,
+/// i.e. by row, and join a whole row of 8 cores into one memtile, beyond its 6
+/// input channels.) Otherwise only output channels are spread, `ocCores` of
+/// them over array rows, and `nCores` is 1. Output channels are spread over
+/// rows only for an OC-first (FHWC) filter, in which each row's tile is a
+/// contiguous slice (and the only layout the memtile split cuts by output
+/// channel); an HWCF filter interleaves the rows' tiles.
+struct ConvTiling {
+  int64_t nCores, ocCores, ohTile, owTile, ocTile, icTile;
+  /// Local memory one core uses, without its stack.
+  int64_t l1Bytes;
+};
+
+/// Chooses a `ConvTiling` for a conv with loop bounds `bounds` and dims `dims`
+/// whose input, filter and output elements take `bytesIn`, `bytesFilter` and
+/// `bytesOut` bytes. Every core buffer (input chunk with its halo, filter
+/// chunk, accumulator) is double-buffered and starts 64-byte aligned (32 below
+/// 64 bytes), as the objectFifo lowering allocates them, and together they fit
+/// in `l1Limit` bytes. Among the tilings that use the most cores it prefers an
+/// input-channel loop short enough for a shim BD's iteration dim (<= 63), then
+/// the most MACs per byte a core receives, then the larger channel chunk. A
+/// core computes at least two outputs (a degenerate tile once gave a GEMV
+/// all-zero results), every transfer starts on a 4-byte boundary and moves
+/// whole 4-byte words (along every dim the tiling cuts: channel chunks,
+/// output-channel tiles, OW/OH block starts, chunks), and a
+/// channel chunk is a multiple of 8 channels (all of them below 8), so that a
+/// pixel's chunk moves at least 16 contiguous bytes from an NHWC tensor.
+/// A fused elementwise epilogue writing `bytesEpilogue` bytes per output adds
+/// its own double-buffered core tile.
+FailureOr<ConvTiling> chooseConvTiling(ArrayRef<int64_t> bounds,
+                                       const ConvDims &dims, int64_t bytesIn,
+                                       int64_t bytesFilter, int64_t bytesOut,
+                                       int64_t numRows, int64_t numCols,
+                                       int64_t l1Limit,
+                                       int64_t bytesEpilogue = 0);
 
 /// Loop-dimension structure of a 2-D max pooling `linalg.generic` in a
 /// channels-last-like layout: the output indexing map is the identity over the

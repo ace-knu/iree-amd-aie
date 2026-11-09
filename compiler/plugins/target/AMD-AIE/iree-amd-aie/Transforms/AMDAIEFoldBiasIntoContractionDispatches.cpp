@@ -28,6 +28,17 @@
 // A matched dispatch the fold cannot rewrite (a bias or weight that is not a
 // compile-time constant, an executable with several callers) is an error: the
 // backend would fail on its third input later with a less clear message.
+//
+// With the native conv tile pipeline enabled (`native_conv` in the target
+// config), a conv dispatch with its bias add fused, `fill(0) -> conv ->
+// generic(addf(conv, bias), ...)`, is folded the same way along its input
+// channels: the input gets ones channels after its IC channels (a host pad
+// dispatch with 1 as the pad value, IC + 1 rounded up to a multiple of 8), and
+// the constant filter gets the bias at input channel IC of its center tap and
+// zeros in the other new channels. The bias is a binding or, when IREE inlined
+// a small one into the executable, an `arith.constant`. The conv's results may
+// be tied to an operand other than its input, filter and bias (a conv writing
+// into the next layer's padded input).
 
 #include "iree-amd-aie/Transforms/AMDAIEDispatchRewriteUtils.h"
 #include "iree-amd-aie/Transforms/KernelDispatch.h"
@@ -111,6 +122,8 @@ static std::optional<BiasFoldInfo> getPostAddBiasInfo(func::FuncOp func) {
       consumer.getNumDpsInputs() != 2 || consumer.getNumDpsInits() != 1)
     return std::nullopt;
   unsigned mmInput = consumer.getDpsInputs()[0] == mmResult ? 0 : 1;
+  // The matmul value is an input of the consumer, not its init.
+  if (consumer.getDpsInputs()[mmInput] != mmResult) return std::nullopt;
   OpOperand *biasOperand = consumer.getDpsInputOperand(1 - mmInput);
   auto biasLoad = getFullTensorLoad(biasOperand->get());
   if (!biasLoad) return std::nullopt;
@@ -210,6 +223,30 @@ static DenseElementsAttr getBroadcastBias(Value acc, ModuleOp module) {
   return getConstantValue(dispatch.getArguments()[arg.getArgNumber()], nullptr);
 }
 
+/// Returns the values of `bias` converted to `floatType` (round to nearest
+/// even) as raw element bytes, one element per bias value. A DenseElementsAttr
+/// whose values are all equal stores a single element, so its raw data cannot
+/// be indexed per value: equal values are expanded here.
+static SmallVector<char> getConvertedBiasBytes(DenseElementsAttr bias,
+                                               FloatType floatType) {
+  SmallVector<APFloat> values;
+  for (APFloat v : bias.getValues<APFloat>()) {
+    bool losesInfo;
+    v.convert(floatType.getFloatSemantics(), APFloat::rmNearestTiesToEven,
+              &losesInfo);
+    values.push_back(v);
+  }
+  auto attr = DenseElementsAttr::get(
+      RankedTensorType::get({static_cast<int64_t>(values.size())}, floatType),
+      values);
+  ArrayRef<char> raw = attr.getRawData();
+  if (!attr.isSplat()) return SmallVector<char>(raw.begin(), raw.end());
+  SmallVector<char> bytes;
+  for (size_t i = 0, e = values.size(); i < e; ++i)
+    bytes.append(raw.begin(), raw.end());
+  return bytes;
+}
+
 /// Returns `weight` ([K, N] or [N, K], K at `kPos`) with `bias` appended as K
 /// row k, the bias converted to the weight element type. Null if the weight
 /// is splat or not a byte-sized float.
@@ -222,16 +259,7 @@ static DenseElementsAttr appendBiasRow(DenseElementsAttr weight,
   int64_t elemBytes = floatType.getWidth() / 8;
   SmallVector<int64_t> shape(type.getShape());
   int64_t k = shape[kPos], n = shape[1 - kPos];
-  SmallVector<APFloat> row;
-  for (APFloat v : bias.getValues<APFloat>()) {
-    bool losesInfo;
-    v.convert(floatType.getFloatSemantics(), APFloat::rmNearestTiesToEven,
-              &losesInfo);
-    row.push_back(v);
-  }
-  ArrayRef<char> rowRaw =
-      DenseElementsAttr::get(RankedTensorType::get({n}, floatType), row)
-          .getRawData();
+  SmallVector<char> rowRaw = getConvertedBiasBytes(bias, floatType);
   ArrayRef<char> src = weight.getRawData();
   SmallVector<char> dst;
   dst.reserve(src.size() + rowRaw.size());
@@ -254,9 +282,10 @@ static DenseElementsAttr appendBiasRow(DenseElementsAttr weight,
 }
 
 /// Rebuilds the bias consumer without the bias: the matmul value is its only
-/// input and the bias `addf` is dropped (its uses read the matmul value). A
-/// consumer that then only yields the matmul value is removed. Erases the bias
-/// load and binding.
+/// input and the bias `addf` is dropped (its uses read the matmul value). The
+/// init keeps its map, so a consumer that also transposes the result still
+/// does. A consumer that then only yields the matmul value through an identity
+/// init map is removed. Erases the bias load and binding.
 static void removeBias(IRRewriter &rewriter, BiasFoldInfo &info,
                        func::FuncOp func) {
   linalg::GenericOp oldConsumer = info.consumer;
@@ -266,10 +295,12 @@ static void removeBias(IRRewriter &rewriter, BiasFoldInfo &info,
   BlockArgument oldInit = oldBody.getArgument(2);
   AffineMap identity =
       AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
+  AffineMap initMap =
+      oldConsumer.getMatchingIndexingMap(oldConsumer.getDpsInitOperand(0));
   rewriter.setInsertionPoint(oldConsumer);
   auto newConsumer = rewriter.create<linalg::GenericOp>(
       loc, oldConsumer->getResultTypes(), ValueRange{mmResult},
-      oldConsumer.getDpsInits(), ArrayRef<AffineMap>{identity, identity},
+      oldConsumer.getDpsInits(), ArrayRef<AffineMap>{identity, initMap},
       oldConsumer.getIteratorTypesArray());
   Block *newBody = rewriter.createBlock(
       &newConsumer.getRegion(), {},
@@ -284,7 +315,7 @@ static void removeBias(IRRewriter &rewriter, BiasFoldInfo &info,
   rewriter.replaceOp(oldConsumer, newConsumer->getResults());
 
   auto yield = cast<linalg::YieldOp>(newBody->getTerminator());
-  if (llvm::hasSingleElement(*newBody) &&
+  if (initMap.isIdentity() && llvm::hasSingleElement(*newBody) &&
       yield.getOperand(0) == newBody->getArgument(0) &&
       newConsumer.getResult(0).getType() == mmResult.getType())
     rewriter.replaceOp(newConsumer, mmResult);
@@ -312,6 +343,299 @@ static void replaceAccumulatorWithZeroFill(IRRewriter &rewriter,
   (void)func.eraseArgument(info.biasArg.getArgNumber());
 }
 
+/// A conv's bias in post-add form: `fill(0) -> conv -> generic(addf(conv,
+/// bias), ...)`, the bias one value per output channel (the conv's last output
+/// dim), from its own binding or an inline constant.
+struct ConvBiasFoldInfo {
+  linalg::LinalgOp conv;
+  ConvDims dims;
+  IREE::TensorExt::DispatchTensorLoadOp inLoad, filterLoad, biasLoad;
+  BlockArgument inArg, filterArg, biasArg;  // biasLoad/biasArg null if inline
+  arith::ConstantOp inlineBias;
+  linalg::GenericOp consumer;
+  arith::AddFOp biasAdd;
+  unsigned convInput;  // the consumer input the conv result feeds
+};
+
+static std::optional<ConvBiasFoldInfo> getConvBiasInfo(func::FuncOp func) {
+  SmallVector<linalg::LinalgOp> convs;
+  func.walk([&](linalg::LinalgOp op) {
+    if (succeeded(getConvDims(op))) convs.push_back(op);
+  });
+  if (convs.size() != 1) return std::nullopt;
+  linalg::LinalgOp conv = convs.front();
+  auto inLoad = getFullTensorLoad(conv.getDpsInputOperand(0)->get());
+  auto filterLoad = getFullTensorLoad(conv.getDpsInputOperand(1)->get());
+  if (!inLoad || !filterLoad) return std::nullopt;
+  auto inArg = dyn_cast<BlockArgument>(inLoad.getSource());
+  auto filterArg = dyn_cast<BlockArgument>(filterLoad.getSource());
+  if (!inArg || !filterArg) return std::nullopt;
+  auto fill = conv.getDpsInitOperand(0)->get().getDefiningOp<linalg::FillOp>();
+  if (!fill || !matchPattern(fill.getInputs()[0], m_AnyZeroFloat()))
+    return std::nullopt;
+
+  Value convResult = conv->getResult(0);
+  if (!convResult.hasOneUse()) return std::nullopt;
+  auto consumer = dyn_cast<linalg::GenericOp>(*convResult.getUsers().begin());
+  if (!consumer || !isElementwise(consumer) ||
+      consumer.getNumDpsInputs() != 2 || consumer.getNumDpsInits() != 1)
+    return std::nullopt;
+  unsigned convInput = consumer.getDpsInputs()[0] == convResult ? 0 : 1;
+  // The conv value is an input of the consumer, not its init.
+  if (consumer.getDpsInputs()[convInput] != convResult) return std::nullopt;
+  OpOperand *biasOperand = consumer.getDpsInputOperand(1 - convInput);
+  MLIRContext *ctx = consumer.getContext();
+  unsigned rank = consumer.getNumLoops();
+  AffineMap perChannel =
+      AffineMap::get(rank, 0, {getAffineDimExpr(rank - 1, ctx)}, ctx);
+  if (!consumer.getMatchingIndexingMap(consumer.getDpsInputOperand(convInput))
+           .isIdentity() ||
+      consumer.getMatchingIndexingMap(biasOperand) != perChannel)
+    return std::nullopt;
+
+  // The conv value and the bias are each read by one `addf` of the two.
+  Block &body = consumer.getRegion().front();
+  BlockArgument convValue = body.getArgument(convInput);
+  BlockArgument biasValue = body.getArgument(1 - convInput);
+  if (!convValue.hasOneUse() || !biasValue.hasOneUse()) return std::nullopt;
+  auto biasAdd = dyn_cast<arith::AddFOp>(*convValue.getUsers().begin());
+  if (!biasAdd || *biasValue.getUsers().begin() != biasAdd.getOperation())
+    return std::nullopt;
+
+  ConvBiasFoldInfo info{conv,    *getConvDims(conv), inLoad,   filterLoad,
+                        {},      inArg,              filterArg, {},
+                        {},      consumer,           biasAdd,   convInput};
+  Value bias = biasOperand->get();
+  if (auto biasLoad = getFullTensorLoad(bias)) {
+    info.biasLoad = biasLoad;
+    info.biasArg = dyn_cast<BlockArgument>(biasLoad.getSource());
+    if (!info.biasArg) return std::nullopt;
+  } else if (auto cstOp = bias.getDefiningOp<arith::ConstantOp>()) {
+    info.inlineBias = cstOp;
+  } else {
+    return std::nullopt;
+  }
+  return info;
+}
+
+/// Returns conv `filter` (HWCF [KH, KW, IC, OC], or FHWC [OC, KH, KW, IC] when
+/// `ocFirst`) with its input channels grown to `newIC`: input channel IC (the
+/// input's first ones channel) holds `bias` at the center tap and zero at the
+/// other taps, and the channels after it are zero. The bias is converted to
+/// the filter element type. Null if the filter is splat or not a byte-sized
+/// float.
+static DenseElementsAttr appendBiasChannel(DenseElementsAttr filter,
+                                           DenseElementsAttr bias,
+                                           bool ocFirst, int64_t newIC) {
+  auto type = cast<RankedTensorType>(filter.getType());
+  auto floatType = dyn_cast<FloatType>(type.getElementType());
+  if (filter.isSplat() || !floatType || floatType.getWidth() % 8 != 0)
+    return {};
+  int64_t eb = floatType.getWidth() / 8;
+  ArrayRef<int64_t> s = type.getShape();
+  int64_t KH = ocFirst ? s[1] : s[0], KW = ocFirst ? s[2] : s[1];
+  int64_t IC = ocFirst ? s[3] : s[2], OC = ocFirst ? s[0] : s[3];
+  SmallVector<char> biasRaw = getConvertedBiasBytes(bias, floatType);
+  ArrayRef<char> src = filter.getRawData();
+  // All-zero bytes are +0.0 for IEEE floats.
+  SmallVector<char> dst(KH * KW * newIC * OC * eb, 0);
+  auto dstIndex = [&](int64_t kh, int64_t kw, int64_t ic, int64_t oc) {
+    return ocFirst ? ((oc * KH + kh) * KW + kw) * newIC + ic
+                   : ((kh * KW + kw) * newIC + ic) * OC + oc;
+  };
+  if (ocFirst) {
+    // [OC][KH][KW][IC]: each (oc, kh, kw) row of IC values moves as a whole.
+    for (int64_t oc = 0; oc < OC; ++oc)
+      for (int64_t kh = 0; kh < KH; ++kh)
+        for (int64_t kw = 0; kw < KW; ++kw) {
+          int64_t from = ((oc * KH + kh) * KW + kw) * IC;
+          std::copy_n(src.begin() + from * eb, IC * eb,
+                      dst.begin() + dstIndex(kh, kw, 0, oc) * eb);
+        }
+  } else {
+    // [KH][KW][IC][OC]: each (kh, kw, ic) row of OC values moves as a whole.
+    for (int64_t kh = 0; kh < KH; ++kh)
+      for (int64_t kw = 0; kw < KW; ++kw)
+        for (int64_t ic = 0; ic < IC; ++ic) {
+          int64_t from = ((kh * KW + kw) * IC + ic) * OC;
+          std::copy_n(src.begin() + from * eb, OC * eb,
+                      dst.begin() + dstIndex(kh, kw, ic, 0) * eb);
+        }
+  }
+  for (int64_t oc = 0; oc < OC; ++oc)
+    std::copy_n(biasRaw.begin() + oc * eb, eb,
+                dst.begin() + dstIndex(KH / 2, KW / 2, IC, oc) * eb);
+  SmallVector<int64_t> shape =
+      ocFirst ? SmallVector<int64_t>{OC, KH, KW, newIC}
+              : SmallVector<int64_t>{KH, KW, newIC, OC};
+  return DenseElementsAttr::getFromRawBuffer(
+      RankedTensorType::get(shape, floatType), dst);
+}
+
+/// Rebuilds the conv's bias consumer without the bias (as `removeBias` does for
+/// a matmul): the conv value is its only input and the bias `addf` is dropped.
+/// The init keeps its map (IREE moves an NHWC -> NCHW transpose of the conv
+/// result there). A consumer that then only yields the conv value through an
+/// identity init map is removed. Erases the bias load and binding, or the
+/// inline bias constant.
+static void removeConvBias(IRRewriter &rewriter, ConvBiasFoldInfo &info,
+                           func::FuncOp func) {
+  linalg::GenericOp oldConsumer = info.consumer;
+  Value convResult = info.conv->getResult(0);
+  Location loc = oldConsumer.getLoc();
+  Block &oldBody = oldConsumer.getRegion().front();
+  BlockArgument oldInit = oldBody.getArgument(2);
+  AffineMap identity = AffineMap::getMultiDimIdentityMap(
+      oldConsumer.getNumLoops(), rewriter.getContext());
+  AffineMap initMap =
+      oldConsumer.getMatchingIndexingMap(oldConsumer.getDpsInitOperand(0));
+  rewriter.setInsertionPoint(oldConsumer);
+  auto newConsumer = rewriter.create<linalg::GenericOp>(
+      loc, oldConsumer->getResultTypes(), ValueRange{convResult},
+      oldConsumer.getDpsInits(), ArrayRef<AffineMap>{identity, initMap},
+      oldConsumer.getIteratorTypesArray());
+  Block *newBody = rewriter.createBlock(
+      &newConsumer.getRegion(), {},
+      {oldBody.getArgument(info.convInput).getType(), oldInit.getType()},
+      {loc, loc});
+  IRMapping mapping;
+  mapping.map(oldBody.getArgument(info.convInput), newBody->getArgument(0));
+  mapping.map(oldInit, newBody->getArgument(1));
+  mapping.map(info.biasAdd.getResult(), newBody->getArgument(0));
+  for (Operation &op : oldBody)
+    if (&op != info.biasAdd.getOperation()) rewriter.clone(op, mapping);
+  rewriter.replaceOp(oldConsumer, newConsumer->getResults());
+
+  auto yield = cast<linalg::YieldOp>(newBody->getTerminator());
+  if (initMap.isIdentity() && llvm::hasSingleElement(*newBody) &&
+      yield.getOperand(0) == newBody->getArgument(0) &&
+      newConsumer.getResult(0).getType() == convResult.getType())
+    rewriter.replaceOp(newConsumer, convResult);
+
+  if (info.biasLoad) {
+    rewriter.eraseOp(info.biasLoad);
+    (void)func.eraseArgument(info.biasArg.getArgNumber());
+  } else if (info.inlineBias->use_empty()) {
+    rewriter.eraseOp(info.inlineBias);
+  }
+}
+
+/// Folds the bias of conv dispatch `dispatch` (see `ConvBiasFoldInfo`) into its
+/// input channels. Emits an error and fails if the fold cannot be done.
+static LogicalResult foldConvBias(
+    IRRewriter &rewriter, ModuleOp module, IREE::Flow::DispatchOp dispatch,
+    func::FuncOp func, ConvBiasFoldInfo &info, int numCallers,
+    IREE::HAL::DeviceAffinityAttr hostAffinity, int &counter,
+    SmallVectorImpl<IREE::Util::GlobalOp> &replacedGlobals) {
+  auto fail = [&](const Twine &reason) {
+    dispatch.emitError(
+        "cannot fold the bias of this NPU conv dispatch into its input "
+        "channels: ")
+        << reason;
+    return failure();
+  };
+  if (numCallers != 1) return fail("its executable has several callers");
+  // The fold grows the input and filter bindings and erases the bias binding,
+  // which anything else reading them would see.
+  auto onlyFeedsOneOp = [](BlockArgument arg, Operation *load) {
+    return arg.hasOneUse() && load->hasOneUse();
+  };
+  if (!onlyFeedsOneOp(info.inArg, info.inLoad) ||
+      !onlyFeedsOneOp(info.filterArg, info.filterLoad) ||
+      (info.biasLoad && !onlyFeedsOneOp(info.biasArg, info.biasLoad)))
+    return fail(
+        "its input, filter or bias is also read by another op of the "
+        "dispatch");
+  auto isStatic = [](Type t) {
+    auto shaped = dyn_cast<ShapedType>(t);
+    return !shaped || shaped.hasStaticShape();
+  };
+  if (!llvm::all_of(dispatch.getOperandTypes(), isStatic) ||
+      !llvm::all_of(dispatch.getResultTypes(), isStatic))
+    return fail("the dispatch has dynamically shaped operands or results");
+  unsigned inArgNo = info.inArg.getArgNumber();
+  unsigned filterArgNo = info.filterArg.getArgNumber();
+  std::optional<unsigned> biasArgNo;
+  if (info.biasArg) biasArgNo = info.biasArg.getArgNumber();
+  // Results tied to the operands the fold replaces or removes would change
+  // under it; a result tied to its own output operand is fine. The storage
+  // holds argument indices.
+  auto tiedAttr = dispatch->getAttrOfType<ArrayAttr>(
+      IREE::Util::TiedOpInterface::getStorageAttrName());
+  SmallVector<int64_t> tied;
+  if (tiedAttr) {
+    for (Attribute a : tiedAttr) {
+      int64_t t = cast<IntegerAttr>(a).getInt();
+      if (t == static_cast<int64_t>(inArgNo) ||
+          t == static_cast<int64_t>(filterArgNo) ||
+          (biasArgNo && t == static_cast<int64_t>(*biasArgNo)))
+        return fail("a result is tied to the conv input, filter or bias");
+      tied.push_back(t);
+    }
+  }
+  Value in = dispatch.getArguments()[inArgNo];
+  Value filter = dispatch.getArguments()[filterArgNo];
+  auto inType = cast<RankedTensorType>(in.getType());
+  auto inElemType = dyn_cast<FloatType>(inType.getElementType());
+  auto filterType = cast<RankedTensorType>(filter.getType());
+  if (!inElemType || !isa<FloatType>(filterType.getElementType()))
+    return fail("the conv operands are not floats");
+  IREE::Util::GlobalOp filterGlobal;
+  DenseElementsAttr filterAttr = getConstantValue(filter, &filterGlobal);
+  if (!filterAttr) return fail("the filter is not a constant");
+  Value biasOperand = biasArgNo ? dispatch.getArguments()[*biasArgNo] : Value();
+  DenseElementsAttr biasAttr =
+      biasArgNo ? getConstantValue(biasOperand, nullptr)
+                : getConstantValue(info.inlineBias.getResult(), nullptr);
+  if (!biasAttr || !isa<FloatType>(biasAttr.getElementType()))
+    return fail("the bias is not a float constant");
+
+  // The input channels are the last input dim.
+  int64_t ic = inType.getShape().back();
+  int64_t newIC = llvm::alignTo(ic + 1, 8);
+  DenseElementsAttr foldedAttr = appendBiasChannel(
+      filterAttr, biasAttr, info.dims.filterOcFirst, newIC);
+  if (!foldedAttr) return fail("the filter is not a dense float constant");
+  SmallVector<int64_t> inShape(inType.getShape());
+  inShape.back() = newIC;
+  auto foldedType = cast<RankedTensorType>(foldedAttr.getType());
+
+  // Executable: IC grown on the input and the filter, no bias.
+  growBinding(rewriter, info.inArg, info.inLoad, inShape);
+  growBinding(rewriter, info.filterArg, info.filterLoad, foldedType.getShape());
+  removeConvBias(rewriter, info, func);
+  SmallVector<Type> argTypes(llvm::map_range(
+      func.getArguments(), [](BlockArgument a) { return a.getType(); }));
+  func.setType(rewriter.getFunctionType(argTypes, /*results=*/{}));
+
+  // Host: the input with ones channels, the filter with the bias channel.
+  rewriter.setInsertionPoint(dispatch);
+  Value inFolded =
+      createPaddingDispatch(rewriter, module, in, inShape, hostAffinity,
+                            counter, rewriter.getFloatAttr(inElemType, 1.0));
+  Value filterFolded = createReplacementConstant(
+      rewriter, module, dispatch.getLoc(),
+      "__bias_folded_weight_" + std::to_string(counter++), foldedAttr,
+      filterGlobal, replacedGlobals);
+  dispatch.getArgumentsMutable().slice(inArgNo, 1).assign(inFolded);
+  dispatch.getArgumentsMutable().slice(filterArgNo, 1).assign(filterFolded);
+  if (biasArgNo) {
+    dispatch.getArgumentsMutable().erase(*biasArgNo);
+    // Results tied after the bias operand move down by one.
+    if (tiedAttr) {
+      for (int64_t &t : tied)
+        if (t != IREE::Util::TiedOpInterface::kUntiedIndex &&
+            t > static_cast<int64_t>(*biasArgNo))
+          --t;
+      dispatch->setAttr(IREE::Util::TiedOpInterface::getStorageAttrName(),
+                        rewriter.getIndexArrayAttr(tied));
+    }
+    eraseDeadProducers(rewriter, biasOperand);
+  }
+  eraseDeadProducers(rewriter, filter);
+  return success();
+}
+
 class AMDAIEFoldBiasIntoContractionDispatchesPass
     : public impl::AMDAIEFoldBiasIntoContractionDispatchesBase<
           AMDAIEFoldBiasIntoContractionDispatchesPass> {
@@ -337,12 +661,26 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
   SmallVector<IREE::Util::GlobalOp> replacedGlobals;
 
   for (IREE::Flow::DispatchOp dispatch : dispatches) {
-    if (!getDispatchTarget(dispatch, module)) continue;
+    IREE::HAL::ExecutableTargetAttr target =
+        getDispatchTarget(dispatch, module);
+    if (!target) continue;
     func::FuncOp func = getDispatchFunc(dispatch, module);
     if (!func) continue;
     std::optional<BiasFoldInfo> info = getPostAddBiasInfo(func);
     if (!info) info = getAccumulatorBiasInfo(func);
-    if (!info) continue;
+    if (!info) {
+      // A conv bias (native conv pipeline only; with im2col the conv is a
+      // matmul above).
+      if (getConfigNativeConv(target)) {
+        if (std::optional<ConvBiasFoldInfo> convInfo = getConvBiasInfo(func)) {
+          if (failed(foldConvBias(rewriter, module, dispatch, func, *convInfo,
+                                  numCallers[func.getOperation()],
+                                  hostAffinity, counter, replacedGlobals)))
+            return signalPassFailure();
+        }
+      }
+      continue;
+    }
 
     // From here on the dispatch has a bias as its third input, which the
     // backend cannot take: fold it or fail with the reason.
@@ -355,6 +693,17 @@ void AMDAIEFoldBiasIntoContractionDispatchesPass::runOnOperation() {
     };
     if (numCallers[func.getOperation()] != 1)
       return fail("its executable has several callers");
+    // K grows on the LHS and weight bindings and the bias binding goes away,
+    // which anything else reading them would see.
+    auto onlyFeedsOneOp = [](BlockArgument arg, Operation *load) {
+      return arg.hasOneUse() && load->hasOneUse();
+    };
+    if (!onlyFeedsOneOp(info->lhsArg, info->lhsLoad) ||
+        !onlyFeedsOneOp(info->rhsArg, info->rhsLoad) ||
+        !onlyFeedsOneOp(info->biasArg, info->biasLoad))
+      return fail(
+          "its LHS, weight or bias is also read by another op of the "
+          "dispatch");
     if (llvm::any_of(llvm::seq<unsigned>(0, dispatch.getNumResults()),
                      [&](unsigned r) {
                        return dispatch.getTiedResultOperandIndex(r).has_value();

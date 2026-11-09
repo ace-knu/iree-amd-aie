@@ -6,7 +6,8 @@
 
 // Helpers shared by the Flow-phase passes that rewrite NPU dispatches at the
 // dispatch boundary (AMDAIEPadContractionDispatches,
-// AMDAIEPadPoolingDispatches, AMDAIEFoldBiasIntoContractionDispatches):
+// AMDAIEPadPoolingDispatches, AMDAIEFoldBiasIntoContractionDispatches,
+// AMDAIEChunkConvDispatches):
 // resolving a dispatch's target and executable, matching full-tensor binding
 // loads, building host pad dispatches, reading compile-time constant operands,
 // and cleaning up what a rewrite leaves dead.
@@ -34,7 +35,8 @@ IREE::HAL::ExecutableTargetAttr getDispatchTarget(
 func::FuncOp getDispatchFunc(IREE::Flow::DispatchOp dispatch, ModuleOp module);
 
 /// Traces a matmul input value to the executable binding (BlockArgument) it is
-/// loaded from via a full-tensor `dispatch.tensor.load`.
+/// loaded from via a full-tensor `dispatch.tensor.load`: zero offsets, unit
+/// strides and the binding's whole shape. Null for any other load.
 IREE::TensorExt::DispatchTensorLoadOp getFullTensorLoad(Value operand);
 
 /// Grows executable binding `arg` and its full-tensor `load` to `newShape`
@@ -57,11 +59,18 @@ unsigned operandDimForLoop(AffineMap map, unsigned loopDim);
 IREE::HAL::DeviceAffinityAttr getHostAffinity(ModuleOp module);
 
 /// First index `i` such that no `pad_executable_i` / `crop_executable_i` /
-/// `concat_executable_i` / `__padded_constant_i` / `__bias_folded_weight_i`
+/// `concat_executable_i` / `halo_executable_i` / `insert_executable_i` /
+/// `__padded_constant_i` / `__bias_folded_weight_i` / `__conv_fhwc_weight_i`
 /// symbol exists yet in `module`: the helper builders number their executables
 /// and globals from it, so the Flow-phase dispatch passes (which run back to
 /// back on the same module) never collide.
 int firstFreeHelperIndex(ModuleOp module);
+
+/// Wraps `funcOp` in a new private `flow.executable` named `name`, appended to
+/// `module`, with a default workgroup-count region. Returns its export.
+IREE::Flow::ExecutableExportOp createExecutable(ModuleOp module,
+                                                func::FuncOp funcOp,
+                                                StringRef name);
 
 /// Creates a `flow.executable` + `flow.dispatch` that zero-pads `v` up to
 /// `dstShape` (high padding), placed on `hostAffinity`. Returns the padded
@@ -79,6 +88,14 @@ Value createPaddingDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
                             ArrayRef<int64_t> dstShape,
                             IREE::HAL::DeviceAffinityAttr hostAffinity,
                             int &counter, TypedAttr padValue = nullptr);
+
+/// Creates a host dispatch (`insert_executable_<i>`) that copies `v` into
+/// `dest` at `offsets`, tied to `dest`, the form `createPaddingDispatch` gives
+/// its copy into the splat. Returns the updated `dest`.
+Value createInsertDispatch(IRRewriter &rewriter, ModuleOp module, Value v,
+                           Value dest, ArrayRef<int64_t> offsets,
+                           IREE::HAL::DeviceAffinityAttr hostAffinity,
+                           int &counter);
 
 /// Returns the dense value of `v` when it is a compile-time constant: an
 /// `arith.constant` or a load of an immutable `util.global` with a dense
@@ -102,7 +119,8 @@ Value createReplacementConstant(
 void eraseDeadProducers(IRRewriter &rewriter, Value v);
 
 /// Erases those of `globals` no load reads any more (they would otherwise be
-/// kept next to their padded or folded copies until a later cleanup).
+/// kept next to their padded or folded copies until a later cleanup). A global
+/// may be listed more than once.
 void eraseDeadGlobals(IRRewriter &rewriter, ModuleOp module,
                       ArrayRef<IREE::Util::GlobalOp> globals);
 
