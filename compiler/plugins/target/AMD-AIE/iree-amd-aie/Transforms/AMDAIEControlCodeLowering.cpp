@@ -144,12 +144,126 @@ struct HalfDmaCpyNdToNpuConverter final
     DmaDimConfig dmaDimConfig(deviceModel, memSpace);
     SmallVector<int64_t> maxSizes = dmaDimConfig.getMaxSizes(offsets.size());
     SmallVector<OpFoldResult> linearOffsets, linearSizes, linearStrides;
-    (void)foldLinearDims(
-        rewriter.getContext(), offsets, sizes, strides, linearOffsets,
-        linearSizes, linearStrides, [&](size_t idxFromEnd, int64_t size) {
-          return idxFromEnd < maxSizes.size() &&
-                 size <= maxSizes[maxSizes.size() - idxFromEnd - 1];
-        });
+    // `innermostInWords` limits a merged innermost dim by its size in words,
+    // what its wrap counts once converted below, instead of in elements.
+    auto foldDims = [&](bool innermostInWords) {
+      linearOffsets.clear();
+      linearSizes.clear();
+      linearStrides.clear();
+      (void)foldLinearDims(
+          rewriter.getContext(), offsets, sizes, strides, linearOffsets,
+          linearSizes, linearStrides, [&](size_t idxFromEnd, int64_t size) {
+            if (innermostInWords && idxFromEnd == 0) {
+              size = (size * elemWidthInBits + minStrideBitWidth - 1) /
+                     minStrideBitWidth;
+            }
+            return idxFromEnd < maxSizes.size() &&
+                   size <= maxSizes[maxSizes.size() - idxFromEnd - 1];
+          });
+    };
+    foldDims(/*innermostInWords=*/false);
+
+    // The shim BD counts its base address, strides and innermost size in
+    // `minStrideBitWidth` words, and the conversion below floors whatever part
+    // of a word is left. For elements narrower than a word that would silently
+    // drop or shift data, so such an access must be whole words: the offset
+    // and the outer strides, and a unit-stride innermost run (the whole
+    // transfer when it folds to no dims at all, a single element). Returns
+    // what breaks that, if anything.
+    auto subWordProblem = [&]() -> std::optional<std::string> {
+      std::string problem;
+      llvm::raw_string_ostream os(problem);
+      auto notWords = [&](StringRef what, int64_t numElems) {
+        os << "accesses " << elemWidthInBits << "-bit elements with " << what
+           << " of " << numElems << " elements, which is not a whole number of "
+           << +minStrideBitWidth
+           << "-bit words (the shim DMA counts its address, strides and "
+              "innermost size in words)";
+        return os.str();
+      };
+      auto isWords = [&](int64_t numElems) {
+        return numElems * elemWidthInBits % minStrideBitWidth == 0;
+      };
+      int64_t elemOffset = bufferOffset + reinterpretElemOffset;
+      if (!isWords(elemOffset)) return notWords("a base offset", elemOffset);
+      if (linearSizes.empty() && !isWords(bufferLength))
+        return notWords("an innermost run", bufferLength);
+      for (size_t i = 0, e = linearSizes.size(); i < e; ++i) {
+        int64_t size = getConstantIndexOrAssert(linearSizes[i]);
+        int64_t stride = getConstantIndexOrAssert(linearStrides[i]);
+        if (i + 1 == e) {
+          if (size > 1 && stride != 1) {
+            os << "accesses " << elemWidthInBits
+               << "-bit elements with an innermost stride of " << stride
+               << " elements (the shim DMA moves whole " << +minStrideBitWidth
+               << "-bit words, so sub-word elements must be contiguous in the "
+                  "innermost dim)";
+            return os.str();
+          }
+          if (!isWords(size)) return notWords("an innermost run", size);
+        } else if (size > 1 && stride != 0 && !isWords(stride)) {
+          return notWords("a stride", stride);
+        }
+      }
+      return std::nullopt;
+    };
+    // Whether each folded dim fits the BD dim it lands in (see the loop
+    // below): the outermost is the repeat count (stride 0) or, when every
+    // address dim is used, the iteration; the others are intra dims, the
+    // innermost counted in words. An intra wrap field holds at most WrapMax (a
+    // WrapMax + 1 that aie-rt accepts is encoded as 0); the highest intra dim
+    // has no wrap field, but aie-rt still takes at most WrapMax + 1 there.
+    FailureOr<uint16_t> wrapMax = deviceModel.getDmaBdProp<uint16_t>(
+        tileType, 0, AMDAIE::AMDAIEDmaBdProp::WrapMax);
+    FailureOr<uint8_t> iterWrapMax = deviceModel.getDmaBdProp<uint8_t>(
+        tileType, 0, AMDAIE::AMDAIEDmaBdProp::IterWrapMax);
+    if (failed(wrapMax) || failed(iterWrapMax))
+      return op.emitOpError() << "could not get the DMA BD wrap limits";
+    int64_t maxRepeatCount = deviceModel.getMaxRepeatCount(tileType);
+    auto bdDimsProblem = [&]() -> std::optional<std::string> {
+      size_t n = linearSizes.size();
+      if (n > numAddrDim) return std::nullopt;  // Reported below.
+      for (size_t i = 0; i < n; ++i) {
+        int64_t size = getConstantIndexOrAssert(linearSizes[i]);
+        int64_t stride = getConstantIndexOrAssert(linearStrides[i]);
+        size_t fromInnermost = n - 1 - i;
+        StringRef what = "an intra dim";
+        int64_t limit = *wrapMax;
+        if (i == 0 && (n == numAddrDim || stride == 0)) {
+          what = stride == 0 ? "a repeat count" : "an iteration count";
+          limit = stride == 0 ? maxRepeatCount : *iterWrapMax + 1;
+        } else if (fromInnermost == 0) {
+          what = "an innermost dim (in words)";
+          size = size * elemWidthInBits / minStrideBitWidth;
+        } else if (fromInnermost + 1 == numIntraAddrDim) {
+          what = "a highest intra dim";
+          limit = *wrapMax + 1;
+        }
+        if (size <= limit) continue;
+        std::string problem;
+        llvm::raw_string_ostream os(problem);
+        os << "folds to a shim BD with " << what << " of " << size
+           << ", more than its limit of " << limit;
+        return os.str();
+      }
+      return std::nullopt;
+    };
+    if (elemWidthInBits < minStrideBitWidth && bufferLength > 0) {
+      std::optional<std::string> problem = subWordProblem();
+      // Contiguous rows of an odd number of elements stay unmerged when their
+      // total passes the wrap counted in elements, yet the merged run may be
+      // whole words within the wrap counted in words. Merging moves every
+      // outer dim down one BD dim, so the refold must also fit the BD; if it
+      // does not, the first fold's problem stands.
+      if (problem) {
+        std::string firstProblem = *problem;
+        foldDims(/*innermostInWords=*/true);
+        problem = subWordProblem();
+        if (!problem) problem = bdDimsProblem();
+        if (problem) problem = firstProblem;
+      }
+      if (problem) return op.emitOpError() << *problem;
+    }
 
     SmallVector<int32_t, 4> staticSizes;
     SmallVector<int32_t, 4> staticStrides;

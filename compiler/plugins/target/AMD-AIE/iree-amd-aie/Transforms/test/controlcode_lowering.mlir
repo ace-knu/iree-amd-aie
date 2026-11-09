@@ -644,6 +644,402 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
 
 // -----
 
+// A shim access of sub-word elements must be whole 32-bit words: the BD
+// counts its address, strides and innermost size in words, and anything
+// else is reported instead of floored.
+
+// Rows of an interior whose first element is not word aligned (bf16 element 15
+// is byte 30, which the BD address field floors to byte 28).
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_not_word_aligned_base_offset() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<2048xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<2048xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<2048xbf16> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with a base offset of 15 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[1, 3] [2, 6] [12, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// A strided read of every other element; the lowering used to turn it into a
+// contiguous word read.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_not_word_aligned_innermost_stride() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<2048xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<2048xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<2048xbf16> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with an innermost stride of 2 elements (the shim DMA moves whole 32-bit words, so sub-word elements must be contiguous in the innermost dim)}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0] [16] [2] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// Rows of 3 elements (6 bytes); the lowering used to floor each row to one
+// word.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_not_word_aligned_innermost_run() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<2048xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<2048xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<2048xbf16> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with an innermost run of 3 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0, 0] [2, 3] [8, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// Rows 5 elements (10 bytes) apart.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_not_word_aligned_outer_stride() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<2048xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<2048xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<2048xbf16> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with a stride of 5 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0, 0] [2, 4] [5, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// A single element: its unit dims fold away to no dims at all, and the
+// whole transfer (2 bytes) is less than a word.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_not_word_aligned_single_element() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<64x32xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<64x32xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<64x32xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<64x32xbf16> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with an innermost run of 1 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0, 0] [1, 1] [8, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// The base offset counts the reinterpret_cast offset (15 bf16 elements, byte
+// 30) next to the access pattern's own.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_not_word_aligned_reinterpret_offset() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<64x32xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<64x32xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<64x32xbf16>>)
+      amdaie.controlcode {
+        %aa = memref.assume_alignment %1, 64 : memref<64x32xbf16>
+        %rc = memref.reinterpret_cast %aa to offset: [15], sizes: [64, 32], strides: [32, 1] : memref<64x32xbf16> to memref<64x32xbf16, strided<[32, 1], offset: 15>>
+        %5 = amdaie.logicalobjectfifo.from_memref %rc, {%tile_0} : memref<64x32xbf16, strided<[32, 1], offset: 15>> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with a base offset of 15 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0] [16] [1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// With the pattern starting one element later the base offset is 16 elements
+// (byte 32): whole words, so it lowers.
+// CHECK-LABEL: @bf16_word_aligned_reinterpret_offset
+// CHECK:       amdaie.npu.write_bd({{.+}}) {bd_id = 0 : ui32, buffer_length = 8 : ui32, {{.*}} sizes = array<i32: 0, 0, 8>, strides = array<i32: 0, 0, 1>
+// CHECK:       amdaie.npu.address_patch {arg_idx = 0 : ui32, bd_id = 0 : ui32, col = 0 : ui32, offset = 32 : ui32}
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_word_aligned_reinterpret_offset() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<64x32xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<64x32xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<64x32xbf16>>)
+      amdaie.controlcode {
+        %aa = memref.assume_alignment %1, 64 : memref<64x32xbf16>
+        %rc = memref.reinterpret_cast %aa to offset: [15], sizes: [64, 32], strides: [32, 1] : memref<64x32xbf16> to memref<64x32xbf16, strided<[32, 1], offset: 15>>
+        %5 = amdaie.logicalobjectfifo.from_memref %rc, {%tile_0} : memref<64x32xbf16, strided<[32, 1], offset: 15>> -> !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[1] [16] [1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2048xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+// ADD1-LABEL:   @bf16_word_aligned_reinterpret_offset
+// ADD1-COUNT-1:   amdaie.npu.address_patch {arg_idx = 1
+// ADD1-NOT:       amdaie.npu.address_patch
+
+// ADD2-LABEL:   @bf16_word_aligned_reinterpret_offset
+// ADD2-COUNT-1:   amdaie.npu.address_patch {arg_idx = 2
+// ADD2-NOT:       amdaie.npu.address_patch
+
+// -----
+
+// 26 contiguous rows of 45 bf16: 1170 elements pass the wrap counted in
+// elements, so the rows stay unmerged and each is an odd number of elements.
+// The run is 585 whole words, within the wrap counted in words, so it is
+// folded again in words and lowers as one dim.
+// CHECK-LABEL: @bf16_contiguous_rows_fold_in_words
+// CHECK:       amdaie.npu.write_bd({{.+}}) {bd_id = 0 : ui32, buffer_length = 585 : ui32, {{.*}} sizes = array<i32: 0, 0, 585>, strides = array<i32: 0, 0, 1>
+// CHECK:       amdaie.npu.address_patch {arg_idx = 0 : ui32, bd_id = 0 : ui32, col = 0 : ui32, offset = 0 : ui32}
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_contiguous_rows_fold_in_words() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<4096xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<4096xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<4096xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<64x64xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<64x64xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<4096xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<64x64xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<64x64xbf16> -> !amdaie.logicalobjectfifo<memref<4096xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0, 0] [26, 45] [45, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<4096xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+// ADD1-LABEL:   @bf16_contiguous_rows_fold_in_words
+// ADD1-COUNT-1:   amdaie.npu.address_patch {arg_idx = 1
+// ADD1-NOT:       amdaie.npu.address_patch
+
+// ADD2-LABEL:   @bf16_contiguous_rows_fold_in_words
+// ADD2-COUNT-1:   amdaie.npu.address_patch {arg_idx = 2
+// ADD2-NOT:       amdaie.npu.address_patch
+
+// -----
+
+// Two contiguous rows of 1025 bf16 are 1025 words, past the wrap in words too:
+// the odd row stride stays and is reported.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_contiguous_rows_over_wrap_in_words() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<4096xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<4096xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<4096xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<64x64xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<64x64xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<4096xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<64x64xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<64x64xbf16> -> !amdaie.logicalobjectfifo<memref<4096xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with a stride of 1025 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0, 0] [2, 1025] [1025, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<4096xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// Folding the odd rows in words would merge [26, 45] into one dim and move the
+// 1024-row dim from the wrap-less highest intra dim into D1, whose wrap field
+// holds at most 1023: the refold does not fit, so the odd row stride stands.
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+#pipeline_layout = #hal.pipeline.layout<bindings = [#hal.pipeline.binding<storage_buffer, "ReadOnly|Indirect">], flags = Indirect>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @bf16_rows_refold_moves_outer_dim() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    amdaie.workgroup {
+      %tile = amdaie.tile(%c0, %c1)
+      %tile_0 = amdaie.tile(%c0, %c0)
+      %buffer = amdaie.buffer(%tile) : memref<2048xbf16, 1 : i32>
+      %lock = amdaie.lock(%tile(4), 4)
+      %lock_2 = amdaie.lock(%tile(5), 0)
+      %0 = amdaie.logicalobjectfifo.from_buffers({%buffer}, {%lock}, {%lock_2}) : memref<2048xbf16, 1 : i32> -> !amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>
+      %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags("ReadOnly|Indirect") : memref<2396164xbf16>
+      %2 = amdaie.logicalobjectfifo.placeholder{%tile_0} : !amdaie.logicalobjectfifo<memref<2396164xbf16>>
+      %channel = amdaie.channel(%tile_0, 0, port_type = DMA, direction = MM2S)
+      %channel_3 = amdaie.channel(%tile, 0, port_type = DMA, direction = S2MM)
+      %3 = amdaie.flow({%channel} -> {%channel_3}) {is_packet_flow = true, packet_id = 0 : ui8}
+      %4 = amdaie.connection(%0 {%channel_3}, %2 {%channel}, flow = %3) {connection_type = #amdaie<connection_type Packet>} : (!amdaie.logicalobjectfifo<memref<2048xbf16, 1 : i32>, 1>, !amdaie.logicalobjectfifo<memref<2396164xbf16>>)
+      amdaie.controlcode {
+        %5 = amdaie.logicalobjectfifo.from_memref %1, {%tile_0} : memref<2396164xbf16> -> !amdaie.logicalobjectfifo<memref<2396164xbf16>>
+        %bd_id = amdaie.bd_id(%tile_0, %c0)
+        // expected-error @below {{accesses 16-bit elements with a stride of 45 elements, which is not a whole number of 32-bit words}}
+        // expected-error @below {{failed to legalize operation 'amdaie.npu.half_dma_cpy_nd'}}
+        %6 = amdaie.npu.half_dma_cpy_nd async %4(%5[0, 0, 0, 0] [2, 1024, 26, 45] [1198082, 1170, 45, 1] bd_id = %bd_id channel = %channel) : !amdaie.logicalobjectfifo<memref<2396164xbf16>>
+        amdaie.npu.dma_wait(%6 : !amdaie.async_token)
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
 // An access pattern that cannot be folded within the shim BD's `intra`
 // addressing dimensions must be reported. This used to be an assert, which
 // meant a release build instead underflowed `numIntraAddrDim - size()` (uint8_t
