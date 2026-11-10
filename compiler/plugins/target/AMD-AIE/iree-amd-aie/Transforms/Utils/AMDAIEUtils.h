@@ -125,6 +125,13 @@ FailureOr<GemvNTiling> chooseGemvNTiling(int64_t M, int64_t N, int64_t kTile,
 /// target config; absent means 32).
 int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr);
 
+/// The float type the inputs of contraction dispatches placed on this target
+/// are converted to (`contraction_input_type` in the executable target config,
+/// e.g. `bf16`), or null to keep them as they are. Read per dispatch by the
+/// Flow demote pass after device placement; any backend's target may carry it.
+FloatType getConfigContractionInputType(
+    IREE::HAL::ExecutableTargetAttr targetAttr);
+
 /// The pool column policy (`pool_columns_policy` in the executable target
 /// config, one of "odd" | "cost" | "full" | "max"; absent means `Max`). Read
 /// per dispatch by the Flow pooling pad pass so it pads OH exactly when the

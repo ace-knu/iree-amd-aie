@@ -14,7 +14,7 @@
 
 namespace mlir::iree_compiler::AMDAIE {
 
-IREE::HAL::ExecutableTargetAttr getDispatchTarget(
+IREE::HAL::ExecutableTargetAttr getDispatchExecutableTarget(
     IREE::Flow::DispatchOp dispatch, ModuleOp module) {
   auto affinity =
       dispatch->getAttrOfType<IREE::HAL::DeviceAffinityAttr>("stream.affinity");
@@ -29,8 +29,14 @@ IREE::HAL::ExecutableTargetAttr getDispatchTarget(
   ArrayRef<IREE::HAL::ExecutableTargetAttr> targets =
       deviceTarget.getExecutableTargets();
   if (targets.empty()) return {};
-  IREE::HAL::ExecutableTargetAttr exec = targets.front();
-  if (exec.getBackend().getValue() != "amd-aie") return {};
+  return targets.front();
+}
+
+IREE::HAL::ExecutableTargetAttr getDispatchTarget(
+    IREE::Flow::DispatchOp dispatch, ModuleOp module) {
+  IREE::HAL::ExecutableTargetAttr exec =
+      getDispatchExecutableTarget(dispatch, module);
+  if (!exec || exec.getBackend().getValue() != "amd-aie") return {};
   return exec;
 }
 
@@ -106,7 +112,8 @@ int firstFreeHelperIndex(ModuleOp module) {
     StringRef name = sym.getName();
     for (StringRef prefix :
          {"pad_executable_", "crop_executable_", "concat_executable_",
-          "__padded_constant_", "__bias_folded_weight_"}) {
+          "cast_executable_", "__padded_constant_", "__bias_folded_weight_",
+          "__demoted_constant_"}) {
       if (!name.consume_front(prefix)) continue;
       int idx;
       if (!name.getAsInteger(10, idx)) next = std::max(next, idx + 1);

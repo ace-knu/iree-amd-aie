@@ -113,6 +113,13 @@ struct AMDAIESession
     placementOptions.acceleratePooling = options.acceleratePooling;
     passManager.addPass(
         AMDAIE::createAMDAIEAssignDeviceAffinitiesPass(placementOptions));
+    // Now that every dispatch has a device, convert the inputs of contraction
+    // dispatches to the element type their device asks for
+    // (--iree-amdaie-contraction-input-type for amd-aie); dispatches on other
+    // devices keep theirs. Before the bias fold and the pads, which size their
+    // work by the element type. No-op when no device asks.
+    passManager.addPass(
+        AMDAIE::createAMDAIEDemoteContractionDispatchInputsPass());
     // Fold a constant bias fused into an NPU contraction dispatch into K, so
     // the dispatch keeps two inputs (then padded like any other K below).
     // No-op without such a dispatch.

@@ -24,9 +24,15 @@
 
 namespace mlir::iree_compiler::AMDAIE {
 
-/// Resolves the amd-aie executable target a dispatch is pinned to via its
-/// `stream.affinity` (affinity -> device global -> executable target attr).
-/// Returns null if the dispatch is not pinned to an amd-aie device.
+/// Resolves the executable target a dispatch is pinned to via its
+/// `stream.affinity` (affinity -> device global -> executable target attr),
+/// whatever its backend. Returns null if the dispatch is not pinned to a
+/// single-target device.
+IREE::HAL::ExecutableTargetAttr getDispatchExecutableTarget(
+    IREE::Flow::DispatchOp dispatch, ModuleOp module);
+
+/// Like `getDispatchExecutableTarget`, but returns null unless the target is
+/// amd-aie.
 IREE::HAL::ExecutableTargetAttr getDispatchTarget(
     IREE::Flow::DispatchOp dispatch, ModuleOp module);
 
@@ -57,8 +63,9 @@ unsigned operandDimForLoop(AffineMap map, unsigned loopDim);
 IREE::HAL::DeviceAffinityAttr getHostAffinity(ModuleOp module);
 
 /// First index `i` such that no `pad_executable_i` / `crop_executable_i` /
-/// `concat_executable_i` / `__padded_constant_i` / `__bias_folded_weight_i`
-/// symbol exists yet in `module`: the helper builders number their executables
+/// `concat_executable_i` / `cast_executable_i` / `__padded_constant_i` /
+/// `__bias_folded_weight_i` / `__demoted_constant_i` symbol exists yet in
+/// `module`: the helper builders number their executables
 /// and globals from it, so the Flow-phase dispatch passes (which run back to
 /// back on the same module) never collide.
 int firstFreeHelperIndex(ModuleOp module);

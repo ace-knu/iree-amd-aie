@@ -223,6 +223,13 @@ int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr) {
   return attr ? attr->getInt() : 32;
 }
 
+FloatType getConfigContractionInputType(
+    IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<TypeAttr> attr =
+      getConfigAttr<TypeAttr>(targetAttr, "contraction_input_type");
+  return attr ? dyn_cast<FloatType>(attr->getValue()) : FloatType();
+}
+
 llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy) {
   switch (policy) {
     case PoolColumnsPolicy::Odd:

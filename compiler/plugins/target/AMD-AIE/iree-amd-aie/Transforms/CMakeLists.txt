@@ -71,6 +71,7 @@ iree_cc_library(
     "AMDAIEConvertDeviceToControlPackets.cpp"
     "AMDAIECreateAIEWorkgroup.cpp"
     "AMDAIECreateReferenceToAllocation.cpp"
+    "AMDAIEDemoteContractionDispatchInputs.cpp"
     "AMDAIEDispatchRewriteUtils.cpp"
     "AMDAIEDistributeCoresAndObjectFifos.cpp"
     "AMDAIEDistributeL1Allocations.cpp"

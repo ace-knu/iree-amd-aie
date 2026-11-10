@@ -40,6 +40,7 @@ iree_lit_test_suite(
     "convert_device_to_control_packets.mlir"
     "create_aie_workgroup.mlir"
     "create_reference_to_allocation.mlir"
+    "demote_contraction_dispatch_inputs.mlir"
     "disable_linalg_function_outlining.mlir"
     "disable_vectorization.mlir"
     "distribute_cores_and_objectfifos.mlir"

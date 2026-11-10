@@ -116,6 +116,13 @@ def AMDAIEAnnotateInputDevices :
       "mlir::iree_compiler::AMDAIE::createAMDAIEAnnotateInputDevicesPass()";
 }
 
+def AMDAIEDemoteContractionDispatchInputs :
+    Pass<"iree-amdaie-demote-contraction-dispatch-inputs", "ModuleOp"> {
+  let summary = "Convert the inputs of contraction dispatches to the element type their device asks for (`contraction_input_type` on its executable target) after device placement: constants at compile time, a host producer's result inside that producer, anything else by a host cast dispatch.";
+  let constructor =
+      "mlir::iree_compiler::AMDAIE::createAMDAIEDemoteContractionDispatchInputsPass()";
+}
+
 def AMDAIEFoldBiasIntoContractionDispatches :
     Pass<"iree-amdaie-fold-bias-into-contraction-dispatches", "ModuleOp"> {
   let summary = "Fold the constant bias of NPU contraction dispatches into the reduction dim (a ones column on the LHS, a bias row in the weight), so the dispatch keeps two inputs.";

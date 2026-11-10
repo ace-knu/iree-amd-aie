@@ -195,6 +195,16 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     addConfig("pool_columns_policy",
               StringAttr::get(context, stringifyPoolColumnsPolicy(
                                            options.poolColumnsPolicy)));
+    // The element type the Flow demote pass converts the inputs of this
+    // device's contraction dispatches to (absent: kept as they are).
+    if (options.contractionInputType == "bf16") {
+      addConfig("contraction_input_type",
+                TypeAttr::get(BFloat16Type::get(context)));
+    } else if (options.contractionInputType != "none") {
+      llvm::report_fatal_error(
+          llvm::Twine("Invalid --iree-amdaie-contraction-input-type (") +
+          options.contractionInputType + "), must be `none` or `bf16`");
+    }
     // Set number of rows/cols used in an AIE array.
     addConfig("num_rows",
               IntegerAttr::get(IntegerType::get(context, 32), nRows));

@@ -67,6 +67,12 @@ struct AMDAIEOptions {
   // too. Harmless while every contraction is placed on the accelerator; revisit
   // if the placement rules change.
   bool demoteContractionInputsToBf16{false};
+  // Element type the inputs of contraction dispatches placed on this device are
+  // converted to after device placement (`none` keeps them, `bf16`), carried
+  // as `contraction_input_type` on the executable target. Unlike
+  // demoteContractionInputsToBf16 above, only the dispatches placed here are
+  // converted, so a GPU or the CPU sharing the model keeps f32.
+  std::string contractionInputType{"none"};
   // Experiment (default empty = off): pins dispatches to devices by dispatch
   // number / name rules, e.g. "d2=npu;~matmul=gpu;*=cpu" or "@<file>". See the
   // `placement-map` option of AMDAIEAssignDeviceAffinities.
@@ -203,6 +209,15 @@ struct AMDAIEOptions {
             "Demote the inputs of contraction ops (matmul + convolution) from "
             "f32 to bf16 during preprocessing (accumulation stays f32). Needed "
             "to run f32 models on npu4, which has no f32 vector path."));
+
+    binder.opt<std::string>(
+        "iree-amdaie-contraction-input-type", contractionInputType,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "Element type the inputs of contraction dispatches placed on the "
+            "amd-aie device are converted to after device placement (Flow "
+            "phase; accumulation stays f32): `none` (default) or `bf16`. "
+            "Dispatches placed on other devices keep their types."));
 
     binder.opt<std::string>(
         "iree-amdaie-placement-map", placementMap, llvm::cl::cat(category),
