@@ -119,6 +119,11 @@ struct AMDAIEOptions {
   // wrapped in transposes, so pooling matches the NHWC convs and the transposes
   // around each pool cancel. Stage 0 of the NPU pooling work; default off.
   bool poolingChannelsLast{false};
+  // With `poolingChannelsLast`, also move NCHW sum pooling (AveragePool,
+  // GlobalAveragePool) to NHWC, layout only. Sum pooling is never accelerator
+  // work, so this does not touch the NPU pool path. Default on
+  // (research/inception-opt).
+  bool poolingChannelsLastSum{true};
   // Count 2-D max pooling as accelerator work in the Flow-phase device
   // placement, so it is placed round-robin on the accelerators like
   // contractions/convs (the NPU lowers it with the pool tile pipeline). See the
@@ -256,6 +261,15 @@ struct AMDAIEOptions {
                        "pooling in preprocessing, matching the channels-last "
                        "convs so the transposes around each pool cancel. "
                        "Default false."));
+
+    binder.opt<bool>(
+        "iree-amdaie-pooling-channels-last-sum", poolingChannelsLastSum,
+        llvm::cl::cat(category),
+        llvm::cl::desc("With --iree-amdaie-pooling-channels-last, also rewrite "
+                       "NCHW sum pooling (AveragePool, GlobalAveragePool) as "
+                       "NHWC pooling, together with its input pad and average "
+                       "divide (layout only; sum pooling never runs on the "
+                       "NPU). Default true."));
 
     /// Command line option for selecting the lowering pipeline to use to
     /// generate AIE DMA configurations, core code and control code.

@@ -23,6 +23,19 @@
 // matches the named `linalg.pooling_nchw_max` only. Gated by the target option
 // `--iree-amdaie-pooling-channels-last` (default off) until validated.
 //
+// With `sum-pooling` (target option `--iree-amdaie-pooling-channels-last-sum`)
+// NCHW sum pooling (`linalg.pooling_nchw_sum`, what AveragePool and
+// GlobalAveragePool lower to: `tensor.pad` -> sum pooling -> elementwise divide)
+// is moved to NHWC as well, layout only. Two neighbours move with it, because
+// upstream transpose propagation stops at them: the input `tensor.pad` (sinking
+// a transpose through a pad is behind an upstream flag, off by default) is
+// rebuilt on the transposed producer, and a single elementwise consumer (the
+// divide; with count_include_pad = 0 it computes the divisor from
+// `linalg.index` on H/W, and propagation gives up on index semantics) is
+// rebuilt in NHWC with its index dims remapped. Sum pooling is never
+// accelerator work (placement admits max pooling only), so no channel padding
+// or halo split applies to it.
+//
 // With `channel-multiple` > 1 the NHWC pooling's channel dim is padded up to a
 // multiple of it (`tensor.pad` on the input, and on the init unless it is a
 // plain fill, which is just rebuilt at the padded size) and the padded channels
@@ -55,6 +68,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-amdaie-convert-pooling-to-channels-last"
@@ -190,6 +204,132 @@ struct PoolingNchwMaxToNhwc : OpRewritePattern<linalg::PoolingNchwMaxOp> {
   int64_t channelMultiple;
 };
 
+/// Whether `generic` is an elementwise op over exactly the NCHW tensor `src`
+/// (all loops parallel, identity maps, `src` its only input, one init), so it
+/// can be moved to NHWC with the pooling. `linalg.index` is allowed (it is
+/// remapped); upstream transpose propagation gives up on such ops.
+static bool isMovableElementwiseConsumer(linalg::GenericOp generic, Value src) {
+  if (!generic.hasPureTensorSemantics() || generic.getNumLoops() != 4 ||
+      generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1 ||
+      generic.getDpsInputs()[0] != src ||
+      generic.getNumParallelLoops() != generic.getNumLoops())
+    return false;
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }))
+    return false;
+  auto resType = dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+  return resType && resType.hasStaticShape() &&
+         resType.getShape() == cast<RankedTensorType>(src.getType()).getShape();
+}
+
+/// Moves an NCHW sum pooling (AveragePool / GlobalAveragePool) to NHWC, layout
+/// only, together with a constant `tensor.pad` producing its input and a single
+/// elementwise consumer (the average divide). See the file comment.
+struct PoolingNchwSumToNhwc : OpRewritePattern<linalg::PoolingNchwSumOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::PoolingNchwSumOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!op.hasPureTensorSemantics())
+      return rewriter.notifyMatchFailure(op, "expected tensor semantics");
+    Value input = op.getInputs()[0];
+    Value window = op.getInputs()[1];
+    Value init = op.getOutputs()[0];
+    auto inType = dyn_cast<RankedTensorType>(input.getType());
+    auto outType = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+    if (!inType || !outType || inType.getRank() != 4 ||
+        !inType.hasStaticShape() || !outType.hasStaticShape())
+      return rewriter.notifyMatchFailure(op, "expected static 4-D NCHW");
+    Location loc = op.getLoc();
+
+    // Input. A pad on H/W only whose value does not depend on the position is
+    // moved below the input transpose: the transpose then sits directly on the
+    // producer, so it cancels or CSEs with the NHWC convs' input transposes.
+    // Upstream sinks a transpose through a pad only behind a flag (off).
+    Value inputNhwc;
+    auto pad = input.getDefiningOp<tensor::PadOp>();
+    auto isUnusedArg = [](BlockArgument arg) { return arg.use_empty(); };
+    if (pad && pad->hasOneUse() &&
+        llvm::all_of(pad.getRegion().front().getArguments(), isUnusedArg) &&
+        !llvm::any_of(pad.getStaticLow(), ShapedType::isDynamic) &&
+        !llvm::any_of(pad.getStaticHigh(), ShapedType::isDynamic) &&
+        pad.getStaticLow()[0] == 0 && pad.getStaticLow()[1] == 0 &&
+        pad.getStaticHigh()[0] == 0 && pad.getStaticHigh()[1] == 0) {
+      Value srcNhwc =
+          transposeTensor(rewriter, loc, pad.getSource(), kNchwToNhwc);
+      SmallVector<OpFoldResult> low = pad.getMixedLowPad();
+      SmallVector<OpFoldResult> high = pad.getMixedHighPad();
+      applyPermutationToVector(low, kNchwToNhwc);
+      applyPermutationToVector(high, kNchwToNhwc);
+      auto paddedType =
+          inType.clone(applyPermutation(inType.getShape(), kNchwToNhwc));
+      auto newPad = tensor::PadOp::create(rewriter, pad.getLoc(), paddedType,
+                                          srcNhwc, low, high, pad.getNofold());
+      rewriter.cloneRegionBefore(pad.getRegion(), newPad.getRegion(),
+                                 newPad.getRegion().begin());
+      inputNhwc = newPad.getResult();
+    } else {
+      inputNhwc = transposeTensor(rewriter, loc, input, kNchwToNhwc);
+    }
+    Value initNhwc = transposeInit(rewriter, loc, init, kNchwToNhwc,
+                                   /*cPad=*/0, /*padValue=*/Value());
+    auto pool = linalg::PoolingNhwcSumOp::create(
+        rewriter, loc, TypeRange{initNhwc.getType()},
+        ValueRange{inputNhwc, window}, initNhwc, op.getStrides(),
+        op.getDilations());
+    Value resultNhwc = pool.getResult(0);
+
+    // Consumer. The average divide uses `linalg.index` on H/W when
+    // count_include_pad is 0, which upstream transpose propagation does not
+    // move; move it here with the pooling and remap its index dims.
+    Value pooled = op.getResult(0);
+    auto consumer = pooled.hasOneUse()
+                        ? dyn_cast<linalg::GenericOp>(*pooled.getUsers().begin())
+                        : linalg::GenericOp();
+    if (!consumer || !isMovableElementwiseConsumer(consumer, pooled)) {
+      rewriter.replaceOp(op,
+                         transposeTensor(rewriter, loc, resultNhwc, kNhwcToNchw));
+      return success();
+    }
+    // Build the moved consumer where the consumer is: its init and the values
+    // its body captures may be defined after the pooling.
+    rewriter.setInsertionPoint(consumer);
+    Value consumerInit = consumer.getDpsInits()[0];
+    auto consumerType = cast<RankedTensorType>(consumer.getResult(0).getType());
+    Value consumerInitNhwc;
+    if (consumerInit.getDefiningOp<tensor::EmptyOp>()) {
+      consumerInitNhwc = tensor::EmptyOp::create(
+          rewriter, loc, applyPermutation(consumerType.getShape(), kNchwToNhwc),
+          consumerType.getElementType());
+    } else {
+      consumerInitNhwc =
+          transposeTensor(rewriter, loc, consumerInit, kNchwToNhwc);
+    }
+    SmallVector<AffineMap> maps(2, rewriter.getMultiDimIdentityMap(4));
+    SmallVector<mlir::utils::IteratorType> iterators(
+        4, mlir::utils::IteratorType::parallel);
+    auto moved = linalg::GenericOp::create(
+        rewriter, consumer.getLoc(), TypeRange{consumerInitNhwc.getType()},
+        ValueRange{resultNhwc}, ValueRange{consumerInitNhwc}, maps, iterators);
+    rewriter.cloneRegionBefore(consumer.getRegion(), moved.getRegion(),
+                               moved.getRegion().begin());
+    // NCHW loop d is NHWC loop kNhwcToNchw[d] (N 0 -> 0, C 1 -> 3, H 2 -> 1,
+    // W 3 -> 2).
+    SmallVector<linalg::IndexOp> indexOps;
+    moved.getRegion().walk([&](linalg::IndexOp idx) { indexOps.push_back(idx); });
+    for (linalg::IndexOp idx : indexOps) {
+      rewriter.setInsertionPoint(idx);
+      rewriter.replaceOpWithNewOp<linalg::IndexOp>(
+          idx, static_cast<uint64_t>(kNhwcToNchw[idx.getDim()]));
+    }
+    rewriter.setInsertionPointAfter(moved);
+    rewriter.replaceOp(
+        consumer, transposeTensor(rewriter, loc, moved.getResult(0), kNhwcToNchw));
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 /// The cost-model shape of an NHWC max pooling (static, 4-D), as the root
 /// config computes it from its loop bounds, so both pick the same columns.
 static PoolShape poolShapeOf(linalg::PoolingNhwcMaxOp op) {
@@ -322,6 +462,7 @@ class AMDAIEConvertPoolingToChannelsLastPass
     RewritePatternSet patterns(ctx);
     patterns.add<PoolingNchwMaxToNhwc>(ctx, channelMultiple);
     patterns.add<PoolingNhwcMaxHaloSplit>(ctx, haloSplitColumns, columnsPolicy);
+    if (sumPooling) patterns.add<PoolingNchwSumToNhwc>(ctx);
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       return signalPassFailure();
   }

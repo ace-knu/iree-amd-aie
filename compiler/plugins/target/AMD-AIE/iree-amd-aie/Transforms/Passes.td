@@ -132,10 +132,12 @@ def AMDAIEPadContractionDispatches :
 
 def AMDAIEConvertPoolingToChannelsLast :
     Pass<"iree-amdaie-convert-pooling-to-channels-last", ""> {
-  let summary = "Rewrite NCHW max pooling (`linalg.pooling_nchw_max`) as NHWC max pooling wrapped in `linalg.transpose` ops, so pooling follows the channels-last layout of the surrounding convolutions.";
+  let summary = "Rewrite NCHW max pooling (`linalg.pooling_nchw_max`) and, with `sum-pooling`, NCHW sum pooling (`linalg.pooling_nchw_sum`, from AveragePool/GlobalAveragePool, together with its input pad and elementwise divide) as NHWC pooling wrapped in `linalg.transpose` ops, so pooling follows the channels-last layout of the surrounding convolutions.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEConvertPoolingToChannelsLastPass()";
   let options = [
+    Option<"sumPooling", "sum-pooling", "bool", /*default=*/"true",
+      "Also move NCHW sum pooling to NHWC (layout only: no channel padding, no halo split, since sum pooling never runs on the NPU). A constant `tensor.pad` producing the input is moved below the input transpose, and a single elementwise `linalg.generic` consumer (the average divide, possibly using `linalg.index`) is moved to NHWC with it.">,
     Option<"channelMultiple", "channel-multiple", "int64_t", /*default=*/"1",
       "Pad the channel dim of the NHWC pooling up to a multiple of this value (the pool pipeline splits C over the array rows, so it is the row count); the padded channels are sliced off the result. 1 disables.">,
     Option<"haloSplitColumns", "halo-split-columns", "int64_t", /*default=*/"0",

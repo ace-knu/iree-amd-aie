@@ -70,8 +70,12 @@ struct AMDAIESession
     // count here (channels are independent under max, the extra ones are
     // sliced off the result), and an overlapping window is pre-split over the
     // columns. A host pool only changes layout.
+    // Sum pooling (AveragePool, GlobalAveragePool) is moved to NHWC as well
+    // (`poolingChannelsLastSum`), layout only: it is never accelerator work,
+    // so the channel padding and halo split above do not apply to it.
     if (options.poolingChannelsLast) {
       AMDAIE::AMDAIEConvertPoolingToChannelsLastOptions poolOptions;
+      poolOptions.sumPooling = options.poolingChannelsLastSum;
       if (options.acceleratePooling) {
         AMDAIE::AMDAIEDeviceModel deviceModel =
             AMDAIE::getDeviceModel(options.AMDAIETargetDevice);
