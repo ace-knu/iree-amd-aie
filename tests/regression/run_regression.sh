@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 3-device (CPU + NPU + GPU) 회귀 테스트.
 #
-# 위치: tests/regression/run_regression.sh (현재 v9(기본 실행 = 수동+자동). 케이스 목록·버전 이력은
+# 위치: tests/regression/run_regression.sh (현재 v10(기본 실행 = 수동+자동). 케이스 목록·버전 이력은
 #       같은 폴더 README.md).
 #
 # 각 케이스: .mlir 을 현재 컴파일러로 새로 컴파일 -> iree-run-module 실행 ->
@@ -153,6 +153,7 @@ R3=amdxdna,vulkan,local-task
 T2=local,vulkan
 R2=local-task,vulkan
 X=128x128xf32
+Y=512x512xf32
 
 # chain2: matmul1 -> NPU(@__device_0), matmul2 -> GPU(@__device_1), 손으로 쓴 affinity.
 #   (1x1)=128, (128x2)=256 x 128 = 32768
@@ -169,6 +170,11 @@ run_case cg_topo_lead1        cg_topo       mlp_reduce.mlir      $T2 $R2 mlp_red
 # mm_probe: 단일 matmul, CPU+GPU. 1 x 2 x 128 = 256 (--input_device 는 위와 같은 이유로 lead 인덱스)
 run_case mm_probe_lead0       mm_probe      mm_probe.mlir        $T2 $R2 mm         256   0,0   0 "$X=1" "$X=2"
 run_case mm_probe_lead1       mm_probe      mm_probe.mlir        $T2 $R2 mm         256   1,1   1 "$X=1" "$X=2"
+# cg_softmax: CPU softmax 5번 -> GPU matmul -> CPU softmax -> GPU matmul (512x512). CPU·GPU 공유 transient 는
+# 소유자 동률이라 lead(local-task)가 할당하고, GPU 실행은 아직 도는 CPU 작업 뒤의 그 alloca 신호를 기다린다.
+# Vulkan 이 외부 장치 wait 전에 버퍼를 import 하면 "transient buffer has not been committed" 로 실패한다(경합,
+# 수정 전 30회 중 28~29회 실패). softmax 균등 1/512 x 512 = 1 -> 1/512 x 512 x 2 = 2
+run_case cg_softmax_lead0     cg_softmax    cg_softmax.mlir      $T2 $R2 cg_softmax 2     0,0,0 0 "$Y=1" "$Y=1" "$Y=2"
 
 # 디바이스 선언 순서 뒤집기 (docs/2026-09-28/03). NPU 가 index 0 이 아니어도 NPU 경계
 # 소유자가 topology 로 확정되는지 본다.

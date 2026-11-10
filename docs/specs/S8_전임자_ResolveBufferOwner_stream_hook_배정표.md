@@ -38,7 +38,7 @@ flowchart LR
 | CPU → NPU | true | amdxdna BO는 host-local·device-visible, CPU가 host-map |
 | NPU → CPU | **false** | amdxdna HAL allocator에 `import_buffer` 없음(드라이버 소프트웨어 한계, 커널 드라이버는 dma-buf·userptr 지원) |
 | CPU → GPU | true | Vulkan dispatch 메모리가 DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT(이 플랫폼). 외장 GPU면 false여야 함 |
-| GPU → CPU | true | host 포인터 import + BRIDGE(S3). (O17: 옛 TODO를 "검증됨 cg_topo lead=0"으로 교체) → 통합 후: **false**. BRIDGE가 기록 시점에 import해서 아직 메모리가 없는 transient CPU 버퍼를 못 가져오므로, CPU·GPU 공유 버퍼는 GPU가 소유(`e3d86485`) |
+| GPU → CPU | true | host 포인터 import + BRIDGE(S3). (O17: 옛 TODO를 "검증됨 cg_topo lead=0"으로 교체) → 통합 후: **false**. BRIDGE가 기록 시점에 import해서 아직 메모리가 없는 transient CPU 버퍼를 못 가져오므로, CPU·GPU 공유 버퍼는 GPU가 소유(`e3d86485`) → (11/05, 브랜치 `feature/cpu-gpu-shared-buffer` `cb41b711`) **true**. false의 두 이유가 해결됐다: transient 가져오기 실패는 Vulkan이 남의 semaphore 대기 뒤에 기록하게 한 수정(fork `210f677`, S3)으로, 정리 단계 abort는 완료 공개 전 해제(S11)로. 지금 표에서는 이 칸과 CPU → GPU 칸이 모두 true라 CPU·GPU 공유 버퍼는 동률이고 lead 장치가 할당한다. 판단 근거(2026-11-05 세션 1 챕터 03, 전원 모드 default): GoogLeNet CPU+GPU lead CPU 3,000회, 경합 `cg_softmax`·`softmax_first` N=512 각 300회, 최소 재현 2종 각 1,000회, GPU 단독 100회, lead GPU 300회, 회귀 v10 28×2, VGG16 CPU+NPU+GPU f32, 지연 진단 9가지 1,150회에서 abort·잘못된 출력·실패 종료 0. 멈춤은 lead GPU 2건뿐이고 원래 Vulkan `queue_alloca` 대기 자리이며 링크 false와 같은 빈도(2/300). → (11/05) dev에 합친다(박사형 결정, 통합 브랜치 `integrate/vulkan-order-link-true` `7aba8545`). dev 통합 기준 검증: VGG16·MLP 6조합 출력이 dev와 바이트 단위로 같고 dispatch별 장치도 같다(링크 표는 버퍼 소유만 바꿈), ctest 실패 목록 dev와 같음, 회귀 v10 28×2 |
 | GPU → NPU | true | amdxdna dma-buf export → Vulkan import(S9) |
 | NPU → GPU | **false** | amdxdna import 없음, Vulkan export 없음 |
 | 그 외 | false·false | 보수적 기본값(복사) |

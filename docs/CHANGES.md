@@ -3,8 +3,202 @@
 git HEAD 대비 **모든 변경**을 한곳에 모은 장부다. 소스(플러그인·IREE 서브모듈)를 고치는 세션은 끝날 때 이 파일을 갱신한다(CLAUDE.md 1-4의 4, 3-1-2).
 
 - 첫 판: 2026-10-20 세션 1 챕터 01 (`docs/2026-10-20/1_변경장부_명세_커밋준비/01_변경_장부/`)
-- 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S10. S6·S10은 dev 통합 때 삭제)
-- **k+1 bias fold 통합(2026-10-30) 후 상태는 바로 아래 절을 본다.** 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+- 주제별 명세: `docs/specs/` (아래 "명세" 열의 S1~S12. S6·S10은 dev 통합 때 삭제)
+- **맨 위 절은 Vulkan semaphore 호스트 쪽 값 단조 수정(2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`, 통합 브랜치 기준)이다.** 그 아래로 링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정(2026-11-03·11-05)이 있고, 그다음이 Vulkan 완료 공개 전 해제 수정(2026-11-04 첫 판, 11-05 갱신)이다. 두 절은 함께 dev 통합 브랜치 `integrate/vulkan-order-link-true`(2026-11-05)로 들어간다.** 그 아래가 k+1 bias fold 통합(2026-10-30) 후 상태다. 그 다음은 dev-POOL 통합(2026-10-28), 3devices 통합(2026-10-25) 때 상태이고, 0~6절은 10/20 스냅숏이다.
+
+## Vulkan semaphore 호스트 쪽 값 단조 수정 — 드문 멈춤(P2) (2026-11-06, 브랜치 `fix/vulkan-semaphore-monotonic`)
+
+- 기준: dev 통합 브랜치 `integrate/vulkan-order-link-true`(상위 `0a779024`, fork `cd34cf2`).
+  - dev를 쓰는 모두가 겪는 멈춤 버그라서, Vulkan alloca 대기 제거(보류)를 기다리지 않고 먼저 넣을 수 있게 따로 둔다.
+- 명세: `docs/specs/S12_Vulkan_semaphore_호스트값_단조.md`. 경위는 로컬 세션 기록 `docs/2026-11-05/2_Vulkan_alloca_대기/`(팀 git 미포함)에 있다.
+  - 챕터 01: 원인 확정
+  - 챕터 02: 설계
+  - 챕터 03: 구현·검증
+
+### 기준과 원칙
+- **원인**: Vulkan semaphore의 호스트 쪽 값(`iree_async_semaphore_t::timeline_value`)이 뒤로 갔다(1 → 0).
+  - 조회·대기·완료 감시가 Vulkan에서 읽은 값을 그대로 덮어썼다(업스트림 `d7f5aba`, #23695).
+  - 그래서 늦게 돌아온 조회가 이미 올라간 값을 되돌리면, 그 직후 등록한 대기자를 아무도 깨우지 않았다.
+  - 증상: CPU+GPU에서 드물게(GoogLeNet 0.02–0.08%) 메인 스레드가 Vulkan `queue_alloca`·BRIDGE·VM fence 대기에서 끝나지 않음.
+- **업스트림을 따른다.** 업스트림 main의 새 Vulkan 드라이버가 같은 경합을 닫은 두 규칙(`9e2ac9142e`)을 옛 드라이버의 같은 자리에 옮긴다. HIP도 같은 규칙이다.
+  - 관찰은 앞으로만(CAS)
+  - 호스트 신호는 호스트 쪽 값 먼저
+- 공용 코드(`iree/async/`)는 바꾸지 않는다. 업스트림 새 드라이버를 들여오면 이 수정은 파일과 함께 사라지고, 같은 동작이 유지된다(다시 넣을 것 없음).
+
+### dev 기준으로 본 변경
+| 파일(`third_party/iree/runtime/src/iree/hal/drivers/vulkan/`) | 변경 |
+|---|---|
+| `native_semaphore.cc` | 새 함수 `iree_hal_vulkan_native_semaphore_observe_value`(더 클 때만 CAS로 올리고, 올린 쪽만 대기자를 깨움). 조회·대기가 이 함수를 씀(조회 반환값 = 반영 뒤 호스트 쪽 값). 호스트 신호 순서를 "호스트 쪽 CAS → `vkSignalSemaphore` → 깨움"으로 |
+| `native_semaphore.h` | 위 함수 선언 |
+| `completion_watcher.cc` | scan 3단계가 위 함수를 씀 |
+- fork 커밋 `d79945b` 1개(+71/−38줄), 상위 포인터 `fdeae865`.
+
+### 검증 (2026-11-06, 전원 모드 default)
+| 항목 | 수정 전 | 수정 뒤 |
+|---|---|---|
+| 조회 읽기→반영 사이 2 ms 지연(GoogLeNet CPU+GPU) | 19/19 멈춤 | **600/600 통과**(lead CPU·GPU 각 300, 지난 값을 읽은 경합이 600회차 모두에서 일어나 무시됨) |
+| 호스트 신호 두 단계 사이 2 ms 지연 | — | 600/600 통과, 신호 실패 0 |
+| 자연 반복 | 46,500회 중 멈춤 18 | **18,000회 멈춤 0**(기대 7.5건) + 계측 없는 빌드 3,000회 0 |
+| 회귀 v10 × 2 | 28/28 × 2 | 수동 28/28·자동 28/28, 2회 |
+| 12조합(MLP·VGG16 × 6장치 조합) 출력 sha256 | — | 12/12 dev와 같음 |
+| dispatch별 장치 배정(12조합) | — | 12/12 dev와 같음 |
+| ctest amd-aie·SPIR-V·Vulkan | 232·65·12 | 232/232·65/65·12/12 |
+| ctest 전체 실패·미실행 목록 | dev 1,303개 | dev와 같음(diff 0) |
+| 성능(한 프로세스 20회 × 5회차) | — | 수정/수정 전 0.97–1.03(흔들림 범위) |
+
+### 알려진 제한
+- 평소의 Vulkan `queue_alloca` 호스트 대기 시간은 그대로다.
+  - GoogLeNet lead CPU에서 48–61 ms다. 대부분 CPU 작업을 기다리는 의존 대기라 alloca만 고쳐서는 줄지 않는다(S12 L-time).
+- `vkGetSemaphoreCounterValue`가 GPU 완료 순간 늦게 돌아오는 이유는 조사하지 않았다(S12 L-slowq). 수정 뒤에는 멈춤과 무관하다.
+- 업스트림 Metal(`shared_event.m`)에도 같은 덮어쓰기가 있다. 이 장비와 무관하다.
+
+### 남은 일
+- Vulkan `queue_alloca` 대기 제거(Feature 2)는 보류("필요할 때")다. 설계는 로컬 `02_설계/B_대기제거_비교.md`.
+- 비차단 BRIDGE(VM 스레드가 남의 semaphore를 호스트에서 기다리지 않게)는 Task 2 시작 때 형 판단을 받는다.
+
+## 링크 표 GPU → CPU true + 이를 가능하게 한 Vulkan 수정 (2026-11-03·11-05, 브랜치 `feature/cpu-gpu-shared-buffer` → dev 통합 브랜치 `integrate/vulkan-order-link-true`)
+
+**dev에 합친다(박사형 결정 11/05).** 경위는 로컬 세션 기록 `docs/2026-11-03/3_CPU_GPU_공유버퍼/`, `docs/2026-11-05/1_BRIDGE경로_링크true_캐시/`(팀 git 미포함)에 있다. 가져온 버퍼 캐시는 넣지 않았다(따로 개발).
+
+### 1. 바꾼 것 — 링크 표 GPU → CPU를 true로
+
+- 버퍼 소유자를 정하는 장치 간 링크 표(S8)의 GPU → CPU 칸을 false에서 true로 바꿨다.
+  - Vulkan은 CPU 메모리를 가져올 수 있지만, 아래 2절의 두 문제 때문에 false로 막아 두었었다.
+  - 두 문제를 고쳐 **박사형 기준(어떤 경우에도 오류 없이)을 만족한다**(3절). 그래서 표가 장치의 실제 능력을 그대로 적게 된다.
+- 지금 표에서는 CPU ↔ GPU 두 칸이 모두 true라 CPU·GPU 공유 버퍼는 동률이고 lead 장치가 할당한다.
+- 박사형 판단(11/03): 메모리 종류를 CPU 캐시 되는 쪽으로 바꾸는 방식은 통합 GPU 특화라 채택하지 않는다(비교 기준). 장치와 상관없이 맞는 설계는 Vulkan이 다른 장치를 기다린 뒤 가져오도록 순서를 고치는 것이다.
+
+| 영역 | 내용 | 커밋 |
+|---|---|---|
+| 링크 표 GPU → CPU true | `AMDAIEDevicePlacementUtils.cpp` `linkFlags` false → true, 주석(두 전제: 가져오는 순서, S11), lit 2줄 | `cb41b711` |
+
+### 2. 이것이 가능해진 이유 — Vulkan 수정 두 가지
+
+- 이 칸을 false로 두었던 이유는 둘이었다.
+  1. Vulkan이 명령을 기록할 때 CPU 버퍼를 가져와서, CPU가 큐 순서로 할당하는 버퍼(transient)는 아직 메모리가 없어 실패했다.
+  2. 정리 단계에서 드물게 abort가 났다.
+- 두 수정이 모두 있어야 링크 true가 검증된 상태라 **함께** 들어간다. 링크 true + 가져오는 순서만이면 GoogLeNet 2,100회 중 8회 정리 단계 abort다.
+
+| 영역 | 내용 | 커밋 |
+|---|---|---|
+| Vulkan 가져오는 순서(A+B) | `queue_execute`가 남의 장치 semaphore를 호스트에서 **먼저 기다리고 그 뒤에** 명령을 기록한다. 대기가 끝난 뒤 버퍼를 쓰는, 다른 HAL과 같은 순서다. one-shot command buffer와 queue fill/copy/update도 deferred로 만들어 `queue_execute`에서 기록한다. transient CPU 버퍼를 메모리가 생긴 뒤 가져온다(S3) | fork `210f677`, 포인터 `f9d7da66` |
+| Vulkan 완료 순서 수정(S11) | 완료가 밖으로 보이기 전에 끝난 모든 제출의 자원을 놓는다. 세 길(완료 감시 신호, BRIDGE 호스트 신호, semaphore 조회·대기)에 모두 적용하고, 감시 등록 실패 때 두 번 해제도 고쳤다. **dev에 원래 있던 버그**(드문 정리 단계 abort, rc 134). 상세는 아래 "Vulkan 완료 공개 전 해제" 절 | fork `290ecd5` `9982879` `370c123` `302e3a5`, 합치기 fork `cd34cf2` / 상위 `0d306f4e` |
+| 회귀 v10 | `cg_softmax_lead0`(CPU softmax → GPU matmul → CPU softmax → GPU matmul, 512×512, CPU·GPU 공유 transient 경합) 추가, 28 케이스 | `af534b16` |
+| dev 통합 브랜치 | dev(`786d1d19`, 2026-11-05 fetch 때 origin/dev와 같음)에서 `integrate/vulkan-order-link-true`를 만들고 위 브랜치를 merge(충돌 없음). fork는 같은 이름 브랜치가 `cd34cf2`(fork dev `32dad76` + A+B + S11 전부)이고 fork dev 줄(`amd-aie-flow-hook`)이 fast-forward할 수 있다 | `7aba8545`, fork `cd34cf2` |
+
+### 3. 검증 (2026-11-05, 전원 모드 default)
+
+#### 3-1. dev 통합 기준 검증 (통합 브랜치 빌드)
+
+3devices·dev-POOL 통합 때와 같은 항목이다. dev 빌드는 같은 날 dev 소스(`786d1d19`, fork `32dad76`)로 만든 빌드다.
+
+| 항목 | 통합 브랜치 | dev |
+|---|---|---|
+| VGG16·MLP 6조합 출력 sha256 | **12/12 dev와 바이트 같음** | — |
+| dispatch별 장치(순번·이름·장치) | **12/12 dev와 같음** | — |
+| ctest amd-aie | 232/232 | 232/232 |
+| SPIR-V lit(`ctest -R SPIRV`) | 65/65 | 65/65 |
+| Vulkan(CTS 포함) | 12/12 | 12/12 |
+| ctest 전체 실패·미실행 | 1,303/2,923(빌드에 없는 e2e 대상 1,248, Python 바인딩, VMVX 로더 없는 local-task CTS 3 등) | **목록 같음** |
+| 회귀 v10 manual·auto | 28/28 × 2 | — |
+
+- 6조합: CPU f32, CPU+GPU f32, CPU+NPU bf16, CPU+NPU f32, CPU+NPU+GPU f32, CPU+GPU+NPU f32. 모두 corr 1.0(bf16 0.99991·0.99996), VGG16 top-1 일치.
+- VGG16 dispatch 수: CPU 56, CPU+GPU 56(GPU 16), CPU+NPU bf16 87(NPU 16), CPU+NPU f32 82(NPU 16), 3장치 두 순서 69(NPU 8, GPU 8).
+- 링크 표는 버퍼 소유만 바꾸고 배정은 바꾸지 않으므로 출력이 바이트 단위로 같아야 정상이고, 그렇다.
+
+#### 3-2. 반복·지연 진단 (링크 표 true)
+
+| 시험 | 회수 | 결과 | 11/03(A+B만) |
+|---|---|---|---|
+| GoogLeNet CPU+GPU lead CPU | 3,000 | 0 오류, 멈춤 0 | 2,100회 중 8회 정리 단계 abort |
+| 경합 `cg_softmax` / `softmax_first` N=512 lead CPU | 300 / 300 | 0 / 0 | 0 / 0 |
+| 최소 재현 2종 | 1,000 / 1,000 | 0 / 0 | — |
+| GPU 단독 GoogLeNet | 100 | 0 | — |
+| GoogLeNet lead GPU | 300 | 0 오류, 멈춤 2 | 50회 중 0 |
+| 회귀 v10 28 × manual·auto(lead 조합, NPU 3장치 포함) | 56 | 28/28 × 2 | 28/28 × 2 |
+| VGG16 CPU+NPU+GPU f32 | 3 | corr 1.00000, top-1 일치 | — |
+| 지연 진단(완료 감시 지연·정지, BRIDGE 지연, 조회 경로 조건) 9가지 | 1,150 | 0 오류, 멈춤 0 | — |
+
+- **판단 근거**: abort·잘못된 출력·실패 종료가 0이다. 멈춤은 lead GPU 2건뿐이다. 둘 다 원래 Vulkan `queue_alloca` 호스트 대기 자리(P2, 원인 미규명)이고, 같은 날 링크 false lead GPU와 같은 빈도(2/300)다. BRIDGE 대기 자리 멈춤은 0이다.
+- 링크 true 적용 확인: GoogLeNet 1회에 Vulkan이 CPU 소유 버퍼를 가져오기 170회(링크 false 0회), 출력 비트 같음.
+
+### 4. 알려진 제한
+
+| 항목 | 내용 |
+|---|---|
+| **Vulkan `queue_alloca` 대기 멈춤(원래 있던 것, 다음 Task)** | 약 0.1%로 멈춘다. 링크 false(dev)에서도 같은 자리, 같은 빈도다. Vulkan이 새 메모리를 할당하면서도 대기 semaphore를 호스트에서 무한 대기하는 자리다(업스트림, 큐 순서 할당 TODO). 신호가 가끔 안 오는 원인은 미규명이다. 링크 true 뒤 가장 큰 비용이기도 하다(GoogLeNet 함수 호출당 queue_alloca 71회 중 호스트 대기가 있는 10회가 39–61 ms) |
+| host 포인터 import 전제 | GPU → CPU true는 Vulkan이 CPU 메모리를 host 포인터로 가져올 수 있는 장치(통합 GPU)를 전제한다. 외장 GPU 등에서 안 되면 이 칸은 false여야 한다 |
+| 가져오기 반복 | 명령마다 가져온다(캐시 없음, 따로 개발). GoogLeNet 함수 호출당 170회 491 MiB 8–17 ms(기록 시간에 포함됨). 그중 132회는 같은 호출 안에서 이미 가져온 버퍼다. CPU 풀의 큰 요청 slab은 호출마다 풀렸다가 같은 주소로 다시 잡히므로 주소만 보는 캐시는 안전하지 않다 |
+
+### 5. 참고: 성능
+
+성능은 모델에 따라 다르다. 한 프로세스에서 함수를 20번 부르는 측정을 5회차, dev와 번갈아 했다(lead CPU). CPU가 GPU 결과를 읽는 모델은 빨라졌다.
+- GoogLeNet CPU+GPU: 142.5 → 94.6 ms, −34%
+- p1b_gpu_cpu(GPU가 만든 220.5 MiB를 CPU가 읽음): 3,377 → 240 ms, −93%
+
+GPU 쪽 일이 많거나 CPU가 큰 버퍼를 새로 쓰는 모델은 조금 느려졌다. 가져오기 비용과 CPU 풀의 큰 요청 새 메모리 때문으로 추정한다.
+- VGG16 CPU+GPU: 122.4 → 130.5 ms, +7%
+- p1b_cpu_gpu: 356.9 → 389.3 ms, +9%
+
+출력은 모든 회차에서 dev와 바이트가 같다. 이 변경의 근거는 성능이 아니라 정확성(표가 장치 능력대로, 오류 0)이다. ~~11/05 "GoogLeNet 205 → 106 ms"~~와 11/04 "187 → 180 ms"는 프로세스 하나씩 3회 잰 벽시계였다. 시작 비용(약 60–80 ms)과 흔들림(89–212 ms)이 섞여 쓸 수 없어 정정한다. 내역은 로컬 기록 챕터 07에 있다.
+
+### 남은 일
+
+- Vulkan `queue_alloca` 큐 순서 할당(다음 Task).
+- 가져온 버퍼 캐시: 명령 버퍼 안 중복 제거(A), slab 단위 + 해제 알림(C, 박사형 판단). dev 통합과 따로 개발.
+- P2 멈춤 원인(신호가 가끔 오지 않는 이유) 미규명.
+
+## Vulkan 완료 공개 전 해제 수정 후 상태 (2026-11-04 첫 판, 2026-11-05 갱신, 브랜치 `fix/vulkan-completion-release-order` → dev 통합 브랜치 `integrate/vulkan-order-link-true`에 포함)
+
+실행은 성공했는데 모듈 정리 중 `iree_vm_buffer_deinitialize`(`vm/buffer.c:79`)가 남은 참조로 abort하는 문제(rc 134)를 다룬다. dev CPU+GPU에서 드물게 나고, 링크 표 GPU → CPU true에서 약 0.38%다. 원인 확정·설계·검증 경위는 로컬 세션 기록 `docs/2026-11-04/1_정리단계_abort/`, `docs/2026-11-05/1_BRIDGE경로_링크true_캐시/`(팀 git 미포함)에 있다. 명세는 `docs/specs/S11`이다.
+
+### 기준과 원칙
+
+- **원인을 고친다**: 실행 도구가 정리 전에 큐를 비우거나 기다리게 하는 방법은 증상만 가리는 우회라 쓰지 않는다(진단에만 썼다).
+- **규칙**: Vulkan 제출의 완료가 밖으로 보이기 전에(신호, 대기자 깨움, 조회 결과 반환), 그때까지 끝난 **모든** 제출의 자원을 놓는다. 11/04 첫 판은 "그 제출"만 다뤘다. 11/05에 "끝난 모든 제출"(신호한 제출이 GPU에서 기다린 앞 제출 포함)로 넓혔다.
+- **범위**: 완료가 호스트에 보이는 네 자리에 같은 함수를 둔다. 네 자리는 완료 감시 신호(업스트림), 전임자 BRIDGE 호스트 신호, semaphore 조회·대기(업스트림)다. BRIDGE의 막는 동작은 바꾸지 않았다(박사형 결정 11/04 ③: BRIDGE를 크게 다시 설계하지 않음). 업스트림 이슈는 올리지 않는다(결정 ①).
+
+### dev 기준으로 본 변경
+
+| 영역 | 내용 | 커밋 |
+|---|---|---|
+| 완료 감시 순서(첫 번째 길) | 완료를 처음 처리할 때 자원을 먼저 놓고, 그다음 timeline 갱신·timepoint dispatch, 마지막에 semaphore 참조를 놓는다. 수정 전에는 신호를 먼저 보냈다. 제출마다 묶음 하나를 모든 항목이 공유한다 | fork `290ecd54b`, 포인터 `6f3b899f` |
+| 주석 | 업스트림 새 Vulkan 드라이버(`queue.c` `drain_completions`)로 바꾸면 이 수정이 사라진다는 `NOTE(fork)`. 헤더 `register` 주석 | 위와 같음 |
+| 끝난 모든 제출 해제(11/05) | 자원 묶음을 감시 mutex 아래 제출 목록에 두고 `iree_hal_vulkan_completion_watcher_release_completed()`(끝난 제출의 자원을 mutex 안에서 놓음)를 둔다. 감시 scan은 "값 관찰 → 끝난 모든 제출 해제 → 신호" | fork `9982879c6`, 포인터 `a6ac34dd` |
+| BRIDGE 호스트 신호(두 번째 길, 11/05) | `DirectCommandQueue::Submit`이 fence 대기 뒤 남의 semaphore를 호스트에서 신호하기 직전에 `release_completed`를 부른다. 큐는 장치 생성 끝에 감시를 받는다 | fork `9982879c6`, 포인터 `a6ac34dd` |
+| semaphore 조회·대기(세 번째 길, 11/05) | `native_semaphore.cc` 조회가 감시보다 앞선 Vulkan 값을 보면, 대기가 성공하면, 보이기 전에 `release_completed`를 부른다. semaphore가 감시 참조를 쥔다(감시 참조 수) | fork `302e3a518`, 포인터 `a6ac34dd` |
+| 등록 실패 두 번 해제(11/05) | `queue_execute`가 `register` 실패 때 resource set을 다시 놓지 않는다(헤더 계약: 소유권은 감시로) | fork `370c1236b`, 포인터 `a6ac34dd` |
+
+### 검증
+
+- 빌드 경고 없음, amd-aie lit 232/232, SPIR-V lit 65/65, Vulkan CTS 12/12(시험별 통과·건너뜀 수 수정 전과 동일).
+- abort 빈도(GoogLeNet CPU+GPU, lead CPU, 전원 모드 default):
+
+| 조건 | 수정 전 | 11/04 첫 판 | 11/05 갱신 |
+|---|---|---|---|
+| dev 링크 표(false), 자연 반복 | 약 1/1,300 | 0/3,000 | **0/3,000**(멈춤 5, 0.17%) |
+| 링크 표 GPU → CPU true(공유 버퍼 브랜치 + 수정) | 8/2,100 | 0/2,100 | 단계 2에서 다시 잼 |
+| 감시 신호 뒤 지연 20 ms 진단 | 200/200 | 200/200(두 번째 길) | **0/200** |
+| 최소 재현, 같은 진단 | 50/50 | 0/200 | 0 |
+| 세 번째 길 재현(출력 2개 최소 모델, 감시 정지 + CPU 큐 제출 지연) | — | 50/50 | **0/200** |
+
+- 멈춤(기존 `queue_alloca` 호스트 대기, 원인 미규명)은 수정 전 약 0.23%, 11/04 0.10%, 11/05 0.17%(dev 링크 표 GoogLeNet 3,000회)로 늘지 않았다. 11/05 멈춤 8건 모두 잠금 교착이 아니다(감시는 `vkWaitSemaphores`, worker는 쉬는 중). 1건은 BRIDGE 대기 자리에서 같은 모양으로 났다. 진단 빌드 반복 3,040회에서는 0회.
+- ASan: GoogLeNet lead CPU·GPU, 최소 재현, 출력 2개 모델 100회 오류 0. 등록 실패를 강제하면 수정 전에는 heap-use-after-free, 수정 후에는 깨끗한 오류 종료.
+- VGG16 CPU+NPU+GPU f32 corr 1.0·top-1 일치, 회귀 v9 27×2 통과, GPU 단독·lead GPU 통과(11/04, 11/05 모두).
+- 성능: 벽시계 GoogLeNet 195 → 205 ms, VGG16 385 → 374 ms(회차 흔들림 안, trace 실행 시간 같음). BRIDGE 호스트 신호(실행마다 1번)는 `release_completed`만큼(15–115 us) 늦어진다.
+
+### 알려진 제한
+
+| 항목 | 내용 |
+|---|---|
+| 등록 실패 때 실행 중 command buffer 해제 | 등록이 제출 뒤에 있어서, 등록이 실패하면(종료 중·메모리 부족) GPU가 아직 실행 중인 command buffer를 감시가 놓을 수 있다(S11 L-regfail) |
+| dev 원래 누수 | 정리 때 Vulkan 큐 객체 2개(96 B)가 남는다(ASan LeakSanitizer, dev `32dad76`부터, 이 수정과 무관, S11 L-leak) |
+| 업스트림 재작성 | fork가 업스트림 새 Vulkan 드라이버를 들여오면 이 수정이 사라진다 |
+
+### 남은 일
+
+- 등록 실패 때 실행 중 command buffer 해제(위 제한).
+- dev 원래 누수(Vulkan 큐 객체) 조사.
 
 ## k+1 bias fold 통합 후 상태 (2026-10-30, 브랜치 `k1-fold-integration`)
 
@@ -684,3 +878,4 @@ dev에 없던 기능이라 그대로 들여오고, 로그·디버그 스위치·
 | 2026-10-25 | dev 통합 S9 | "dev 통합 후 상태" 절 추가, 명세 경로를 `docs/specs/`로, 4·5·6절 상태 칸과 N04·N07·N09에 통합 결과를 덧붙임 |
 | 2026-10-28 | dev-POOL 통합 P9 | "dev-POOL 통합 후 상태" 절 추가, ukernel upstream 이전과 unroll 규칙 반영 |
 | 2026-10-30 | k+1 bias fold 통합 Step 7 | "k+1 bias fold 통합 후 상태" 절 추가, W15·W17과 channels-last 행에 결과를 덧붙임 |
+| 2026-11-05 | Vulkan 가져오는 순서·완료 공개 전 해제·링크 표 GPU → CPU true 통합(`integrate/vulkan-order-link-true`) | 맨 위 두 절을 dev 통합 상태로 고침, dev 통합 기준 검증·성능 절 추가, 11/05 "205 → 106 ms"를 측정 흔들림으로 정정 |

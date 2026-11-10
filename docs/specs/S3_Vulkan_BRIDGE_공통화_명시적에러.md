@@ -47,9 +47,9 @@ flowchart TD
 | local-task 버퍼(placement.device 있음) | HOST_ALLOCATION export → host 포인터 import |
 | heap 버퍼(placement.device 없음) | map해서 host 포인터 import |
 | dispatch 바인딩 > 8개, buffer barrier, indirect 인자 | **에러**(`FAILED_PRECONDITION`, 조용한 실패 아님) |
-| 기록 시점에 아직 commit되지 않은 남의 transient 버퍼(CPU `queue_alloca`가 앞 작업 대기 중) | export 실패 → 에러 `transient buffer has not been committed`(CLAUDE.md 3-2, 10/2 세션2 챕터03). **미해결**: import를 제출 시점(대기 충족 후)으로 미뤄야 함 |
+| 기록 시점에 아직 commit되지 않은 남의 transient 버퍼(CPU `queue_alloca`가 앞 작업 대기 중) | export 실패 → 에러 `transient buffer has not been committed`(CLAUDE.md 3-2, 10/2 세션2 챕터03). → (11/03, fork `210f677`, 브랜치 `feature/cpu-gpu-shared-buffer`) **해결**: `queue_execute`가 남의 장치 semaphore를 호스트에서 먼저 기다리고(`iree_hal_vulkan_device_wait_foreign_semaphores`) 그 뒤에 명령을 기록한다. one-shot command buffer도 deferred로 만들어 `queue_execute`에서 기록한다. 그래서 import 시점에는 transient CPU 버퍼에 메모리가 있다. 이것이 링크 표 GPU → CPU true(S8)의 전제다 |
 | host 포인터 정렬이 맞지 않음 | Vulkan import 실패 → 에러(정렬 정보 로그) |
-| import 캐시 | 없음. 명령마다 export·import한다(성능 부채) |
+| import 캐시 | 없음. 명령마다 export·import한다(성능 부채). 링크 true GoogLeNet 함수 호출당 import 170회 491 MiB 8–17 ms(2026-11-05 여러 번 잰 범위, 기록 시간에 포함), 그중 132회는 같은 호출 안에서 이미 가져온 버퍼. CPU 풀의 큰 요청 slab은 호출마다 풀렸다가 같은 주소로 다시 잡히므로 주소만 보는 캐시는 Vulkan 규격(가져온 메모리보다 호스트 메모리가 먼저 풀리면 안 됨) 위반이 된다. 캐시는 dev 통합과 따로 개발한다(명령 버퍼 안 중복 제거, slab 단위 + 해제 알림) |
 | fd 수명 | export가 매번 새 fd를 만든다(amdxdna `F_DUPFD_CLOEXEC`). Vulkan 규격상 fd import는 소유권을 구현으로 넘기는데, 전임자 import 주석은 "드라이버가 dup하므로 소유권은 호출자"라고 적었다. **둘이 다르다.** 7절 L-fd: 성공 경로는 규격대로 동작(아무도 닫지 않음, 확인함), 실패 경로는 fd 누수(추정) |
 | fill/update에 남의 버퍼가 오는 실제 모델 | 없음(경로는 코드만 있고 실행 검증 모델 없음) |
 
