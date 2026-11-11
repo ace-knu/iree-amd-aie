@@ -1,6 +1,6 @@
 # 패치 노트: 장치 배정 후 장치별 contraction 입력 타입 변환
 
-브랜치: `dev` (`786d1d19`) 위 작업 트리, **아직 커밋하지 않음**
+브랜치: `demote-dispatch-inputs`. 1단계는 커밋 `644c8f20`(이후 `origin/dev` 병합 `e6638d97`), 규칙 2 일반화(12절)는 그 위 다음 커밋
 
 장치 배정(device placement)이 끝난 뒤, 각 contraction(matmul/conv) dispatch의 입력을 **그 dispatch가 배정된 장치가 원하는 타입**으로 바꾸는 Flow 단계 패스 `AMDAIEDemoteContractionDispatchInputs`(파일 `compiler/plugins/target/AMD-AIE/iree-amd-aie/Transforms/AMDAIEDemoteContractionDispatchInputs.cpp`)를 추가한 작업의 기록입니다. 무엇이 바뀌었는지, 왜 바꿨는지, 어떻게 검증했는지를 적습니다. 통합 컴파일러 1단계 범위(VGG16 + NPU)이고, 다음 단계에서 이 문서에 같은 형식으로 항목을 덧붙입니다.
 
@@ -15,7 +15,8 @@
 | 3 | 설정 읽기 | 새 함수 `getConfigContractionInputType()`: 어느 백엔드 target에서든 위 키를 읽음 | `$P/Transforms/Utils/AMDAIEUtils.h/.cpp` |
 | 4 | 공용 helper | 새 함수 `getDispatchExecutableTarget()`(모든 백엔드용) 분리, 새 symbol 접두어 2개 등록 | `$P/Transforms/AMDAIEDispatchRewriteUtils.h/.cpp` |
 | 5 | 파이프라인 | Flow 단계에서 장치 배정 패스와 bias fold 패스 사이에 새 패스 추가 | `$P/PluginRegistration.cpp` |
-| 6 | 테스트 | lit 테스트 파일 (5개 경우) | `$P/Transforms/test/demote_contraction_dispatch_inputs.mlir` |
+| 6 | 테스트 | lit 테스트 파일 (6개 경우) | `$P/Transforms/test/demote_contraction_dispatch_inputs.mlir` |
+| 7 | 규칙 2 일반화 (12절) | 앞 dispatch가 어느 장치든 그 안에서 변환. 못 하는 장치만 target 설정 키 `fuse_truncf = false`(지금은 NPU) | 새 패스 파일, `$P/Target/AIETarget.cpp`, `$P/Transforms/Utils/AMDAIEUtils.h/.cpp` |
 
 **결과 요약** (VGG16, CPU+NPU, 사용자 스크립트 옵션):
 
@@ -157,13 +158,13 @@ NPU(또는 bf16을 원하는 장치)의 dispatch D가 읽는 값 X마다, 위에
 | 순서 | 조건 | 처리 | 1단계 구현 | 새 패스 파일의 함수 |
 |---|---|---|---|---|
 | 1 | X가 컴파일 시점 상수 (weight) | 컴파일할 때 bf16 global을 새로 만듦. f32 global은 다른 곳에서 안 읽으면 지움 | O | `createDemotedConstant` (6-5절) |
-| 2 | X가 dispatch P의 결과이고, X를 읽는 곳이 모두 bf16을 원함 | P의 저장 직전에 truncf를 넣어 P가 bf16을 씀 | O (P가 CPU일 때만) | `fuseIntoProducer` (6-6절) |
+| 2 | X가 dispatch P의 결과이고, X를 읽는 곳이 모두 bf16을 원함 | P의 저장 직전에 truncf를 넣어 P가 bf16을 씀 | O (P의 장치가 `fuse_truncf = false`가 아니면. 지금은 NPU만 제외, 12절) | `fuseIntoProducer` (6-6절) |
 | 3 | X를 f32로 읽는 곳도 있음 | P가 f32와 bf16 두 개를 출력 | X (다음 단계) | 없음 |
 | 4 | 위가 모두 안 됨 (모델 입력 등) | CPU에서 변환만 하는 dispatch를 새로 만듦 | O (안전장치) | `createCastDispatch` (6-7절) |
 
 "bf16을 원한다"는 것은 X를 읽는 dispatch의 장치 target에 `contraction_input_type = bf16`이 있고, 새 패스가 그 dispatch 안의 contraction 입력을 bf16으로 바꿨다는 뜻입니다. 패스는 먼저 소비자(NPU dispatch) 쪽을 바꾸면서 "이 값을 bf16으로 원하는 사용처" 목록을 만들고, 규칙 2에서는 X를 실제로 읽는 곳이 모두 그 목록에 있는지 비교합니다(6-6절).
 
-규칙 2에서 P가 NPU인 경우(NPU epilogue에서 bf16을 씀)는 2단계로 미뤘습니다(3-7절, 9절, 10절 참고).
+규칙 2에서 P가 NPU인 경우(NPU epilogue에서 bf16을 씀)는 2단계로 미뤘습니다(3-7절, 9절, 10절 참고). 처음(1단계)에는 P가 CPU일 때만 합쳤고, 12절에서 CPU·GPU·다른 가속기로 넓혔습니다. 규칙 4는 P가 변환을 맡을 수 없을 때만 쓰는 우회책입니다.
 
 ---
 
@@ -388,7 +389,7 @@ util.return %1, %2      // %1(f32)은 반환에도 쓰이므로 그대로 남음
 | conv(im2col) matmul 13개 | NPU | bf16 (activation, weight 모두) |
 | FC matmul 3개 | CPU | **f32** (activation, weight 모두) |
 
-기존 플래그였다면 CPU FC도 bf16이 됐습니다. GPU도 `contraction_input_type`이 없으니 같은 방식으로 f32로 남습니다(이 빌드에는 Vulkan이 꺼져 있어 GPU로 직접 확인하지는 못했음).
+기존 플래그였다면 CPU FC도 bf16이 됐습니다. GPU도 `contraction_input_type`이 없으니 같은 방식으로 f32로 남습니다(나중에 Vulkan 빌드로 직접 확인함, 12-3절).
 
 ### 3-7. 사용자 스크립트 설정의 FC: 아직 다른 부분
 
@@ -409,6 +410,8 @@ util.return %1, %2      // %1(f32)은 반환에도 쓰이므로 그대로 남음
 
 1단계는 규칙 2를 CPU producer에만 적용하므로 FC 뒤에 CPU cast dispatch가 하나씩(총 2개) 생겼습니다. dispatch 수가 87개에서 89개로 늘었습니다. NPU epilogue에 합치는 2단계에서 없앨 대상입니다.
 
+12절 이후에도 이 경우는 그대로입니다. NPU target에 `fuse_truncf = false`가 붙어 있어서입니다. 반면 FC1이 GPU에 배정된 세 장치 실행에서는 FC1(GPU)이 직접 bf16을 써서 cast가 사라졌습니다(12-3절).
+
 ---
 
 ## 4. 변경 파일
@@ -427,7 +430,7 @@ util.return %1, %2      // %1(f32)은 반환에도 쓰이므로 그대로 남음
 | `$P/Transforms/Passes.td`, `Passes.h`, `PassDetail.h` | 수정 (+7, +4, +1) | 패스 등록 |
 | `$P/Transforms/CMakeLists.txt`, `$P/Transforms/test/CMakeLists.txt` | 수정 (+1, +1) | 소스와 테스트 등록 |
 
-기존 파일은 12개, 83줄 추가 9줄 삭제입니다. IREE 본체(`$IREE`)는 바꾸지 않았습니다.
+기존 파일은 12개, 83줄 추가 9줄 삭제입니다. IREE 본체(`$IREE`)는 바꾸지 않았습니다. 이 표는 1단계 기준이고, 12절 변경 파일은 12-2절에 따로 적었습니다.
 
 > 아래 행 번호는 **이 문서 작성 시점의 작업 트리 기준**입니다.
 
@@ -609,7 +612,7 @@ FloatType getConfigContractionInputType(
 
 | 단계 | 함수 | 행 | 하는 일 |
 |---|---|---|---|
-| 판단 | `canWriteElementType` | 73 | 앞 dispatch의 장치가 bf16을 직접 쓸 수 있는가 (지금은 host만) |
+| 판단 | `canWriteElementType` | 73 | 앞 dispatch의 장치가 bf16을 직접 쓸 수 있는가 (1단계는 host만, 12절부터는 `fuse_truncf = false`가 아닌 모든 장치) |
 | 분석 | `isDemotableContraction` | 88 | 곱셈이 있는 named matmul/conv이고 입력이 대상 타입보다 넓은 float인가 |
 | 분석 | `getLoadedBinding` | 107 | contraction 입력 → 전체 load → 읽기 전용 binding |
 | 분석 | `analyzeFunc` | 129 | 바꿀 contraction과 binding 목록(`FuncPlan`) |
@@ -742,7 +745,7 @@ named linalg op은 만들 때 body의 block 인자 타입이 입력 원소 타�
 ```
 
 조건은 다섯 가지입니다.
-1. 앞 dispatch P의 장치가 bf16을 쓸 수 있음(지금은 host만, 73행).
+1. 앞 dispatch P의 장치가 bf16을 쓸 수 있음(1단계는 host만. 12절부터는 target에 `fuse_truncf = false`가 없는 모든 장치).
 2. 결과가 입력과 묶인(tied) in-place 결과가 아님.
 3. 이 값을 읽는 곳이 모두 bf16을 원하는 dispatch임(f32로 읽는 곳이 있으면 규칙 4).
 4. P 안에서 결과 binding이 전체 store 하나로 쓰임.
@@ -767,7 +770,7 @@ pad 패스가 쓰는 함수 `createPaddingDispatch`(`$P/Transforms/AMDAIEDispatc
 641        continue;
 642      }
 643
-644      // b. Result of a host dispatch read only here: fuse into it.
+644      // b. Result of a dispatch read only here: fuse into it.   (1단계: "a host dispatch")
 645      if (auto producer = root.getDefiningOp<IREE::Flow::DispatchOp>()) {
 646        if (fuseIntoProducer(rewriter, module, producer, cast<OpResult>(root),
 647                             request, callers))
@@ -787,8 +790,9 @@ pad 패스가 쓰는 함수 `createPaddingDispatch`(`$P/Transforms/AMDAIEDispatc
 | 1 | CPU im2col → reshape → NPU matmul, 상수 weight | im2col generic body에 truncf, 출력 bf16, reshape도 bf16. weight는 `__demoted_constant_0`이고 RNE 확인용 값(1.00390625 → 1.0, 1.01171875 → 1.015625). f32 global 제거. NPU matmul은 bf16 입력, f32 출력 |
 | 2 | 모델 입력, f32로도 반환되는 relu 결과, 두 NPU dispatch가 같은 executable | 모델 입력 2개와 relu 결과에 cast dispatch 3개. relu f32 결과는 반환용으로 남음. 공유 executable은 한 번만 변환 |
 | 3 | 같은 executable을 NPU와 CPU가 호출, 같은 weight를 둘 다 읽음 | NPU 쪽만 복사본 `@mm_0`(bf16), CPU 쪽은 `@mm`(f32) 그대로, f32 weight global 유지 |
-| 4 | `contraction_input_type`이 없는 NPU | 아무것도 바뀌지 않음 |
-| 5 | NPU dispatch 하나에 matmul 3개: A는 입력을 혼자 읽음, B의 입력 하나는 add도 읽음, C는 B와 입력 하나를 공유 | A만 bf16. B는 1회차에, C는 2회차에(마지막 후보) 빠져 f32 유지. cast dispatch는 A의 입력 2개에만 생김. 함수 `analyzeFunc`의 후보 제거 반복 확인용 |
+| 4 | GPU FC1 → NPU FC2 → NPU FC3, NPU target에 `fuse_truncf = false` (12절에서 추가) | FC1(GPU)의 matmul 결과 뒤에 truncf generic이 붙어 bf16을 저장하고, FC2는 그걸 바로 읽음(cast 없음). FC2(NPU) 결과는 CPU cast를 거쳐 FC3로 감 |
+| 5 | `contraction_input_type`이 없는 NPU | 아무것도 바뀌지 않음 |
+| 6 | NPU dispatch 하나에 matmul 3개: A는 입력을 혼자 읽음, B의 입력 하나는 add도 읽음, C는 B와 입력 하나를 공유 | A만 bf16. B는 1회차에, C는 2회차에(마지막 후보) 빠져 f32 유지. cast dispatch는 A의 입력 2개에만 생김. 함수 `analyzeFunc`의 후보 제거 반복 확인용 |
 
 ---
 
@@ -800,7 +804,7 @@ pad 패스가 쓰는 함수 `createPaddingDispatch`(`$P/Transforms/AMDAIEDispatc
 
 | 테스트 | 결과 |
 |---|---|
-| `demote_contraction_dispatch_inputs.mlir` (새, 5개 경우. `analyzeFunc` 수정 후 5번째 추가해 다시 통과) | 통과 |
+| `demote_contraction_dispatch_inputs.mlir` (새, 1단계 당시 5개 경우. `analyzeFunc` 수정 후 마지막 경우 추가해 다시 통과. 12절에서 6개로) | 통과 |
 | `pad_contraction_dispatches.mlir` (패스 `AMDAIEPadContractionDispatches`) | 통과 |
 | `fold_bias_into_contraction_dispatches.mlir` (패스 `AMDAIEFoldBiasIntoContractionDispatches`) | 통과 |
 | `pad_pooling_dispatches.mlir` (패스 `AMDAIEPadPoolingDispatches`) | 통과 |
@@ -838,24 +842,24 @@ pad 패스가 쓰는 함수 `createPaddingDispatch`(`$P/Transforms/AMDAIEDispatc
 
 ## 9. 알려진 문제와 제약
 
-- **NPU producer에는 합치지 않음 (1단계 범위)**: 앞 dispatch가 NPU면 함수 `canWriteElementType`(새 패스 파일 73행)이 거절해 규칙 4(CPU cast)로 갑니다. VGG FC처럼 NPU 출력이 바로 다음 NPU 입력이면, f32로 한 번 왕복하고 cast dispatch가 하나 더 돕니다. 2단계 대상입니다.
+- **NPU producer에는 합치지 않음**: 앞 dispatch가 NPU면 함수 `canWriteElementType`이 거절해 규칙 4(CPU cast)로 갑니다. 12절 이후에는 NPU target의 `fuse_truncf = false` 때문이고, 그 이유는 아래 반올림 문제입니다. VGG FC처럼 NPU 출력이 바로 다음 NPU 입력이면, f32로 한 번 왕복하고 cast dispatch가 하나 더 돕니다. 2단계 대상입니다.
 - **NPU의 f32 → bf16 변환이 내림**: dev에서 반올림 모드를 바꾸는 곳은 matmul ukernel 소스 `$P/Target/uKernels/npu4/peano/matmul.cc`(47행 `aie::swap_rounding`) 하나이고, 호출이 끝나면 하드웨어 기본값(내림)으로 되돌립니다. 그래서 ukernel 밖의 epilogue truncf는 내림입니다. 코어 시작에 설정하는 커밋 `822f0fed`(최지훈, 원격 브랜치 `origin/3devices-f32-aie2p-bf16`, 이 커밋이 추가하는 플래그 `--iree-amdaie-core-rounding-mode`)는 있지만 dev에는 아직 없습니다. 이 작업과는 별도로 처리하기로 했습니다. 2단계에서 NPU epilogue에 변환을 합칠 때 이 반올림이 결과에 그대로 나타나므로, 그 전에 이 커밋이 dev에 들어오는지 확인해야 합니다.
-- **GPU로는 직접 확인하지 못함**: 이 빌드에는 Vulkan이 꺼져 있습니다(CMake 옵션 `IREE_TARGET_BACKEND_VULKAN_SPIRV=OFF`). 대신 CPU 배치로 같은 동작을 확인했습니다.
+- **(해결됨) GPU로는 직접 확인하지 못함**: 처음 빌드에는 Vulkan이 꺼져 있었습니다(CMake 옵션 `IREE_TARGET_BACKEND_VULKAN_SPIRV=OFF`). 이후 Vulkan을 켠 빌드로 CPU+NPU+GPU에서 확인했습니다(12-3절).
 - **대상 op 범위**: named contraction/convolution op만 바꿉니다(함수 `isDemotableContraction`, 88행). 이미 generic으로 풀린 contraction과 동적 shape 입력은 건너뜁니다(f32 그대로, 결과는 맞음).
 - **f32로도 읽히는 값**: 규칙 3(두 개 출력)이 없어 cast dispatch로 처리합니다. residual이 많은 모델(ResNet 등)에서 비용을 봐야 합니다.
 - **host 장치가 없으면** 패스가 아무것도 하지 않습니다(공용 함수 `getHostAffinity`가 null. pad 패스 `AMDAIEPadContractionDispatches`와 같은 동작). 스크립트는 local-host를 항상 첫 장치로 둡니다.
 - **dispatch 이름**: 변환 뒤에도 이름 끝이 `_f32`로 남습니다. 표시만의 문제입니다.
 - **컴파일 시간**: 상수 변환이 APFloat 기반이라 VGG에서 약 5 s 늘었습니다. 비트 연산으로 바꾸면 줄일 수 있습니다.
-- **(해결됨) 함수 `analyzeFunc`의 후보 제거**: 처음에는 후보 집합(`SetVector`)을 순회하면서 원소를 바로 지워, 다음 원소를 건너뛰거나 마지막 원소를 지울 때 끝을 넘어갈 수 있었습니다. 뺄 후보를 모은 뒤 순회가 끝나고 지우도록 고쳤고(151–164행), lit 5번 경우를 추가했습니다(6-3절, 7절).
+- **(해결됨) 함수 `analyzeFunc`의 후보 제거**: 처음에는 후보 집합(`SetVector`)을 순회하면서 원소를 바로 지워, 다음 원소를 건너뛰거나 마지막 원소를 지울 때 끝을 넘어갈 수 있었습니다. 뺄 후보를 모은 뒤 순회가 끝나고 지우도록 고쳤고(151–164행), lit 경우를 추가했습니다(지금 번호로 6번, 6-3절, 7절).
 - **작업 머신의 Peano 버전 (이 작업과 무관)**: 호스트용 스크립트 `scripts/docker/run-onnx.sh`는 환경 변수 `PEANO_INSTALL_DIR=/workspace/llvm-aie`(= 저장소 루트의 `llvm-aie/`)를 씁니다. 설치 문서(`docs/2026-07-06_env_setup/DEV_CONTAINER.md`)대로라면 여기에 v22가 있어야 하지만, 이 머신의 `llvm-aie/`는 아직 v19(`19.0.0.2025052701+31d2aa6e`)입니다. v19로는 VGG GEMV 코어의 stack이 부족해(1472 > 1024 B) 기존 경로와 새 경로 모두 컴파일되지 않았습니다. 검증은 v22(`build/peano_v22/llvm-aie`, `22.0.0.2026101201+83ba9ea9`)로 했습니다. 설치 스크립트 `build_tools/download_peano.sh`로 `llvm-aie/`를 v22로 갱신하면 스크립트를 그대로 쓸 수 있습니다(기존 v19를 덮어씀). 버전은 `llvm-aie/bin/clang --version`으로 확인합니다.
 
 ## 10. 남은 과제
 
 | 단계 | 내용 |
 |---|---|
-| 2단계 | NPU epilogue에 truncf 합치기: 함수 `canWriteElementType`(새 패스 파일 73행)을 넓혀, NPU dispatch가 "matmul + 단일 elementwise epilogue" 모양이면 그 epilogue에 합침. 기대 효과는 VGG FC 뒤 cast 2개 제거(89 → 87개). 반올림 커밋 `822f0fed`의 dev 반영 여부 확인 필요 |
+| 2단계 | NPU epilogue에 truncf 합치기: 12절로 패스 쪽 준비는 끝났습니다. 반올림 커밋 `822f0fed`가 dev에 들어오면 `$P/Target/AIETarget.cpp`의 `fuse_truncf = false` 한 줄을 빼고 NPU epilogue truncf가 컴파일되는지, 결과가 RNE인지 확인. 기대 효과는 VGG FC 뒤 cast 2개 제거(89 → 87개) |
 | 3단계 | f32로도 읽히는 값: producer가 f32와 bf16 두 개를 출력 (2-3절 규칙 3) |
-| 4단계 | GPU와 섞어서 확인(Vulkan 빌드 필요), NPU 입력 쪽 변환은 백엔드가 지원할 때만 |
+| 4단계 | (GPU와 섞어서 확인은 12-3절에서 완료) NPU 입력 쪽 변환은 백엔드가 지원할 때만. GPU에 다른 입력 타입(f16 등)을 원하게 하려면 Vulkan target에 `contraction_input_type`을 싣는 경로가 따로 필요(패스는 그대로) |
 | 다른 모델 | ResNet(residual), MLP·transformer(NPU → NPU 연결)로 일반성 확인 |
 | 스크립트·문서 | `scripts/onnx/options.py`의 스크립트 옵션 `--numeric`에 새 방식 선택지 추가(그 선택지는 Python 함수 `check()`의 vulkan 금지 검사에서 제외), `docs/device_placement.md`에 장치별 입력 타입 절 추가. 두 파일 모두 공용이라 팀과 정한 뒤 수정 |
 | 정리 | 상수 변환 비트 연산화 (함수 `createDemotedConstant`) |
@@ -868,12 +872,11 @@ pad 패스가 쓰는 함수 `createPaddingDispatch`(`$P/Transforms/AMDAIEDispatc
 # 빌드
 cmake --build build --target iree-opt iree-compile FileCheck
 
-# lit (새 테스트)
-T=compiler/plugins/target/AMD-AIE/iree-amd-aie/Transforms/test
-build/tools/iree-opt --split-input-file \
-  --pass-pipeline='builtin.module(iree-amdaie-demote-contraction-dispatch-inputs)' \
-  $T/demote_contraction_dispatch_inputs.mlir \
-  | build/llvm-project/bin/FileCheck $T/demote_contraction_dispatch_inputs.mlir
+# lit (새 테스트). ctest로 돌려야 함: ctest는 FileCheck에 --enable-var-scope를 주므로
+# (third_party/iree/build_tools/cmake/iree_lit_test.cmake:81) iree-opt | FileCheck를
+# 직접 돌리면 통과해도 ctest에서는 실패하는 경우가 있음(CHECK-LABEL을 넘는 변수는 $ 접두어 필요)
+cd build && ctest -R demote_contraction_dispatch_inputs --output-on-failure && cd ..
+# amd-aie lit 전체: ctest -R iree/target/amd-aie (PEANO_INSTALL_DIR 필요)
 
 # VGG16 e2e: 기존 경로와 새 패스 (Peano v22 사용)
 # --numeric, --runs, --outdir, --extra-flag는 스크립트 옵션(scripts/onnx/options.py).
@@ -896,6 +899,69 @@ python3 scripts/onnx/e2e.py models/vgg16/vgg16-12.onnx --numeric f32 \
 ```
 
 호스트에서는 스크립트 `scripts/docker/run-onnx.sh`로 같은 명령을 돌릴 수 있습니다. 이 스크립트는 `PEANO_INSTALL_DIR`을 `/workspace/llvm-aie`로 고정하므로, 거기에 Peano v22가 설치돼 있어야 합니다(9절).
+
+세 장치(12-3절)는 Vulkan을 켠 빌드(`scripts/build/configure.sh`)에서 위 새 경로 명령에 `--devices local-host,amdxdna-npu4,vulkan-gfx1150`을 붙입니다.
+
+---
+
+## 12. 규칙 2 일반화: 어느 장치든 앞 dispatch에서 변환 (2026-11-10)
+
+### 12-1. 무엇을 왜 바꿨나
+
+1단계의 규칙 2는 앞 dispatch P가 CPU일 때만 적용됐습니다. GPU를 넣어 보니 GPU FC1 → NPU FC2 경계에서 규칙 4(CPU cast)가 생겼습니다. 규칙 4는 dispatch 사이 메모리 왕복이 한 번 더 생기는 우회책이라, 원칙을 다음처럼 바꿨습니다.
+
+> 뒤에 bf16을 원하는 장치가 있으면, P가 어떤 장치든(CPU, GPU, 다른 가속기) P의 저장 직전에 truncf를 넣는다. P의 장치가 그 변환을 올바르게 할 수 없을 때만 규칙 4로 간다.
+
+"올바르게 할 수 없음"은 장치 이름이 아니라 target 설정 키로 판단합니다. 키 이름은 `fuse_truncf`이고, 없으면 할 수 있는 것으로 봅니다. 새 장치는 아무것도 적지 않아도 규칙 2를 씁니다. 지금 `false`인 것은 NPU 하나입니다. NPU 코어의 f32 → bf16 변환이 RNE가 아니라 내림이기 때문입니다(9절).
+
+바꾸기 전에 GPU가 dispatch 끝의 truncf를 처리하는지 따로 확인했습니다(Radeon 890M, gfx1150).
+
+| 테스트 | dispatch 수 | 결과 |
+|---|---|---|
+| f32 → bf16 변환만 (4096개: 정확히 중간, 중간 ±1, 음수, 무작위) | 1 | RNE와 4096개 모두 일치. 버림·내림과는 수백 개 다름 |
+| matmul(1×4096×1024) → bias → ReLU → truncf | 1 (truncf가 matmul dispatch 안에 합쳐짐) | RNE 기준과 1024개 모두 일치. 내림 기준과는 245개가 1ulp 다름 |
+
+스크립트가 막는 "GPU + bf16"(`scripts/onnx/options.py:141`)은 bf16 **입력**을 받는 matmul 이야기입니다. f32로 계산하고 bf16으로 **저장**만 하는 것은 됩니다.
+
+### 12-2. 변경 파일
+
+| 파일 | 변경 |
+|---|---|
+| `$P/Transforms/AMDAIEDemoteContractionDispatchInputs.cpp` | 함수 `canWriteElementType`: `deviceRole(...) == DeviceRole::Host` → `getConfigFuseTruncF(target)`. 파일 머리 주석의 규칙 b·c, `runOnOperation`의 규칙 b 주석 수정 |
+| `$P/Transforms/Utils/AMDAIEUtils.h/.cpp` | 새 함수 `getConfigFuseTruncF()`: 설정 키 `fuse_truncf`(BoolAttr)를 읽음, 없으면 true |
+| `$P/Target/AIETarget.cpp` | `contraction_input_type = bf16`을 실을 때 `fuse_truncf = false`도 함께 실음. 같은 패스만 읽는 키라 그 플래그를 쓸 때만 붙임(플래그를 안 쓰는 빌드의 target 속성과 기존 lit `amd_aie_target_backend.mlir`는 그대로) |
+| `$P/Transforms/test/demote_contraction_dispatch_inputs.mlir` | 경우 4(GPU → NPU → NPU) 추가. 경우 3의 FileCheck 변수를 `[[$COPY]]`로 바꿔 ctest(`--enable-var-scope`)에서도 통과 |
+
+```cpp
+static bool canWriteElementType(IREE::HAL::ExecutableTargetAttr target,
+                                FloatType type) {
+  return target && getConfigFuseTruncF(target);
+}
+```
+
+| P의 장치 | 1단계 | 12절 이후 |
+|---|---|---|
+| CPU | 규칙 2 | 규칙 2 |
+| GPU | 규칙 4 | 규칙 2 |
+| NPU | 규칙 4 | 규칙 4 (`fuse_truncf = false`. 반올림 수정 `822f0fed`가 들어오면 이 키를 빼서 규칙 2) |
+| 새 가속기 | 규칙 4 | 규칙 2 (못 하면 그 target에 `fuse_truncf = false`) |
+
+### 12-3. 검증
+
+Vulkan을 켠 빌드, Peano v22에서 확인했습니다.
+
+| 항목 | 결과 |
+|---|---|
+| lit `demote_contraction_dispatch_inputs.mlir` (ctest) | 통과 |
+| amd-aie lit 전체 (`ctest -R iree/target/amd-aie`) | 215/215 |
+| 회귀 `tests/regression/run_regression.sh` | 수동 28/28, 자동 28/28 |
+| VGG16 CPU+NPU+GPU (`--numeric f32` + 새 플래그) CPU cast 수 | 1 → 0 |
+| 같은 실행 정확도 | corr 0.99998, maxabs 0.0305, top-1 일치. 변경 전 출력과 비트 단위로 같음(차이 0.0) |
+
+- 세 장치 배치에서는 NPU dispatch 8개가 bf16 입력, GPU dispatch 8개가 f32입니다. FC1(GPU, `dispatch_50_matmul_1x4096x25088`)이 `1x4096xbf16`을 직접 쓰고, FC2(NPU)가 그걸 읽습니다. executable 복사본은 생기지 않았습니다.
+- 출력이 같은 것은 GPU 안 변환과 CPU cast가 둘 다 RNE이기 때문입니다.
+- 실행 시간은 같은 컨테이너에서 번갈아 10회 중앙값을 두 번씩 쟀습니다. 변경 전 1.49, 1.38 s, 변경 후 1.45, 1.46 s로 차이가 보이지 않았습니다. 없어진 cast가 1×4096(16 KB) 하나뿐이라서입니다.
+- CPU+NPU 두 장치 배치는 P가 NPU인 경계가 여전히 규칙 4이므로 결과가 바뀌지 않습니다.
 
 ---
 

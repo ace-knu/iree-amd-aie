@@ -230,6 +230,12 @@ FloatType getConfigContractionInputType(
   return attr ? dyn_cast<FloatType>(attr->getValue()) : FloatType();
 }
 
+bool getConfigFuseTruncF(IREE::HAL::ExecutableTargetAttr targetAttr) {
+  std::optional<BoolAttr> attr =
+      getConfigAttr<BoolAttr>(targetAttr, "fuse_truncf");
+  return attr ? attr->getValue() : true;
+}
+
 llvm::StringRef stringifyPoolColumnsPolicy(PoolColumnsPolicy policy) {
   switch (policy) {
     case PoolColumnsPolicy::Odd:

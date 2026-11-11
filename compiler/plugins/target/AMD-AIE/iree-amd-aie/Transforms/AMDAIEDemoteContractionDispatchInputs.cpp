@@ -26,11 +26,15 @@
 //   2. decision, per value, in this order:
 //      a. a compile-time constant: converted at compile time into a new global
 //         (the f32 global stays while something else reads it);
-//      b. the result of a dispatch on a device that can write the type (the
-//         host), read only by dispatches that want it: the conversion is fused
-//         into that dispatch before its store, so it writes the narrow type;
-//      c. otherwise (a model input, a value something else reads in f32): a
-//         host dispatch converting it in front of the consumers;
+//      b. the result of a dispatch, read only by dispatches that want it: the
+//         conversion is fused into that dispatch before its store, so it
+//         writes the narrow type, whatever device it runs on (host, GPU or
+//         another accelerator), unless that device's target opts out
+//         (`fuse_truncf = false`, set on amd-aie whose cores do not round to
+//         nearest even);
+//      c. otherwise (a model input, a value something else reads in f32, a
+//         producer that opts out): a host dispatch converting it in front of
+//         the consumers, the fallback;
 //   3. rewrite: the executables of the converting dispatches see the narrow
 //      bindings, loads and contraction inputs, and each value is converted as
 //      decided. An executable shared with dispatches that do not convert is
@@ -67,13 +71,14 @@ using IREE::TensorExt::DispatchTensorStoreOp;
 using IREE::TensorExt::DispatchTensorType;
 
 /// Whether a dispatch on `target` can write `type` itself, so that a
-/// conversion can be fused into it. The host can (its codegen takes any float
-/// type); an accelerator would need its backend to take the conversion as an
-/// epilogue, which no backend is marked for yet.
+/// conversion can be fused into it. Any device can, whatever its role (host,
+/// GPU, another accelerator), unless its target opts out with
+/// `fuse_truncf = false` (see `getConfigFuseTruncF`): the producer of a value
+/// a narrow-input device reads converts it, and a host cast dispatch is the
+/// fallback only.
 static bool canWriteElementType(IREE::HAL::ExecutableTargetAttr target,
                                 FloatType type) {
-  return target &&
-         deviceRole(target.getBackend().getValue()) == DeviceRole::Host;
+  return target && getConfigFuseTruncF(target);
 }
 
 static RankedTensorType withElementType(Type type, Type elemType) {
@@ -641,7 +646,7 @@ void AMDAIEDemoteContractionDispatchInputsPass::runOnOperation() {
       continue;
     }
 
-    // b. Result of a host dispatch read only here: fuse into it.
+    // b. Result of a dispatch read only here: fuse into it.
     if (auto producer = root.getDefiningOp<IREE::Flow::DispatchOp>()) {
       if (fuseIntoProducer(rewriter, module, producer, cast<OpResult>(root),
                            request, callers))

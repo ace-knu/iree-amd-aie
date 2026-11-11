@@ -175,7 +175,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@cpu>} {
 // CHECK:         func.func @mm
 // CHECK-SAME:      %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xf32>>
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<8x2xf32>, tensor<2x2xf32>) outs(%{{.+}} : tensor<8x2xf32>)
-// CHECK:       flow.executable private @[[COPY:mm_[0-9]+]] {
+// CHECK:       flow.executable private @[[$COPY:mm_[0-9]+]] {
 // CHECK:         func.func @mm
 // CHECK-SAME:      %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xbf16>>
 // CHECK:         linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<8x2xbf16>, tensor<2x2xbf16>) outs(%{{.+}} : tensor<8x2xf32>)
@@ -184,7 +184,7 @@ module attributes {stream.affinity.default = #hal.device.affinity<@cpu>} {
 // CHECK-DAG:     %[[W:.+]] = util.global.load immutable @weight : tensor<2x2xf32>
 // CHECK-DAG:     %[[WB:.+]] = util.global.load immutable @__demoted_constant_{{[0-9]+}} : tensor<2x2xbf16>
 // CHECK-DAG:     %[[A:.+]] = flow.dispatch @cast_executable_{{[0-9]+}}::@cast_dispatch_{{[0-9]+}}(%arg0)
-// CHECK:         flow.dispatch @[[COPY]]::@mm(%[[A]], %[[WB]]) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xbf16>, tensor<2x2xbf16>) -> tensor<8x2xf32>
+// CHECK:         flow.dispatch @[[$COPY]]::@mm(%[[A]], %[[WB]]) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xbf16>, tensor<2x2xbf16>) -> tensor<8x2xf32>
 // CHECK:         flow.dispatch @mm::@mm(%arg1, %[[W]]) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<8x2xf32>, tensor<2x2xf32>) -> tensor<8x2xf32>
 module attributes {stream.affinity.default = #hal.device.affinity<@cpu>} {
   util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {contraction_input_type = bf16, num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
@@ -213,6 +213,83 @@ module attributes {stream.affinity.default = #hal.device.affinity<@cpu>} {
     %0 = flow.dispatch @mm::@mm(%arg0, %w) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xf32>, tensor<2x2xf32>) -> tensor<8x2xf32>
     %1 = flow.dispatch @mm::@mm(%arg1, %w) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<8x2xf32>, tensor<2x2xf32>) -> tensor<8x2xf32>
     util.return %0, %1 : tensor<8x2xf32>, tensor<8x2xf32>
+  }
+}
+
+// -----
+
+// Accelerator producers. FC1 runs on the GPU, which does not ask for a type
+// and does not opt out of fused conversions: FC2 on the NPU reads its result
+// only, so FC1 converts it before its store (a matmul result, not a generic:
+// a new truncf generic) and writes bf16, with no cast dispatch in between.
+// FC2's own result feeds FC3, also on the NPU, whose target opts out
+// (`fuse_truncf = false`): a host cast dispatch converts it instead.
+
+// CHECK-LABEL: func.func @fc1
+// CHECK-SAME:    %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x2xbf16>>
+// CHECK:         %[[M:.+]] = linalg.matmul ins(%{{.+}}, %{{.+}} : tensor<8x2xf32>, tensor<2x2xf32>) outs(%{{.+}} : tensor<8x2xf32>)
+// CHECK:         %[[T:.+]] = linalg.generic
+// CHECK-SAME:      ins(%[[M]] : tensor<8x2xf32>) outs(%{{.+}} : tensor<8x2xbf16>)
+// CHECK:           arith.truncf %{{.+}} : f32 to bf16
+// CHECK:         iree_tensor_ext.dispatch.tensor.store %[[T]], %arg1, {{.+}} : tensor<8x2xbf16>
+
+// CHECK-LABEL: func.func @mm
+// CHECK-SAME:    %arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xbf16>>
+// CHECK-SAME:    %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x2xf32>>
+
+// CHECK-LABEL: util.func public @main
+// CHECK:         %[[F1:.+]] = flow.dispatch @fc1::@fc1(%arg0) {stream.affinity = #hal.device.affinity<@gpu>} : (tensor<8x2xf32>) -> tensor<8x2xbf16>
+// CHECK-NOT:     cast_executable
+// CHECK:         %[[F2:.+]] = flow.dispatch @mm::@mm(%[[F1]], %{{.+}}) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xbf16>, tensor<2x2xbf16>) -> tensor<8x2xf32>
+// CHECK:         %[[C:.+]] = flow.dispatch @cast_executable_{{[0-9]+}}::@cast_dispatch_{{[0-9]+}}(%[[F2]]) {stream.affinity = #hal.device.affinity<@cpu>} : (tensor<8x2xf32>) -> tensor<8x2xbf16>
+// CHECK:         flow.dispatch @mm::@mm(%[[C]], %{{.+}}) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xbf16>, tensor<2x2xbf16>) -> tensor<8x2xf32>
+module attributes {stream.affinity.default = #hal.device.affinity<@cpu>} {
+  util.global private @npu = #hal.device.target<"amdxdna", [#hal.executable.target<"amd-aie", "amdaie-pdi-fb", {contraction_input_type = bf16, fuse_truncf = false, num_cols = 8 : i32, num_rows = 4 : i32, target_device = "npu4", ukernels = "none"}>]> : !hal.device
+  util.global private @gpu = #hal.device.target<"vulkan", [#hal.executable.target<"vulkan-spirv", "vulkan-spirv-fb", {}>]> : !hal.device
+  util.global private @cpu = #hal.device.target<"local", [#hal.executable.target<"llvm-cpu", "embedded-elf-x86_64", {}>]> : !hal.device
+  flow.executable private @fc1 {
+    flow.executable.export public @fc1 workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @fc1(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %w = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [8, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xf32>> -> tensor<8x2xf32>
+        %1 = tensor.empty() : tensor<8x2xf32>
+        %2 = linalg.fill ins(%cst : f32) outs(%1 : tensor<8x2xf32>) -> tensor<8x2xf32>
+        %3 = linalg.matmul ins(%0, %w : tensor<8x2xf32>, tensor<2x2xf32>) outs(%2 : tensor<8x2xf32>) -> tensor<8x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %3, %arg1, offsets = [0, 0], sizes = [8, 2], strides = [1, 1] : tensor<8x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x2xf32>>
+        return
+      }
+    }
+  }
+  util.global private @weight = dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
+  flow.executable private @mm {
+    flow.executable.export public @mm workgroups() -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      flow.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @mm(%arg0: !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xf32>>, %arg1: !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>>, %arg2: !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x2xf32>>) {
+        %cst = arith.constant 0.000000e+00 : f32
+        %0 = iree_tensor_ext.dispatch.tensor.load %arg0, offsets = [0, 0], sizes = [8, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<8x2xf32>> -> tensor<8x2xf32>
+        %1 = iree_tensor_ext.dispatch.tensor.load %arg1, offsets = [0, 0], sizes = [2, 2], strides = [1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<2x2xf32>> -> tensor<2x2xf32>
+        %2 = tensor.empty() : tensor<8x2xf32>
+        %3 = linalg.fill ins(%cst : f32) outs(%2 : tensor<8x2xf32>) -> tensor<8x2xf32>
+        %4 = linalg.matmul ins(%0, %1 : tensor<8x2xf32>, tensor<2x2xf32>) outs(%3 : tensor<8x2xf32>) -> tensor<8x2xf32>
+        iree_tensor_ext.dispatch.tensor.store %4, %arg2, offsets = [0, 0], sizes = [8, 2], strides = [1, 1] : tensor<8x2xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<8x2xf32>>
+        return
+      }
+    }
+  }
+  util.func public @main(%arg0: tensor<8x2xf32>) -> tensor<8x2xf32> {
+    %w = util.global.load immutable @weight : tensor<2x2xf32>
+    %0 = flow.dispatch @fc1::@fc1(%arg0) {stream.affinity = #hal.device.affinity<@gpu>} : (tensor<8x2xf32>) -> tensor<8x2xf32>
+    %1 = flow.dispatch @mm::@mm(%0, %w) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xf32>, tensor<2x2xf32>) -> tensor<8x2xf32>
+    %2 = flow.dispatch @mm::@mm(%1, %w) {stream.affinity = #hal.device.affinity<@npu>} : (tensor<8x2xf32>, tensor<2x2xf32>) -> tensor<8x2xf32>
+    util.return %2 : tensor<8x2xf32>
   }
 }
 

@@ -200,6 +200,11 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
     if (options.contractionInputType == "bf16") {
       addConfig("contraction_input_type",
                 TypeAttr::get(BFloat16Type::get(context)));
+      // No conversion fused into this device's dispatches either: its cores
+      // round f32 -> bf16 toward -inf (the rounding mode register is reset to
+      // floor), not to nearest even as the host and the GPU do. Read only by
+      // the same demote pass, so set only along with the key above.
+      addConfig("fuse_truncf", BoolAttr::get(context, false));
     } else if (options.contractionInputType != "none") {
       llvm::report_fatal_error(
           llvm::Twine("Invalid --iree-amdaie-contraction-input-type (") +

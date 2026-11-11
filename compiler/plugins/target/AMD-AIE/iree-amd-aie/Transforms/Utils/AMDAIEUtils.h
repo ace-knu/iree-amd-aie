@@ -132,6 +132,13 @@ int64_t getConfigGemvN1(IREE::HAL::ExecutableTargetAttr targetAttr);
 FloatType getConfigContractionInputType(
     IREE::HAL::ExecutableTargetAttr targetAttr);
 
+/// Whether the Flow demote pass may fuse a narrowing float conversion
+/// (`arith.truncf`) into the end of a dispatch placed on this target, so the
+/// dispatch writes the narrow type itself (`fuse_truncf` in the executable
+/// target config; absent: true). A backend whose codegen does not round that
+/// conversion to nearest even sets it to false.
+bool getConfigFuseTruncF(IREE::HAL::ExecutableTargetAttr targetAttr);
+
 /// The pool column policy (`pool_columns_policy` in the executable target
 /// config, one of "odd" | "cost" | "full" | "max"; absent means `Max`). Read
 /// per dispatch by the Flow pooling pad pass so it pads OH exactly when the
